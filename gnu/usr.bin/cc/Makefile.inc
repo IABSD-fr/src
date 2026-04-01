@@ -23,7 +23,7 @@ GCCDIR=	${GCCLIB}/gcc
 
 # Machine description.
 MD_FILE=	${GCCDIR}/config/${GCC_CPU}/${GCC_CPU}.md
-GCC_TARGET=	${TARGET_ARCH}-unknown-openbsd${OSREV}
+GCC_TARGET=	${TARGET_ARCH}-unknown-iabsd${OSREV}
 
 NOPIE=		Yes
 

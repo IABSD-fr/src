@@ -524,11 +524,11 @@ emitload(FILE *fp)
 		if (fprintf(fp, "update-link:\n") < 0)
 			return (1);
 		if (fprintf(fp,
-		    "\tmkdir -p -m 700 /usr/share/relink/kernel\n"
-		    "\trm -rf /usr/share/relink/kernel/%s /usr/share/relink/kernel.tgz\n"
-		    "\tmkdir /usr/share/relink/kernel/%s\n"
+		    "\tmkdir -p -m 700 /var/relink/kernel\n"
+		    "\trm -rf /var/relink/kernel/%s /var/relink/kernel.tgz\n"
+		    "\tmkdir /var/relink/kernel/%s\n"
 		    "\ttar -chf - Makefile makegap.sh ld.script *.o | \\\n"
-		    "\t    tar -C /usr/share/relink/kernel/%s -xf -\n\n",
+		    "\t    tar -C /var/relink/kernel/%s -xf -\n\n",
 		    last_component, last_component, last_component) < 0)
 			return (1);
 	}

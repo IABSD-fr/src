@@ -196,6 +196,7 @@ changequote([,])dnl
       alpha*-*-linux-gnu*)		fmt=elf em=linux ;;
       alpha*-*-netbsd*)			fmt=elf em=nbsd ;;
       alpha*-*-openbsd*)		fmt=elf em=obsd ;;
+      alpha*-*-iabsd*)		fmt=elf em=obsd ;;
 
       # cpu_type for am33_2.0 is set to mn10300
       mn10300-*-linux*)			fmt=elf bfd_gas=yes em=linux ;;
@@ -214,6 +215,7 @@ changequote([,])dnl
       arm-*-netbsdelf*)                 fmt=elf  em=nbsd ;;
       arm-*-netbsd*)			fmt=aout em=nbsd ;;
       arm-*-openbsd*)			fmt=elf  em=obsd ;;
+      arm-*-iabsd*)			fmt=elf  em=obsd ;;
       arm-**-nto*)			fmt=elf ;;
       arm-*-oabi | thumb-*-oabi)	fmt=elf ;;
       arm-epoc-pe | thumb-epoc-pe)	fmt=coff em=epoc-pe ;;
@@ -242,6 +244,10 @@ changequote([,])dnl
       hppa-*-lites*)			fmt=elf em=hppa ;;
       hppa-*-netbsd*)			fmt=elf em=nbsd ;;
       hppa-*-openbsd*)	case ${cpu} in
+			    hppa64)	fmt=elf em=obsdhppa64 ;;
+			    hppa)	fmt=elf em=obsd ;;
+			esac ;;
+      hppa-*-iabsd*)	case ${cpu} in
 			    hppa64)	fmt=elf em=obsdhppa64 ;;
 			    hppa)	fmt=elf em=obsd ;;
 			esac ;;
@@ -291,6 +297,7 @@ changequote(,)dnl
 					fmt=elf ;;
 			       esac
 			esac ;;
+      i386-*-iabsd*)			em=obsd bfd_gas=yes fmt=elf ;;
 changequote([,])dnl
       i386-*-linux*aout*)		fmt=aout em=linux ;;
       i386-*-linux*oldld)		fmt=aout em=linux ;;
@@ -382,12 +389,14 @@ changequote([,])dnl
       m68k-*-netbsdelf*)		fmt=elf em=nbsd ;;
       m68k-*-netbsd*)			fmt=aout em=nbsd bfd_gas=yes ;;
       m68k-*-openbsd*)			fmt=elf em=obsd ;;
+      m68k-*-iabsd*)			fmt=elf em=obsd ;;
       m68k-apple-aux*)			fmt=coff em=aux ;;
       m68k-*-psos*)			fmt=elf em=psos;;
 
       m88k-motorola-sysv3*)		fmt=coff em=delt88 ;;
       m88k-*-coff*)			fmt=coff ;;
       m88k-*-openbsd*)			fmt=elf em=obsd bfd_gas=yes ;;
+      m88k-*-iabsd*)			fmt=elf em=obsd bfd_gas=yes ;;
 
       mcore-*-elf)			fmt=elf ;;
       mcore-*-pe)			fmt=coff em=pe bfd_gas=yes ;;
@@ -411,6 +420,7 @@ changequote([,])dnl
       mips-*-elf* | mips-*-rtems*)	fmt=elf ;;
       mips-*-netbsd*)			fmt=elf ;;
       mips-*-openbsd*)			fmt=elf em=tmips ;;
+      mips-*-iabsd*)			fmt=elf em=tmips ;;
 
       mmix-*-*)				fmt=elf ;;
       mn10200-*-*)			fmt=elf ;;
@@ -435,6 +445,7 @@ changequote([,])dnl
       ppc-*-beos*)			fmt=coff ;;
       ppc-*-netbsd* | ppc-*-elf*)	fmt=elf ;;
       ppc-*-openbsd*)			fmt=elf em=obsd ;;
+      ppc-*-iabsd*)			fmt=elf em=obsd ;;
       ppc-*-eabi* | ppc-*-sysv4*)	fmt=elf ;;
       ppc-*-linux-gnu*)			fmt=elf em=linux
 	    case "$endian" in
@@ -467,6 +478,7 @@ changequote([,])dnl
       sh64*-*-netbsd*)			fmt=elf em=nbsd ;;
       sh*-*-netbsdelf*)			fmt=elf em=nbsd ;;
       sh*-*-openbsd*)			fmt=elf em=obsd endian=little ;;
+      sh*-*-iabsd*)			fmt=elf em=obsd endian=little ;;
       sh-*-elf*)			fmt=elf ;;
       sh-*-coff*)			fmt=coff ;;
       sh-*-nto*)			fmt=elf ;;
@@ -508,8 +520,10 @@ changequote(,)dnl
 			    *)
 					fmt=elf ;;
 			esac ;;
+      sparc-*-iabsd*)			em=obsd bfd_gas=yes fmt=elf ;;
 changequote([,])dnl
       sparc64-*-openbsd*) em=obsd bfd_gas=yes fmt=elf ;;
+      sparc64-*-iabsd*) em=obsd bfd_gas=yes fmt=elf ;;
       strongarm-*-coff)			fmt=coff ;;
       strongarm-*-elf)			fmt=elf ;;
       strongarm-*-kaos*)		fmt=elf ;;
@@ -527,6 +541,7 @@ changequote([,])dnl
       v850ea-*-*)			fmt=elf ;;
 
       vax-*-netbsdelf* | vax-*-openbsd*) fmt=elf em=nbsd ;;
+      vax-*-iabsd*)			fmt=elf em=nbsd ;;
       vax-*-netbsd*)			fmt=aout em=nbsd ;;
       vax-*-bsd* | vax-*-ultrix*)	fmt=aout ;;
       vax-*-linux-gnu*)			fmt=elf em=linux bfd_gas=yes ;;
@@ -644,6 +659,7 @@ changequote([,])dnl
 	    mips_default_abi=O32_ABI
 	    ;;
 	  mips64*-openbsd*)
+	  mips64*-iabsd*)
 	    mips_default_abi=N64_ABI
 	    ;;
 	  *)

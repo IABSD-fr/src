@@ -1,3 +1,4 @@
-**/obj
-**/tags
-**/CVS
+CVS
+.claude
+obj
+tags

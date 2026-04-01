@@ -44,6 +44,9 @@
 #define OpenBSD	202610		/* OpenBSD version (year & month). */
 #define OpenBSD8_0 1		/* OpenBSD 8.0 */
 
+#define IABSD OpenBSD
+#define IABSD0_1 1
+
 #include <sys/_null.h>
 
 #ifndef _LOCORE

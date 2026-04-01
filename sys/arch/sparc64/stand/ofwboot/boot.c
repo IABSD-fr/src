@@ -436,7 +436,7 @@ main(void)
 	char **bootlp;
 	char *just_bootline[2];
 
-	printf(">> OpenBSD BOOT %s\n", version);
+	printf(">> IABSD BOOT %s\n", version);
 
 	/*
 	 * Get the boot arguments from Openfirmware

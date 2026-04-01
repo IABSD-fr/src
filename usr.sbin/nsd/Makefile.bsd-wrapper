@@ -6,7 +6,8 @@ BINDIR=		/usr/sbin
 CHROOTDIR=	/var/nsd
 
 XCFLAGS=	CC="${CC}" CFLAGS="${CFLAGS} ${COPTS}" LDFLAGS="${LDFLAGS}" \
-		YACC="/usr/bin/yacc"
+		YACC="/usr/bin/yacc" SED="/usr/bin/sed" \
+		GREP="/usr/bin/grep" EGREP="/usr/bin/egrep"
 CONFIGURE_OPTS=	--prefix=/usr \
 		--localstatedir=/var \
 		--sysconfdir=/etc \

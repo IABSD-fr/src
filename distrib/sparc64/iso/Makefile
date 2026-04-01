@@ -16,10 +16,11 @@ BASE=		${RELDIR}/base${OSrev}.tgz ${RELDIR}/comp${OSrev}.tgz \
 		${RELDIR}/INSTALL.${MACHINE} ${RELDIR}/BUILDINFO
 XBASE=		${RELXDIR}/xbase${OSrev}.tgz ${RELXDIR}/xfont${OSrev}.tgz \
 		${RELXDIR}/xshare${OSrev}.tgz ${RELXDIR}/xserv${OSrev}.tgz
+SIG=		${RELDIR}/SHA256 ${RELDIR}/SHA256.sig
 
 all: ${FS} ${CDROM} 
 
-${FS}: ${BASE} ${XBASE}
+${FS}: ${BASE} ${XBASE} ${SIG}
 	dd if=/dev/zero of=${FS} bs=512 count=${FSSIZE}
 	vnconfig -v -t ${FSDISKTYPE} ${FS} > vnd
 	echo '/ *' | disklabel -wAT- `cat vnd`
@@ -35,23 +36,21 @@ ${FS}: ${BASE} ${XBASE}
 	ln ${MOUNT_POINT}/${OSREV}/${MACHINE}/bsd.rd ${MOUNT_POINT}/bsd.rd
 	ln ${MOUNT_POINT}/${OSREV}/${MACHINE}/bsd.rd ${MOUNT_POINT}/bsd
 
-	cat ${RELDIR}/SHA256 ${RELXDIR}/SHA256 > \
-	    ${MOUNT_POINT}/${OSREV}/${MACHINE}/SHA256
-	# XXX no SHA256.sig
+	cp -p ${RELDIR}/SHA256 ${MOUNT_POINT}/${OSREV}/${MACHINE}/SHA256
+	cp -p ${RELDIR}/SHA256.sig ${MOUNT_POINT}/${OSREV}/${MACHINE}/SHA256.sig
 	df -i ${MOUNT_POINT}
 	umount ${MOUNT_POINT}
 	vnconfig -u `cat vnd`
 
-${CDROM}: ${BASE} ${XBASE}
+${CDROM}: ${BASE} ${XBASE} ${SIG}
 	rm -rf ${.OBJDIR}/cd-dir/
 	mkdir -p ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 
 	cp -p ${BASE} ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 	cp -p ${XBASE} ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 
-	cat ${RELDIR}/SHA256 ${RELXDIR}/SHA256 > \
-	    ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}/SHA256
-	# XXX no SHA256.sig
+	cp -p ${RELDIR}/SHA256 ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}/SHA256
+	cp -p ${RELDIR}/SHA256.sig ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}/SHA256.sig
 
 	cp -p ${RELDIR}/ofwboot ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 
@@ -63,13 +62,13 @@ ${CDROM}: ${BASE} ${XBASE}
 	echo 'm 5	sun4us' >> ${.OBJDIR}/cd-dir/.slicemapfile
 	echo 'm 6	sun4v' >> ${.OBJDIR}/cd-dir/.slicemapfile
 	mkhybrid -a -R -T -L -d -D -N \
-	    -A "OpenBSD ${OSREV} ${MACHINE} Install CD" \
-	    -P "Copyright (c) `date +%Y` Theo de Raadt, The OpenBSD project" \
-	    -p "Theo de Raadt <deraadt@openbsd.org>" \
-	    -V "OpenBSD/${MACHINE} ${OSREV} Install CD" \
+	    -A "IABSD ${OSREV} ${MACHINE} Install CD" \
+	    -P "Copyright (c) `date +%Y` Thomas de Grivel" \
+	    -p "Thomas de Grivel <thodg@kmx.io>" \
+	    -V "IABSD/${MACHINE} ${OSREV} Install CD" \
 	    -o ${.OBJDIR}/${CDROM} ${.OBJDIR}/cd-dir
 	vnconfig -v ${.OBJDIR}/${CDROM} > vnd
-	disklabel -w `cat vnd` fakecdrom "OpenBSD${OSrev}${MACHINE}"
+	disklabel -w `cat vnd` fakecdrom "IABSD${OSrev}${MACHINE}"
 	vnconfig -u `cat vnd`
 	rm -f vnd
 	mksuncd f ${.OBJDIR}/${CDROM} ${.OBJDIR}/../miniroot/miniroot${OSrev}.img

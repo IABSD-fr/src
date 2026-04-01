@@ -8,7 +8,7 @@ option		NO_PROPOLICE
 option		BOOT_CONFIG
 
 option		RAMDISK_HOOKS
-option		MINIROOTSIZE=4480
+option		MINIROOTSIZE=8192
 
 #option		PCIVERBOSE
 option		SCSITERSE

@@ -171,7 +171,7 @@ magic_offset:	.word	0x1fe
 found_sector:	.long	0
 
 	.align	2
-banner:		.asciz	"\r\nOpenBSD MBR\r\n"
+banner:		.asciz	"\r\nIABSD MBR\r\n"
 
 	.align	2
 ERR_INVPART:	.asciz	"No active partition\r\n"

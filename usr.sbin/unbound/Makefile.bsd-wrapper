@@ -5,7 +5,9 @@
 BINDIR=		/usr/sbin
 CHROOTDIR=	/var/unbound
 
-XCFLAGS=	CC="${CC}" CFLAGS="${CFLAGS} ${COPTS}" LDFLAGS="${LDFLAGS}"
+XCFLAGS=	CC="${CC}" CFLAGS="${CFLAGS} ${COPTS}" LDFLAGS="${LDFLAGS}" \
+		SED="/usr/bin/sed" GREP="/usr/bin/grep" \
+		EGREP="/usr/bin/egrep" FGREP="/usr/bin/fgrep"
 
 CONFIGURE_OPTS_UNBOUND=	--enable-allsymbols \
 			--with-ssl=/usr \

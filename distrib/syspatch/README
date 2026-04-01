@@ -35,9 +35,9 @@ install -m 0700 ${RELEASEDIR}/bsd{,.mp} ${FAKE}
 for set in base comp game man xbase xshare xfont xserv; do
 	tar xzphf ${RELEASEDIR}/${set}$(uname -r | tr -d '.').tgz -C ${FAKE}
 done
-mkdir -m 700 -p ${FAKE}/usr/share/relink/kernel/GENERIC{,.MP}
-tar -C ${FAKE}/usr/share/relink/kernel -xzf ${FAKE}/usr/share/relink/kernel.tgz
-rm ${FAKE}/usr/share/relink/kernel.tgz
+mkdir -m 700 -p ${FAKE}/var/relink/kernel/GENERIC{,.MP}
+tar -C ${FAKE}/var/relink/kernel -xzf ${FAKE}/var/relink/kernel.tgz
+rm ${FAKE}/var/relink/kernel.tgz
 
 Continuing syspatch builds
 --------------------------

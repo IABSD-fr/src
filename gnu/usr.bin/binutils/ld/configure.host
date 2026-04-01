@@ -71,6 +71,10 @@ case "${host}" in
   HOSTING_CRT0=/usr/lib/crt0.o
   ;;
 
+*-*-iabsd*)
+  HOSTING_CRT0=/usr/lib/crt0.o
+  ;;
+
 esac
 
 #
@@ -245,6 +249,9 @@ x86_64-*-linux-gnu*)
   ;;
 
 *-*-openbsd*)
+  ;;
+
+*-*-iabsd*)
   ;;
 
 alpha*-*-*)
