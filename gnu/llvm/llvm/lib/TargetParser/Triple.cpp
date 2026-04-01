@@ -720,6 +720,7 @@ static Triple::OSType parseOS(StringRef OSName) {
       .StartsWith("managarm", Triple::Managarm)
       .StartsWith("netbsd", Triple::NetBSD)
       .StartsWith("openbsd", Triple::OpenBSD)
+      .StartsWith("iabsd", Triple::OpenBSD)
       .StartsWith("solaris", Triple::Solaris)
       .StartsWith("uefi", Triple::UEFI)
       .StartsWith("win32", Triple::Win32)

@@ -65,7 +65,7 @@ main(void)
 	/* Keep stdout unbuffered to mimic ordinary bootblocks. */
 	setvbuf(stdout, NULL, _IONBF, 0);
 
-	printf(">> OpenBSD/" MACHINE " BOOT %s\n", version);
+	printf(">> IABSD/" MACHINE " BOOT %s\n", version);
 
 	octbootfd = open("/dev/octboot", O_WRONLY);
 	if (octbootfd == -1)

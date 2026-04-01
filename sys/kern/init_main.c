@@ -106,7 +106,8 @@ extern void stoeplitz_init(void);
 const char	copyright[] =
 "Copyright (c) 1982, 1986, 1989, 1991, 1993\n"
 "\tThe Regents of the University of California.  All rights reserved.\n"
-"Copyright (c) 1995-2026 OpenBSD. All rights reserved.  https://www.OpenBSD.org\n";
+"Copyright (c) 1995-2026 OpenBSD. All rights reserved.  https://www.OpenBSD.org\n"
+"Copyright (c) 2026 Thomas de Grivel.  All rights reserved.  https://www.iabsd.fr\n";
 
 /* Components of the first process -- never freed. */
 struct	session session0;
