@@ -142,7 +142,7 @@ main()
 	/* Init prom callback vector. */
 	init_prom_calls();
 
-	puts("\nOpenBSD/Alpha Primary Boot\n");
+	puts("\nIABSD/Alpha Primary Boot\n");
 
 	bbinfop = (struct bbinfo *)&_end;
 	loadaddr = (char *)SECONDARY_LOAD_ADDRESS;

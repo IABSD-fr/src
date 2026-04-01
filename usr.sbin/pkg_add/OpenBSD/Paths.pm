@@ -104,7 +104,7 @@ sub compute_osversion($self)
 	open my $cmd, '-|', $self->sysctl, '-n', 'kern.version';
 	my $line = <$cmd>;
 	close($cmd);
-	if ($line =~ m/^OpenBSD (\d\.\d)(\S*)\s/) {
+	if ($line =~ m/^IABSD (\d\.\d)(\S*)\s/) {
 		$osversion = $1;
 		if ($2 eq '-current' or $2 eq '-beta') {
 			$osdirectory = 'snapshots';

@@ -51,10 +51,13 @@ struct ufsmount {
 	union {					/* pointer to superblock */
 		struct	fs *fs;			/* FFS */
 		struct  m_ext2fs *e2fs;		/* EXT2FS */
+		struct  m_ext4fs *e4fs;		/* EXT4FS */
 	} ufsmount_u;
 #define	um_fs		ufsmount_u.fs
 #define	um_e2fs		ufsmount_u.e2fs
 #define	um_e2fsb	ufsmount_u.e2fs->s_es
+#define	um_e4fs		ufsmount_u.e4fs
+//#define	um_e4fsb	ufsmount_u.e4fs->s_es
 
 	struct	vnode *um_quotas[MAXQUOTAS];	/* pointer to quota files */
 	struct	ucred *um_cred[MAXQUOTAS];	/* quota file access cred */
@@ -72,9 +75,10 @@ struct ufsmount {
 /*
  * Filesystem types
  */
-#define	UM_UFS1	1
-#define	UM_UFS2	2
+#define	UM_UFS1		1
+#define	UM_UFS2		2
 #define	UM_EXT2FS	3
+#define	UM_EXT4FS	4
 
 /*
  * Flags describing the state of quotas.

@@ -22,6 +22,7 @@ rdboot: ${RDBOOT}
 
 mr.fs: rdboot bsd
 	rm -rf $@.d
+	install -d -o root -g wheel $@.d
 	install -d -o root -g wheel $@.d/dev
 	install -d -o root -g wheel $@.d/mnt
 	install -d -o root -g wheel $@.d/sbin

@@ -48,9 +48,9 @@ CPPFLAGS+=	-D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS \
 		-D__STDC_FORMAT_MACROS
 
 .if ${MACHINE_ARCH} == "arm"
-TRIPLE=		armv7-unknown-openbsd${OSREV}-gnueabi
+TRIPLE=		armv7-unknown-iabsd${OSREV}-gnueabi
 .else
-TRIPLE=		${MACHINE_ARCH}-unknown-openbsd${OSREV}
+TRIPLE=		${MACHINE_ARCH}-unknown-iabsd${OSREV}
 .endif
 .include "Makefile.arch"
 

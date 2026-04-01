@@ -22,7 +22,7 @@ export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 
 KERNEL=$(sysctl -n kern.osversion)
 KERNEL=${KERNEL%#*}
-KERNEL_DIR=/usr/share/relink/kernel
+KERNEL_DIR=/var/relink/kernel
 LOGFILE=$KERNEL_DIR/$KERNEL/relink.log
 PROGNAME=${0##*/}
 SHA256=/var/db/kernel.SHA256
