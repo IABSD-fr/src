@@ -4,6 +4,6 @@
 SUBDIR=	mbr cdbr
 .endif
 SUBDIR+=biosboot boot cdboot fdboot pxeboot efiboot
-SUBDIR+=rdboot vmboot
+SUBDIR+=rdboot
 
 .include <bsd.subdir.mk>

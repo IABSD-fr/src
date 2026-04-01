@@ -82,14 +82,14 @@ includeit(hardware)
 Verifying the OpenBSD Installation Media:
 -----------------------------------------
 
-OpenBSD installations are able to verify files for the next
-release.  The OpenBSD OSREV release was signed with the
-/etc/signify/openbsd-{:--:}OSrev-base.pub release key.
+IABSD installations are able to verify files for the next
+release.  The IABSD OSREV release was signed with the
+/etc/signify/iabsd-{:--:}OSrev-base.pub release key.
 
-If you have an existing OpenBSD installation, you can run signify(1)
+If you have an existing IABSD installation, you can run signify(1)
 to verify the signature and checksum.  For example, run the following
-to verify that the cd{:--:}OSrev.iso file was distributed by the OpenBSD team:
-	signify -C -p /etc/signify/openbsd-{:--:}OSrev-base.pub -x SHA256.sig cd{:--:}OSrev.iso
+to verify that the cd{:--:}OSrev.iso file was distributed by the IABSD team:
+	signify -C -p /etc/signify/iabsd-{:--:}OSrev-base.pub -x SHA256.sig cd{:--:}OSrev.iso
 
 If you are unable to run or compile signify(1), use sha256(1) with the SHA256
 file to see if a file was corrupt during the transfer.

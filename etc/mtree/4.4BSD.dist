@@ -496,13 +496,6 @@ usr
         mk
         ..
 
-        # ./usr/share/relink
-        relink
-
-            # ./usr/share/relink/kernel
-            kernel
-            ..
-        ..
         snmp
             mibs
             ..
@@ -531,6 +524,14 @@ usr
 # ./var
 var
     account
+    ..
+
+    # ./var/relink
+    relink
+
+        # ./var/relink/kernel
+        kernel
+        ..
     ..
     agentx			uname=root gname=wheel mode=755
     ..

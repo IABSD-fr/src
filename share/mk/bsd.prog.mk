@@ -144,9 +144,9 @@ ${PROG}.tar: ${OBJS} install.sh
 
 afterinstall: ${PROG}.tar
 	install -d -o root -g wheel -m 755 \
-	    ${DESTDIR}/usr/share/relink/${BINDIR}/${PROG}
+	    ${DESTDIR}/var/relink/${BINDIR}/${PROG}
 	install -o root -g bin -m 640 \
-	    ${PROG}.tar ${DESTDIR}/usr/share/relink/${BINDIR}/${PROG}/${PROG}.tar
+	    ${PROG}.tar ${DESTDIR}/var/relink/${BINDIR}/${PROG}/${PROG}.tar
 
 CLEANFILES+= ${PROG}.tar install.sh
 .endif

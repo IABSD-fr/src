@@ -33,7 +33,7 @@ sub add_default($self, $state, $p)
 		if (!defined $dir) {
 			$state->fatal("Couldn't find/parse OS version");
 		}
-		$path = "http://firmware.openbsd.org/firmware/$dir/";
+		$path = "http://firmware.iabsd.fr/firmware/$dir/";
 	}
 	$p->add(OpenBSD::PackageRepository->new($path, $state));
 }

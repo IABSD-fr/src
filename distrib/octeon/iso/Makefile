@@ -14,6 +14,7 @@ BASE=		${RELDIR}/base${OSrev}.tgz ${RELDIR}/comp${OSrev}.tgz \
 		${RELDIR}/INSTALL.${MACHINE} ${RELDIR}/BUILDINFO
 XBASE=		${RELXDIR}/xbase${OSrev}.tgz ${RELXDIR}/xfont${OSrev}.tgz \
 		${RELXDIR}/xshare${OSrev}.tgz ${RELXDIR}/xserv${OSrev}.tgz
+SIG=		${RELDIR}/SHA256 ${RELDIR}/SHA256.sig
 
 MSDOSSTART=	64
 MSDOSSIZE=	80000
@@ -21,7 +22,7 @@ TOTALSIZE!=	expr ${FSSIZE} + ${MSDOSSIZE}
 
 all: ${FS}
 
-${FS}: ${BASE} ${XBASE}
+${FS}: ${BASE} ${XBASE} ${SIG}
 	dd if=/dev/zero of=${FS} bs=512 count=${TOTALSIZE}
 	vnconfig -v ${FS} > vnd
 	fdisk -iy -b "${MSDOSSIZE}@${MSDOSSTART}:c" `cat vnd` >/dev/null
@@ -41,9 +42,8 @@ ${FS}: ${BASE} ${XBASE}
 	ln ${MOUNT_POINT}/${OSREV}/${MACHINE}/bsd.rd ${MOUNT_POINT}/bsd.rd
 	ln ${MOUNT_POINT}/${OSREV}/${MACHINE}/bsd.rd ${MOUNT_POINT}/bsd
 
-	cat ${RELDIR}/SHA256 ${RELXDIR}/SHA256 > \
-	    ${MOUNT_POINT}/${OSREV}/${MACHINE}/SHA256
-	# XXX no SHA256.sig
+	cp -p ${RELDIR}/SHA256 ${MOUNT_POINT}/${OSREV}/${MACHINE}/SHA256
+	cp -p ${RELDIR}/SHA256.sig ${MOUNT_POINT}/${OSREV}/${MACHINE}/SHA256.sig
 	df -i ${MOUNT_POINT}
 	umount ${MOUNT_POINT}
 	vnconfig -u `cat vnd`
