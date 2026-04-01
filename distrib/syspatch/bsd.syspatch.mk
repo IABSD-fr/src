@@ -42,7 +42,7 @@ SYSPATCH=	${SYSPATCH_BASE}.tgz
 # arguments used by different tools
 MTREE_FILES=	/etc/mtree/4.4BSD.dist
 MTREE_ARGS=	-qdep ${FAKE} -U
-SIGNIFY_KEY=	/etc/signify/openbsd-${OSrev}-base.pub
+SIGNIFY_KEY=	/etc/signify/iabsd-${OSrev}-base.pub
 PATCH_STRIP?=	-p0
 PATCH_ARGS=	-d ${SRCDIR} -z .orig --forward --quiet -E ${PATCH_STRIP}
 
@@ -182,14 +182,14 @@ ${_BUILD_COOKIE}: ${_PATCH_COOKIE} ${_FAKE_COOKIE}
 		su ${BUILDUSER} -c 'umask ${WOBJUMASK} && \
 		cd ${SRCDIR}/sys/arch/${MACHINE}/compile/GENERIC/obj && \
 		cp -p *.o Makefile ld.script makegap.sh \
-		${FAKE}/usr/share/relink/kernel/GENERIC/' || \
+		${FAKE}/var/relink/kernel/GENERIC/' || \
 		{ echo "***>   failed to install ${_kern} object files"; \
 		exit 1; }; \
 	elif [ ${_kern} = "GENERIC.MP" ]; then \
 		su ${BUILDUSER} -c 'umask ${WOBJUMASK} && \
 		cd ${SRCDIR}/sys/arch/${MACHINE}/compile/GENERIC.MP/obj && \
 		cp -p *.o Makefile ld.script makegap.sh \
-		${FAKE}/usr/share/relink/kernel/GENERIC.MP/' || \
+		${FAKE}/var/relink/kernel/GENERIC.MP/' || \
 		{ echo "***>   failed to install ${_kern} object files"; \
 		exit 1; }; \
 	fi; exit 0

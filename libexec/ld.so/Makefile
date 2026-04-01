@@ -123,6 +123,6 @@ ld.so.a: ${OBJS} ${.CURDIR}/Symbols.map ${test_prog} ${LD_SCRIPT}
 
 afterinstall: ld.so.a
 	install -d -o root -g wheel -m 755 \
-	    ${DESTDIR}/usr/share/relink/usr/libexec
+	    ${DESTDIR}/var/relink/usr/libexec
 	install -o ${BINOWN} -g ${BINGRP} -m ${NONBINMODE} \
-	    ld.so.a ${DESTDIR}/usr/share/relink/usr/libexec/ld.so.a
+	    ld.so.a ${DESTDIR}/var/relink/usr/libexec/ld.so.a

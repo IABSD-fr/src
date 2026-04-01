@@ -829,7 +829,7 @@ create cur-blockno -1 l, -1 l,		\ Current disk block.
 ;
 
 : do-boot ( bootfile -- )
-   ." OpenBSD IEEE 1275 Bootblock 2.1" cr
+   ." IABSD IEEE 1275 Bootblock 2.1" cr
 
    \ Open boot device
    boot-path				( boot-path len )

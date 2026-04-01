@@ -81,7 +81,7 @@ REBOOT=true
 WHAT='release'
 
 VERSION=$(uname -r)
-NEXT_VERSION=$(echo ${VERSION} + 0.1 | bc)
+NEXT_VERSION=$(printf '%g' $(echo ${VERSION} + 0.1 | bc))
 
 while getopts b:fknrR:s arg; do
 	case ${arg} in
@@ -105,7 +105,7 @@ shift $(( OPTIND -1 ))
 
 case $# in
 0)	MIRROR=$(sed 's/#.*//;/^$/d' /etc/installurl) 2>/dev/null ||
-		MIRROR=https://cdn.openbsd.org/pub/OpenBSD
+		MIRROR=https://ftp.iabsd.fr/pub/IABSD
 	;;
 1)	MIRROR=$1
 	;;
@@ -154,7 +154,7 @@ fi
 
 # The key extracted from SHA256.sig must precisely match a pattern
 KEY=$(head -1 < SHA256.sig | cut -d' ' -f5 | \
-	egrep '^openbsd-[[:digit:]]{2,3}-base.pub$' || true)
+	egrep '^iabsd-[[:digit:]]{2,3}-base.pub$' || true)
 if [[ -z $KEY ]]; then
 	echo "Invalid SHA256.sig file"
 	exit 1
@@ -162,18 +162,17 @@ fi
 
 # If required key is not in the system, get it from a signed bundle
 if ! [[ -r /etc/signify/$KEY ]]; then
-	HAVEKEY=$(cd /etc/signify && ls -1 openbsd-*-base.pub | \
+	HAVEKEY=$(cd /etc/signify && ls -1 iabsd-*-base.pub | \
 	    tail -2 | head -1 | cut -d- -f2)
 	BUNDLE=sigbundle-${HAVEKEY}.tgz
 	FWKEY=$(echo $KEY | sed -e 's/base/fw/')
 	echo "Adding missing keys from bundle $BUNDLE"
-	unpriv -f ${BUNDLE} ftp -N sysupgrade -Vmo $BUNDLE https://ftp.openbsd.org/pub/OpenBSD/signify/$BUNDLE
+	unpriv -f ${BUNDLE} ftp -N sysupgrade -Vmo $BUNDLE https://ftp.iabsd.fr/pub/IABSD/signify/$BUNDLE
 	signify -Vzq -m - -x $BUNDLE | (cd /etc/signify && tar xfz - $KEY $FWKEY)
 	rm $BUNDLE
 fi
 
 unpriv -f SHA256 signify -Ve -x SHA256.sig -m SHA256
-rm SHA256.sig
 
 if cmp -s /var/db/installed.SHA256 SHA256 && ! $FORCE; then
 	echo "Already on latest ${WHAT}."
@@ -221,11 +220,10 @@ fi
 cat <<__EOT >/auto_upgrade.conf
 Location of sets = disk
 Pathname to the sets = ${SETSDIR}/
-Directory does not contain SHA256.sig. Continue without verification = yes
 __EOT
 
 if ! ${KEEP}; then
-	CLEAN=$(echo BUILDINFO SHA256 ${SETS} | sed -e 's/ /,/g')
+	CLEAN=$(echo BUILDINFO SHA256 SHA256.sig ${SETS} | sed -e 's/ /,/g')
 	cat <<__EOT > /etc/rc.firsttime
 rm -f ${SETSDIR}/{${CLEAN}}
 __EOT
@@ -233,12 +231,12 @@ fi
 
 echo Fetching updated firmware.
 set -A _NEXTKERNV -- $(what bsd |
-	sed -n '2s/^[[:blank:]]OpenBSD \([1-9][0-9]*\.[0-9]\)\([^ ]*\).*/\1 \2/p')
+	sed -n '2s/^[[:blank:]]IABSD \([0-9][0-9]*\.[0-9]\)\([^ ]*\).*/\1 \2/p')
 
 if [[ ${_NEXTKERNV[1]} == '-current' ]]; then
-	FW_URL=http://firmware.openbsd.org/firmware/snapshots/
+	FW_URL=http://firmware.iabsd.fr/firmware/snapshots/
 else
-	FW_URL=http://firmware.openbsd.org/firmware/${_NEXTKERNV[0]}/
+	FW_URL=http://firmware.iabsd.fr/firmware/${_NEXTKERNV[0]}/
 fi
 VNAME="${_NEXTKERNV[0]}" fw_update -p ${FW_URL} || true
 

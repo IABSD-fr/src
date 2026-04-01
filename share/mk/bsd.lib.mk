@@ -288,12 +288,12 @@ realinstall:
 .if defined(LIBREBUILD)
 .if !defined(DESTDIR)
 	@echo cleaning out old relink libraries to conserve disk space
-	rm -f /usr/share/relink/${LIBDIR}/lib${LIB}.*.a
+	rm -f /var/relink/${LIBDIR}/lib${LIB}.*.a
 .endif	
 	${INSTALL} -d -o ${LIBOWN} -g ${LIBGRP} -m 755 \
-	   ${DESTDIR}/usr/share/relink/${LIBDIR}
+	   ${DESTDIR}/var/relink/${LIBDIR}
 	${INSTALL} ${INSTALL_COPY} -o ${LIBOWN} -g ${LIBGRP} -m ${LIBMODE} \
-	    ${FULLSHLIBNAME}.a ${DESTDIR}/usr/share/relink/${LIBDIR}
+	    ${FULLSHLIBNAME}.a ${DESTDIR}/var/relink/${LIBDIR}
 .endif
 .endif
 .if defined(LINKS) && !empty(LINKS)

@@ -77,7 +77,7 @@ boot(dev_t dev)
 	cninit();
 	devboot(dev, path);
 	strncpy(path + strlen(path), ":/bsd.rd", 9);
-	printf(">> OpenBSD/" MACHINE " CDBOOT 0.2\n"
+	printf(">> IABSD/" MACHINE " CDBOOT 0.2\n"
 	    "booting %s: ", path);
 
 	/* XXX note that rnddata is not initialized */

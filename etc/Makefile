@@ -3,7 +3,7 @@
 .include <bsd.own.mk>
 
 TZDIR=		/usr/share/zoneinfo
-LOCALTIME=	Canada/Mountain
+LOCALTIME=	Europe/Paris
 MTREEDIR=	/etc/mtree
 
 NOOBJ=
@@ -30,11 +30,11 @@ kernels: ${ALL_KERNELS}
 	chmod a+r ${RELEASEDIR}/$K
 .endfor
 	cd ${.CURDIR}/../sys/arch/${MACHINE}/compile/ && \
-		tar -chzf ${DESTDIR}/usr/share/relink/kernel.tgz -s ',/obj/,/,' \
+		tar -chzf ${DESTDIR}/var/relink/kernel.tgz -s ',/obj/,/,' \
 		GENERIC*/obj/*.o GENERIC*/obj/Makefile \
 		GENERIC*/obj/ld.script GENERIC*/obj/makegap.sh
-	chown root:wheel ${DESTDIR}/usr/share/relink/kernel.tgz
-	chmod 644 ${DESTDIR}/usr/share/relink/kernel.tgz
+	chown root:wheel ${DESTDIR}/var/relink/kernel.tgz
+	chmod 644 ${DESTDIR}/var/relink/kernel.tgz
 
 # -rw-r--r--
 BINOWN= root
@@ -287,7 +287,7 @@ do-release:
 release-sets:
 	su ${BUILDUSER} -c 'exec ${MAKE} distribution'
 	su ${BUILDUSER} -c 'exec ${MAKE} kernels'
-	cp -p ${DESTDIR}/usr/share/relink/kernel.tgz /usr/share/relink/kernel.tgz
+	cp -p ${DESTDIR}/var/relink/kernel.tgz /var/relink/kernel.tgz
 	${MAKE} bootblocks
 	cd ${RELEASEDIR} && rm -f SHA256
 	cd ../distrib/sets && exec su ${BUILDUSER} -c 'exec sh maketars ${OSrev}'

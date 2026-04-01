@@ -12,19 +12,19 @@ BASE=		${RELDIR}/base${OSrev}.tgz ${RELDIR}/comp${OSrev}.tgz \
 		${RELDIR}/INSTALL.${MACHINE} ${RELDIR}/BUILDINFO
 XBASE=		${RELXDIR}/xbase${OSrev}.tgz ${RELXDIR}/xfont${OSrev}.tgz \
 		${RELXDIR}/xshare${OSrev}.tgz ${RELXDIR}/xserv${OSrev}.tgz
+SIG=		${RELDIR}/SHA256 ${RELDIR}/SHA256.sig
 
 all: ${CDROM}
 
-${CDROM}: ${BASE} ${XBASE}
+${CDROM}: ${BASE} ${XBASE} ${SIG}
 	rm -rf ${.OBJDIR}/cd-dir
 	mkdir -p ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 
 	cp -p ${BASE} ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 	cp -p ${XBASE} ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 
-	cat ${RELDIR}/SHA256 ${RELXDIR}/SHA256 > \
-	    ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}/SHA256
-	# XXX no SHA256.sig
+	cp -p ${RELDIR}/SHA256 ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}/SHA256
+	cp -p ${RELDIR}/SHA256.sig ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}/SHA256.sig
 
 	# make sure right kernel is in /
 	ln ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}/bsd.rd ${.OBJDIR}/cd-dir/bsd.rd
@@ -34,10 +34,10 @@ ${CDROM}: ${BASE} ${XBASE}
 	cp -p ${RELDIR}/bootxx ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 
 	(mkhybrid -a -R -T -L -d -D -N -o ${.OBJDIR}/${CDROM} -v -v -v \
-	    -A "OpenBSD ${OSREV} ${MACHINE} Install CD" \
-	    -P "Copyright (c) `date +%Y` Theo de Raadt, The OpenBSD project" \
-	    -p "Theo de Raadt <deraadt@openbsd.org>" \
-	    -V "OpenBSD/${MACHINE}   ${OSREV} Install CD" \
+	    -A "IABSD ${OSREV} ${MACHINE} Install CD" \
+	    -P "Copyright (c) `date +%Y` Thomas de Grivel" \
+	    -p "Thomas de Grivel <thodg@kmx.io>" \
+	    -V "IABSD/${MACHINE}   ${OSREV} Install CD" \
 	    ${.OBJDIR}/cd-dir 2>&1) | tee log
 	vnconfig -v ${CDROM} > vnd
 	mount -t cd9660 /dev/`cat vnd`a ${MOUNT_POINT}

@@ -68,6 +68,9 @@
 #include <ufs/ufs/dirhash.h>
 #endif
 #include <ufs/ext2fs/ext2fs_extern.h>
+#ifdef EXT4FS
+#include <ufs/ext4fs/ext4fs.h>
+#endif
 
 #include <uvm/uvm_extern.h>
 
@@ -105,6 +108,12 @@ ufs_itimes(struct vnode *vp)
 #ifdef EXT2FS
 	if (IS_EXT2_VNODE(ip->i_vnode)) {
 		EXT2FS_ITIMES(ip);
+		goto out;
+	}
+#endif
+#ifdef EXT4FS
+	if (vp->v_tag == VT_EXT4FS) {
+		EXT4FS_ITIMES(ip);
 		goto out;
 	}
 #endif
@@ -1891,6 +1900,14 @@ filt_ufsread(struct knote *kn, long hint)
 	if (IS_EXT2_VNODE(ip->i_vnode))
 		kn->kn_data = ext2fs_size(ip) - foffset(kn->kn_fp);
 	else
+#endif
+#ifdef EXT4FS
+	if (ip->i_vnode->v_tag == VT_EXT4FS) {
+		struct ext4fs_dinode *din = &ip->i_e4din->dinode;
+		kn->kn_data = ((off_t)letoh32(din->i_size_lo) |
+		    ((off_t)letoh32(din->i_size_hi) << 32)) -
+		    foffset(kn->kn_fp);
+	} else
 #endif
 		kn->kn_data = DIP(ip, size) - foffset(kn->kn_fp);
 	if (kn->kn_data == 0 && kn->kn_sfflags & NOTE_EOF) {

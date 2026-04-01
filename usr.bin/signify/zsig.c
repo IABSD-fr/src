@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <fcntl.h>
+#include <limits.h>
 #include "signify.h"
 
 struct gzheader {
@@ -315,5 +316,129 @@ zsign(const char *seckeyfile, const char *msgfile, const char *sigfile,
 	}
 	free(buffer);
 	close(fdout);
+}
+static void
+zsign_one(struct decseckey *dsk, const char *seckeyfile, const char *msgfile,
+    const char *sigfile, int skipdate)
+{
+	size_t bufsize = MYBUFSIZE;
+	int fdin, fdout;
+	struct gzheader h;
+	struct stat sb;
+	size_t space;
+	char *msg;
+	char *p;
+	uint8_t *buffer;
+	uint8_t *sighdr;
+	char date[80];
+	time_t clock;
+
+	fdin = xopen(msgfile, O_RDONLY, 0);
+	if (fstat(fdin, &sb) == -1 || !S_ISREG(sb.st_mode))
+		errx(1, "Sorry can only sign regular files");
+
+	readgz_header(&h, fdin);
+	free(h.buffer);
+
+	if (lseek(fdin, h.headerlength, SEEK_SET) == -1)
+		err(1, "seek in %s", msgfile);
+
+	space = (sb.st_size / MYBUFSIZE+1) * SHA512_256_DIGEST_STRING_LENGTH +
+		1024;
+
+	msg = xmalloc(space);
+	buffer = xmalloc(bufsize);
+	if (skipdate) {
+		clock = 0;
+	} else {
+		time(&clock);
+	}
+	strftime(date, sizeof date, "%Y-%m-%dT%H:%M:%SZ", gmtime(&clock));
+	snprintf(msg, space,
+	    "date=%s\n"
+	    "key=%s\n"
+	    "algorithm=SHA512/256\n"
+	    "blocksize=%zu\n\n",
+	    date, check_keyname_compliance(NULL, seckeyfile), bufsize);
+	p = strchr(msg, 0);
+
+	while (1) {
+		size_t n = read(fdin, buffer, bufsize);
+		if (n == -1)
+			err(1, "read from %s", msgfile);
+		if (n == 0)
+			break;
+		SHA512_256Data(buffer, n, p);
+		p += SHA512_256_DIGEST_STRING_LENGTH;
+		p[-1] = '\n';
+		if (msg + space < p)
+			errx(1, "file too long %s", msgfile);
+	}
+	*p = 0;
+
+	fdout = xopen(sigfile, O_CREAT|O_TRUNC|O_NOFOLLOW|O_WRONLY, 0666);
+	sighdr = createsig_with_key(dsk, msg, p-msg);
+	fake[8] = h.xflg;
+
+	writeall(fdout, fake, sizeof fake, sigfile);
+	writeall(fdout, sighdr, strlen(sighdr), sigfile);
+	free(sighdr);
+	writeall(fdout, msg, p - msg + 1, sigfile);
+	free(msg);
+
+	if (lseek(fdin, h.headerlength, SEEK_SET) == -1)
+		err(1, "seek in %s", msgfile);
+
+	while (1) {
+		size_t n = read(fdin, buffer, bufsize);
+		if (n == -1)
+			err(1, "read from %s", msgfile);
+		if (n == 0)
+			break;
+		writeall(fdout, buffer, n, sigfile);
+	}
+	free(buffer);
+	close(fdout);
+	close(fdin);
+}
+
+void
+zsign_filelist(const char *seckeyfile, const char *filelist, int skipdate)
+{
+	struct decseckey dsk;
+	FILE *fp;
+	char line[PATH_MAX];
+
+	readseckey(seckeyfile, &dsk);
+
+	if (strcmp(filelist, "-") == 0)
+		fp = stdin;
+	else {
+		fp = fopen(filelist, "r");
+		if (!fp)
+			err(1, "can't open %s", filelist);
+	}
+
+	while (fgets(line, sizeof(line), fp)) {
+		size_t len = strlen(line);
+		if (len > 0 && line[len-1] == '\n')
+			line[len-1] = '\0';
+		if (line[0] == '\0')
+			continue;
+		{
+			char tmp[PATH_MAX];
+			int nr;
+			nr = snprintf(tmp, sizeof(tmp), "%s.sig", line);
+			if (nr < 0 || nr >= sizeof(tmp))
+				errx(1, "path too long");
+			zsign_one(&dsk, seckeyfile, line, tmp, skipdate);
+			if (rename(tmp, line) == -1)
+				err(1, "rename %s to %s", tmp, line);
+		}
+	}
+
+	if (fp != stdin)
+		fclose(fp);
+	explicit_bzero(&dsk, sizeof(dsk));
 }
 #endif

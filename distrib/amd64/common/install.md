@@ -43,7 +43,7 @@ grep -q -e '^efifb0 at mainbus0' -e '^acpi0 at bios0: ACPI [5-9]\.' \
 md_installboot() {
 	if ! installboot -cr /mnt ${1}; then
 		echo "\nFailed to install bootblocks."
-		echo "You will not be able to boot OpenBSD from ${1}."
+		echo "You will not be able to boot IABSD from ${1}."
 		exit
 	fi
 }
@@ -71,7 +71,7 @@ md_prep_fdisk() {
 		ask "$_q or (E)dit?" "$_d"
 		case $resp in
 		[wW]*)
-			echo -n "Setting OpenBSD MBR partition to whole $_disk..."
+			echo -n "Setting IABSD MBR partition to whole $_disk..."
 			fdisk -iy $_disk >/dev/null
 			echo "done."
 			return ;;
@@ -80,7 +80,7 @@ md_prep_fdisk() {
 				ask_yn "An EFI/GPT disk may not boot. Proceed?" || continue
 			fi
 
-			echo -n "Setting OpenBSD GPT partition to whole $_disk..."
+			echo -n "Setting IABSD GPT partition to whole $_disk..."
 			fdisk -gy -b 532480 $_disk >/dev/null
 			echo "done."
 			return ;;
@@ -90,9 +90,9 @@ md_prep_fdisk() {
 				cat <<__EOT
 
 You will now create two GPT partitions. The first must have an id
-of 'EF' and be large enough to contain the OpenBSD boot programs,
+of 'EF' and be large enough to contain the IABSD boot programs,
 at least 532480 blocks. The second must have an id of 'A6' and will
-contain your OpenBSD data. Neither may overlap other partitions.
+contain your IABSD data. Neither may overlap other partitions.
 Inside the fdisk command, the 'manual' command describes the fdisk
 commands in detail.
 
@@ -101,7 +101,7 @@ __EOT
 				fdisk -e $_disk
 
 				if ! disk_has $_disk gpt openbsd; then
-					echo -n "No OpenBSD partition in GPT,"
+					echo -n "No IABSD partition in GPT,"
 				elif ! disk_has $_disk gpt efisys; then
 					echo -n "No EFI Sys partition in GPT,"
 				else
@@ -111,7 +111,7 @@ __EOT
 				# Manually configure the MBR.
 				cat <<__EOT
 
-You will now create a single MBR partition to contain your OpenBSD data. This
+You will now create a single MBR partition to contain your IABSD data. This
 partition must have an id of 'A6'; must *NOT* overlap other partitions; and
 must be marked as the only active partition.  Inside the fdisk command, the
 'manual' command describes all the fdisk commands in detail.
@@ -120,7 +120,7 @@ $(fdisk $_disk)
 __EOT
 				fdisk -e $_disk
 				disk_has $_disk mbr openbsd && return
-				echo -n "No OpenBSD partition in MBR,"
+				echo -n "No IABSD partition in MBR,"
 			fi
 			echo " try again." ;;
 		[oO]*)
