@@ -69,7 +69,7 @@ boot1(uint32_t *sector)
 
 	bios_sector = *sector;
 
-	putstr("\r\nOpenBSD/" MACHINE " Primary Bootstrap\r\n");
+	putstr("\r\nIABSD/" MACHINE " Primary Bootstrap\r\n");
 
 	do {
 		/*

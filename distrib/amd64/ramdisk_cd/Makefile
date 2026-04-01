@@ -56,10 +56,10 @@ ${CDROM}: bsd.rd ${EFICDBOOT}
 	cp ${DESTDIR}/usr/mdec/cdboot ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}/cdboot
 	cp ${.OBJDIR}/${EFICDBOOT} ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 	mkhybrid -a -R -T -L -l -d -D -N -o ${.OBJDIR}/${CDROM} \
-	    -A "OpenBSD ${OSREV} ${MACHINE} bootonly CD" \
-	    -P "Copyright (c) `date +%Y` Theo de Raadt, The OpenBSD project" \
-	    -p "Theo de Raadt <deraadt@openbsd.org>" \
-	    -V "OpenBSD/${MACHINE}   ${OSREV} bootonly CD" \
+	    -A "IABSD ${OSREV} ${MACHINE} bootonly CD" \
+	    -P "Copyright (c) `date +%Y` Thomas de Grivel" \
+	    -p "Thomas de Grivel <thodg@kmx.io>" \
+	    -V "IABSD/${MACHINE}     ${OSREV} bootonly CD" \
 	    -b ${OSREV}/${MACHINE}/cdbr -c ${OSREV}/${MACHINE}/boot.catalog \
 	    -e ${OSREV}/${MACHINE}/${EFICDBOOT} \
 	    ${.OBJDIR}/cd-dir
@@ -82,7 +82,7 @@ bsd:
 	    su ${BUILDUSER} -c '${MAKE} config && ${MAKE} clean && exec ${MAKE} ${MFLAGS}'
 	cp -p ${.CURDIR}/../../../sys/arch/${MACHINE}/compile/${RAMDISK}/obj/bsd bsd
 
-mr.fs: instbin bsd
+mr.fs: instbin bsd ${LISTS} ${UTILS}/dot.profile ${UTILS}/install.sub
 	rm -rf $@.d
 	install -d -o root -g wheel $@.d
 	mtree -def ${MTREE} -p $@.d -u

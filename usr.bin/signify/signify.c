@@ -81,6 +81,7 @@ usage(const char *error)
 	    "\t%1$s -C [-q] [-p pubkey] [-t keytype] -x sigfile [file ...]\n"
 	    "\t%1$s -G [-n] [-c comment] -p pubkey -s seckey\n"
 	    "\t%1$s -S [-enz] [-x sigfile] -s seckey -m message\n"
+	    "\t%1$s -S -z -s seckey -F filelist\n"
 #endif
 	    "\t%1$s -V [-eqz] [-p pubkey] [-t keytype] [-x sigfile] -m message\n",
 	    getprogname());
@@ -379,6 +380,65 @@ check_keyname_compliance(const char *pubkeyfile, const char *seckeyfile)
 	return seckeyfile;
 bad:
 	errx(1, "please use naming scheme of keyname.pub and keyname.sec");
+}
+
+void
+readseckey(const char *seckeyfile, struct decseckey *dsk)
+{
+	struct enckey enckey;
+	uint8_t xorkey[sizeof(enckey.seckey)];
+	uint8_t digest[SHA512_DIGEST_LENGTH];
+	int i, nr, rounds;
+	SHA2_CTX ctx;
+	char comment[COMMENTMAXLEN];
+
+	readb64file(seckeyfile, &enckey, sizeof(enckey), comment);
+
+	if (strcmp(seckeyfile, "-") == 0) {
+		nr = snprintf(dsk->sigcomment, sizeof(dsk->sigcomment),
+		    "signature from %s", comment);
+	} else {
+		const char *keyname = check_keyname_compliance(NULL,
+		    seckeyfile);
+		nr = snprintf(dsk->sigcomment, sizeof(dsk->sigcomment),
+		    VERIFYWITH "%.*s.pub", (int)strlen(keyname) - 4, keyname);
+	}
+	if (nr < 0 || nr >= sizeof(dsk->sigcomment))
+		errx(1, "comment too long");
+
+	if (memcmp(enckey.kdfalg, KDFALG, 2) != 0)
+		errx(1, "unsupported KDF");
+	rounds = ntohl(enckey.kdfrounds);
+	kdf(enckey.salt, sizeof(enckey.salt), rounds, 1, 0, xorkey,
+	    sizeof(xorkey));
+	for (i = 0; i < sizeof(enckey.seckey); i++)
+		enckey.seckey[i] ^= xorkey[i];
+	explicit_bzero(xorkey, sizeof(xorkey));
+	SHA512Init(&ctx);
+	SHA512Update(&ctx, enckey.seckey, sizeof(enckey.seckey));
+	SHA512Final(digest, &ctx);
+	if (memcmp(enckey.checksum, digest, sizeof(enckey.checksum)) != 0)
+		errx(1, "incorrect passphrase");
+	explicit_bzero(digest, sizeof(digest));
+
+	memcpy(dsk->seckey, enckey.seckey, sizeof(dsk->seckey));
+	memcpy(dsk->keynum, enckey.keynum, sizeof(dsk->keynum));
+	explicit_bzero(&enckey, sizeof(enckey));
+}
+
+uint8_t *
+createsig_with_key(struct decseckey *dsk, uint8_t *msg,
+    unsigned long long msglen)
+{
+	struct sig sig;
+	char *sighdr;
+
+	signmsg(dsk->seckey, msg, msglen, sig.sig);
+	memcpy(sig.keynum, dsk->keynum, KEYNUMLEN);
+	memcpy(sig.pkalg, PKALG, 2);
+
+	sighdr = createheader(dsk->sigcomment, &sig, sizeof(sig));
+	return sighdr;
 }
 
 uint8_t *
@@ -756,6 +816,7 @@ main(int argc, char **argv)
 	char *keytype = NULL;
 #ifndef VERIFYONLY
 	const char *seckeyfile = NULL, *comment = "signify";
+	const char *filelist = NULL;
 	int none = 0;
 #endif
 	int ch;
@@ -773,7 +834,7 @@ main(int argc, char **argv)
 	if (pledge("stdio rpath wpath cpath tty", NULL) == -1)
 		err(1, "pledge");
 
-	while ((ch = getopt(argc, argv, "CGSVzc:em:np:qs:t:x:")) != -1) {
+	while ((ch = getopt(argc, argv, "CGSVzc:em:nF:p:qs:t:x:")) != -1) {
 		switch (ch) {
 #ifndef VERIFYONLY
 		case 'C':
@@ -796,6 +857,9 @@ main(int argc, char **argv)
 			break;
 		case 'n':
 			none = 1;
+			break;
+		case 'F':
+			filelist = optarg;
 			break;
 		case 's':
 			seckeyfile = optarg;
@@ -877,7 +941,11 @@ main(int argc, char **argv)
 		break;
 	case SIGN:
 		/* no pledge */
-		if (gzip) {
+		if (filelist) {
+			if (!gzip || !seckeyfile)
+				usage("must specify -z -s seckey -F filelist");
+			zsign_filelist(seckeyfile, filelist, none);
+		} else if (gzip) {
 			if (!msgfile || !seckeyfile || !sigfile)
 				usage("must specify message sigfile seckey");
 			zsign(seckeyfile, msgfile, sigfile, none);

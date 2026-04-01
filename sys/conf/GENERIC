@@ -32,6 +32,7 @@ option		FFS2		# UFS2
 option		UFS_DIRHASH	# hash large directories
 option		QUOTA		# UFS quotas
 option		EXT2FS		# Second Extended Filesystem
+option		EXT4FS		# Fourth Extended Filesystem
 option		MFS		# memory file system
 option		NFSCLIENT	# Network File System client
 option		NFSSERVER	# Network File System server

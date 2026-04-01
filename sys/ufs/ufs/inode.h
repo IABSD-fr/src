@@ -43,6 +43,7 @@
 #include <ufs/ufs/dir.h>
 #include <ufs/ext2fs/ext2fs_dinode.h>
 #include <ufs/ext2fs/ext2fs_extents.h>
+#include <ufs/ext4fs/ext4fs_dinode.h>
 
 
 /*
@@ -76,11 +77,13 @@ struct inode {
 
 	union {			/* Associated filesystem. */
 		struct	fs *fs;			/* FFS */
-		struct  m_ext2fs *e2fs;		/* EXT2FS */
+		struct	m_ext2fs *e2fs;		/* EXT2FS */
+		struct	m_ext4fs *e4fs;		/* EXT4FS */
 	} inode_u;
 
 #define	i_fs	inode_u.fs
 #define	i_e2fs	inode_u.e2fs
+#define	i_e4fs	inode_u.e4fs
 
 	struct   cluster_info i_ci;
 	struct	 dquot *i_dquot[MAXQUOTAS]; /* Dquot structures. */
@@ -117,14 +120,16 @@ struct inode {
 	 * The on-disk dinode itself.
 	 */
 	union {
-		struct ufs1_dinode     *ffs1_din;
-		struct ufs2_dinode     *ffs2_din;
-		struct ext2fs_dinode   *e2fs_din;
+		struct ufs1_dinode	 *ffs1_din;
+		struct ufs2_dinode	 *ffs2_din;
+		struct ext2fs_dinode	 *e2fs_din;
+		struct ext4fs_dinode_256 *e4fs_din;
 	} dinode_u;
 
 #define i_din1	dinode_u.ffs1_din
 #define i_din2	dinode_u.ffs2_din
 #define	i_e2din	dinode_u.e2fs_din
+#define	i_e4din	dinode_u.e4fs_din
 
 	struct inode_vtbl *i_vtbl;
 };
@@ -223,6 +228,8 @@ struct inode_vtbl {
 #define	i_size			i_din1->di_size
 #define	i_uid			i_din1->di_uid
 #endif	/* _KERNEL */
+
+#define i_e4fs_nlink		i_e4din->dinode.i_links_count
 
 #define i_e2fs_mode		i_e2din->e2di_mode
 #define i_e2fs_size		i_e2din->e2di_size
