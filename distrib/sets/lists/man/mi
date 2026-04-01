@@ -2735,6 +2735,7 @@
 ./usr/share/man/man8/mount.8
 ./usr/share/man/man8/mount_cd9660.8
 ./usr/share/man/man8/mount_ext2fs.8
+./usr/share/man/man8/mount_ext4fs.8
 ./usr/share/man/man8/mount_ffs.8
 ./usr/share/man/man8/mount_msdos.8
 ./usr/share/man/man8/mount_nfs.8

@@ -320,6 +320,7 @@ struct statfs {
 #define	MOUNT_AFS	"afs"		/* Andrew Filesystem */
 #define	MOUNT_CD9660	"cd9660"	/* ISO9660 (aka CDROM) Filesystem */
 #define	MOUNT_EXT2FS	"ext2fs"	/* Second Extended Filesystem */
+#define	MOUNT_EXT4FS	"ext4fs"	/* Fourth Extended Filesystem */
 #define	MOUNT_NCPFS	"ncpfs"		/* NetWare Network File System */
 #define	MOUNT_NTFS	"ntfs"		/* NTFS */
 #define	MOUNT_UDF	"udf"		/* UDF */
@@ -551,6 +552,7 @@ extern	const struct vfsops msdosfs_vfsops;
 extern	const struct vfsops nfs_vfsops;
 extern	const struct vfsops cd9660_vfsops;
 extern	const struct vfsops ext2fs_vfsops;
+extern	const struct vfsops ext4fs_vfsops;
 extern	const struct vfsops ntfs_vfsops;
 extern	const struct vfsops udf_vfsops;
 extern	const struct vfsops fusefs_vfsops;

@@ -173,7 +173,7 @@ SPECIAL	cd dev; sh MAKEDEV ramdisk
 COPY	${CURDIR}/../../miniroot/group		etc/group
 COPY	${CURDIR}/../../miniroot/master.passwd	etc/master.passwd
 SPECIAL	pwd_mkdb -p -d etc master.passwd; rm etc/master.passwd
-COPY	${DESTDIR}/etc/signify/openbsd-${OSrev}-base.pub	etc/signify/openbsd-${OSrev}-base.pub
+COPY	${DESTDIR}/etc/signify/iabsd-${OSrev}-base.pub	etc/signify/iabsd-${OSrev}-base.pub
 COPY	${CURDIR}/../../miniroot/protocols	etc/protocols
 COPY	${CURDIR}/../../miniroot/services	etc/services
 TERMCAP	vt100,vt220,dumb			usr/share/misc/termcap

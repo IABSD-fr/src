@@ -66,7 +66,7 @@ main(void)
 	/* Keep stdout unbuffered to mimic ordinary bootblocks. */
 	setvbuf(stdout, NULL, _IONBF, 0);
 
-	printf(">> OpenBSD/" MACHINE " BOOT %s\n", version);
+	printf(">> IABSD/" MACHINE " BOOT %s\n", version);
 
 	kexecfd = open("/dev/kexec", O_WRONLY);
 	if (kexecfd == -1)

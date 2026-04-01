@@ -43,6 +43,7 @@
 #include <ufs/ufs/ufs_extern.h>
 #include <ufs/ufs/ufsmount.h>
 #include <ufs/ext2fs/ext2fs_extern.h>
+#include <ufs/ext4fs/ext4fs_extern.h>
 
 #include <crypto/siphash.h>
 
@@ -110,6 +111,11 @@ loop:
 			     */
 			    IS_EXT2_VNODE(vp) ? ip->i_e2fs_nlink <= 0 :
 #endif
+			    /*
+			     * XXX DIP does not cover ext4fs either;
+			     * use i_e4din directly like ext2fs uses i_e2din.
+			     */
+			    vp->v_tag == VT_EXT4FS ? ip->i_e4fs_nlink <= 0 :
 			    DIP(ip, nlink) <= 0) &&
 			     (vp->v_mount->mnt_flag & MNT_RDONLY) == 0) {
 				/*

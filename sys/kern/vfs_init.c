@@ -100,6 +100,11 @@ static struct vfsconf vfsconflist[] = {
 	{ &tmpfs_vfsops, MOUNT_TMPFS, 19, 0, MNT_LOCAL,
 	    sizeof(struct tmpfs_args) },
 #endif
+
+#ifdef EXT4FS
+	{ &ext4fs_vfsops, MOUNT_EXT4FS, 22, 0, MNT_LOCAL,
+	    sizeof(struct ufs_args) },
+#endif
 };
 
 

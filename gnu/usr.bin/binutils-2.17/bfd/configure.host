@@ -45,6 +45,7 @@ i[3-7]86-sequent-sysv*)	HDEFINES=-Dshared=genshared ;;
 
 mips*-*-netbsd*)	;;
 mips*-*-openbsd*)	;;
+mips*-*-iabsd*)		;;
 mips*-dec-*)		HDEFINES="-G 4"	;;
 mips*-sgi-irix3*)	HDEFINES="-G 4" ;;
 mips*-sgi-irix4*)	HDEFINES="-G 4" ;;
