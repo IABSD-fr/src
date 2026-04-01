@@ -20,6 +20,7 @@
 #define signify_h
 extern void zverify(const char *, const char *, const char *, const char *);
 extern void zsign(const char *, const char *, const char *, int);
+extern void zsign_filelist(const char *, const char *, int);
 
 extern const char *check_keyname_compliance(const char *, const char *);
 
@@ -29,6 +30,15 @@ extern int xopen(const char *, int, mode_t);
 extern void *verifyzdata(uint8_t *, unsigned long long,
     const char *, const char *, const char *);
 extern uint8_t *createsig(const char *, const char *, uint8_t *,
+    unsigned long long);
+
+struct decseckey {
+	uint8_t seckey[64];
+	uint8_t keynum[8];
+	char sigcomment[1024];
+};
+extern void readseckey(const char *, struct decseckey *);
+extern uint8_t *createsig_with_key(struct decseckey *, uint8_t *,
     unsigned long long);
 
 

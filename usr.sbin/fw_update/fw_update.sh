@@ -507,7 +507,7 @@ set_fw_paths() {
 
 	if [ ! "$_version" ]; then
 		_version=$(sed -nE \
-		    '/^OpenBSD ([0-9]+\.[0-9][^ ]*) .*/{s//\1/;h;};${g;p;}' \
+		    '/^IABSD ([0-9]+\.[0-9][^ ]*) .*/{s//\1/;h;};${g;p;}' \
 		    "${DMESG:-/var/run/dmesg.boot}")
 	
 		# If VNAME was set in the environment instead of the DMESG,
@@ -519,13 +519,13 @@ set_fw_paths() {
 	fi
 	
 	[ "${FWURL:-}" ] ||
-	     FWURL=http://firmware.openbsd.org/firmware/${_fwdir:-$_version}
+	     FWURL=http://firmware.iabsd.fr/firmware/${_fwdir:-$_version}
 
 	FWURL=${FWURL%%+(/)}
 
 	# TODO: Would it be better to use the untrusted comment in CFILE.sig?
 	_version=${_version%.*}${_version#*.}
-	FWPUB_KEY=${DESTDIR}/etc/signify/openbsd-${_version}-fw.pub
+	FWPUB_KEY=${DESTDIR}/etc/signify/iabsd-${_version}-fw.pub
 }
 
 usage() {

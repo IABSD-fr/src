@@ -16,6 +16,7 @@ BASE=		${RELDIR}/base${OSrev}.tgz ${RELDIR}/comp${OSrev}.tgz \
 		${RELDIR}/INSTALL.${MACHINE} ${RELDIR}/BUILDINFO
 XBASE=		${RELXDIR}/xbase${OSrev}.tgz ${RELXDIR}/xfont${OSrev}.tgz \
 		${RELXDIR}/xshare${OSrev}.tgz ${RELXDIR}/xserv${OSrev}.tgz
+SIG=		${RELDIR}/SHA256 ${RELDIR}/SHA256.sig
 
 EFIBOOT?=	${DESTDIR}/usr/mdec/BOOTX64.EFI ${DESTDIR}/usr/mdec/BOOTIA32.EFI
 EFICDBOOT=	eficdboot
@@ -25,7 +26,7 @@ TOTALSIZE!=	expr ${FSSIZE} + ${MSDOSSIZE}
 
 all: ${FS} ${CDROM}
 
-${FS}: ${BASE} ${XBASE} bsd.rd
+${FS}: ${BASE} ${XBASE} ${SIG} bsd.rd
 	dd if=/dev/zero of=${FS} bs=512 count=${TOTALSIZE}
 	vnconfig -v ${FS} > vnd
 	fdisk -yi -l ${FSSIZE} -b ${MSDOSSIZE} -f ${DESTDIR}/usr/mdec/mbr `cat vnd`
@@ -49,9 +50,8 @@ ${FS}: ${BASE} ${XBASE} bsd.rd
 	cp -p ${BASE} ${MOUNT_POINT}/${OSREV}/${MACHINE}
 	cp -p ${XBASE} ${MOUNT_POINT}/${OSREV}/${MACHINE}
 
-	cat ${RELDIR}/SHA256 ${RELXDIR}/SHA256 > \
-	    ${MOUNT_POINT}/${OSREV}/${MACHINE}/SHA256
-	# XXX no SHA256.sig
+	cp -p ${RELDIR}/SHA256 ${MOUNT_POINT}/${OSREV}/${MACHINE}/SHA256
+	cp -p ${RELDIR}/SHA256.sig ${MOUNT_POINT}/${OSREV}/${MACHINE}/SHA256.sig
 	df -i ${MOUNT_POINT}
 	umount ${MOUNT_POINT}
 	vnconfig -u `cat vnd`
@@ -64,7 +64,7 @@ ${EFICDBOOT}: ${EFIBOOT}
 	makefs -t msdos -o create_size=${EFICDBOOTSIZE} ${EFICDBOOT} \
 	    ${.OBJDIR}/eficdboot-dir
 
-${CDROM}: ${BASE} ${XBASE} ${EFICDBOOT}
+${CDROM}: ${BASE} ${XBASE} ${SIG} ${EFICDBOOT}
 	rm -rf ${.OBJDIR}/cd-dir
 	mkdir -p ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 	mkdir -p ${.OBJDIR}/cd-dir/etc
@@ -73,19 +73,18 @@ ${CDROM}: ${BASE} ${XBASE} ${EFICDBOOT}
 	cp -p ${BASE} ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 	cp -p ${XBASE} ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 
-	cat ${RELDIR}/SHA256 ${RELXDIR}/SHA256 > \
-	    ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}/SHA256
-	# XXX no SHA256.sig
+	cp -p ${RELDIR}/SHA256 ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}/SHA256
+	cp -p ${RELDIR}/SHA256.sig ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}/SHA256.sig
 
 	cp -p ${RELDIR}/cdbr ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 	cp -p ${RELDIR}/cdboot ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}/cdboot
 	cp -p ${.OBJDIR}/${EFICDBOOT} ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 
 	mkhybrid -a -R -T -L -l -d -D -N -o ${.OBJDIR}/${CDROM} \
-	    -A "OpenBSD ${OSREV} ${MACHINE} Install CD" \
-	    -P "Copyright (c) `date +%Y` Theo de Raadt, The OpenBSD project" \
-	    -p "Theo de Raadt <deraadt@openbsd.org>" \
-	    -V "OpenBSD/${MACHINE}   ${OSREV} Install CD" \
+	    -A "IABSD ${OSREV} ${MACHINE} Install CD" \
+	    -P "Copyright (c) `date +%Y` Thomas de Grivel" \
+	    -p "Thomas de Grivel <thodg@kmx.io>" \
+	    -V "IABSD/${MACHINE}     ${OSREV} Install CD" \
 	    -b ${OSREV}/${MACHINE}/cdbr -c ${OSREV}/${MACHINE}/boot.catalog \
 	    -e ${OSREV}/${MACHINE}/${EFICDBOOT} \
 	    ${.OBJDIR}/cd-dir

@@ -38,7 +38,7 @@ set +o sh
 export VNAME=$(sysctl -n kern.osrelease)
 export VERSION="${VNAME%.*}${VNAME#*.}"
 export ARCH=$(sysctl -n hw.machine)
-export OBSD="OpenBSD/$ARCH $VNAME"
+export OBSD="IABSD/$ARCH $VNAME"
 export PATH=/sbin:/bin:/usr/bin:/usr/sbin:/
 
 umask 022

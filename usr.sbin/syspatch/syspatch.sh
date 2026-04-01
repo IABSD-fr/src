@@ -47,8 +47,8 @@ apply_patch()
 
 	_kernel=$(sysctl -n kern.osversion)
 	[[ ${_kernel%#*} == "GENERIC.MP" ]] &&
-		_s="-s @usr/share/relink/kernel/GENERIC/.*@@g" ||
-		_s="-s @usr/share/relink/kernel/GENERIC.MP/.*@@g"
+		_s="-s @var/relink/kernel/GENERIC/.*@@g" ||
+		_s="-s @var/relink/kernel/GENERIC.MP/.*@@g"
 	_files="$(tar -xvzphf ${_TMP}/syspatch${_patch}.tgz -C ${_edir} \
 		${_s})" || { rm -r ${_PDIR}/${_patch}; return 1; }
 
@@ -70,7 +70,7 @@ apply_patch()
 	trap exit INT
 
 	echo ${_files} | grep -Eqv \
-		'(^|[[:blank:]]+)usr/share/relink/kernel/GENERI(C|C.MP)/[[:print:]]+([[:blank:]]+|$)' ||
+		'(^|[[:blank:]]+)var/relink/kernel/GENERI(C|C.MP)/[[:print:]]+([[:blank:]]+|$)' ||
 		_KARL=true
 
 	(! ${_upself} || err "updated itself, run it again to install \
@@ -227,7 +227,7 @@ rollback_patch()
 	trap exit INT
 
 	echo ${_files} | grep -Eqv \
-		'(^|[[:blank:]]+)usr/share/relink/kernel/GENERI(C|C.MP)/[[:print:]]+([[:blank:]]+|$)' ||
+		'(^|[[:blank:]]+)var/relink/kernel/GENERI(C|C.MP)/[[:print:]]+([[:blank:]]+|$)' ||
 		_KARL=true
 }
 

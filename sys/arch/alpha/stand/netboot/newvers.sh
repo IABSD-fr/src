@@ -35,7 +35,7 @@
 u=${USER-root} h=`hostname` t=`date`
 r=`awk ' { print $3 ; exit } ' < $1`
 
-echo "char bootprog_name[] = \"OpenBSD/alpha Network Boot\";" > vers.c
+echo "char bootprog_name[] = \"IABSD/alpha Network Boot\";" > vers.c
 echo "char bootprog_rev[] = \"${r}\";" >> vers.c
 echo "char bootprog_date[] = \"${t}\";" >> vers.c
 echo "char bootprog_maker[] = \"${u}@${h}\";" >> vers.c

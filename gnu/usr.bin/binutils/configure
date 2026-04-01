@@ -1102,6 +1102,10 @@ case "${target}" in
     noconfigdirs="$noconfigdirs target-libiberty"
     noconfigdirs="$noconfigdirs gdb"
    ;;
+  *-*-iabsd.*)
+    noconfigdirs="$noconfigdirs target-libiberty"
+    noconfigdirs="$noconfigdirs gdb"
+   ;;
 esac
 
 case "${target}" in
@@ -1268,6 +1272,7 @@ case "${target}" in
   parisc*-*-linux* | hppa*-*-linux* | \
   hppa*-*-lites* | \
   hppa*-*-openbsd* | \
+  hppa*-*-iabsd* | \
   hppa*64*-*-*)
     noconfigdirs="$noconfigdirs ${libgcj}"
     # Do configure ld/binutils/gas for this case.
@@ -1431,6 +1436,9 @@ case "${target}" in
   mips*-*-openbsd*)
     noconfigdirs="$noconfigdirs target-libgloss ${libgcj}"
     ;;
+  mips*-*-iabsd*)
+    noconfigdirs="$noconfigdirs target-libgloss ${libgcj}"
+    ;;
   mips*-*-bsd*)
     noconfigdirs="$noconfigdirs gprof target-libgloss ${libgcj}"
     ;;
@@ -1490,6 +1498,9 @@ case "${target}" in
     noconfigdirs="$noconfigdirs target-libgloss ${libgcj}"
     ;;
   vax-*-openbsd*)
+    noconfigdirs="$noconfigdirs ${libgcj}"
+    ;;
+  vax-*-iabsd*)
     noconfigdirs="$noconfigdirs ${libgcj}"
     ;;
   vax-*-vms)

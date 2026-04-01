@@ -15,6 +15,7 @@ BASE=		${RELDIR}/base${OSrev}.tgz ${RELDIR}/comp${OSrev}.tgz \
 		${RELDIR}/INSTALL.${MACHINE} ${RELDIR}/BUILDINFO
 XBASE=		${RELXDIR}/xbase${OSrev}.tgz ${RELXDIR}/xfont${OSrev}.tgz \
 		${RELXDIR}/xshare${OSrev}.tgz ${RELXDIR}/xserv${OSrev}.tgz
+SIG=		${RELDIR}/SHA256 ${RELDIR}/SHA256.sig
 
 # this offset is required by Rockchip
 MSDOSSTART=	32768
@@ -69,7 +70,7 @@ cdbr:	${RELDIR}/BOOTAA64.EFI
 	vnconfig -u `cat vnd`
 	rm -f vnd
 
-${FS}: ${BASE} ${XBASE}
+${FS}: ${BASE} ${XBASE} ${SIG}
 	dd if=/dev/zero of=${FS} bs=512 count=${FSSIZE}
 	vnconfig -v ${FS} > vnd
 	fdisk -iy -b "${MSDOSSIZE}@${MSDOSSTART}:c" `cat vnd` >/dev/null
@@ -98,15 +99,14 @@ ${FS}: ${BASE} ${XBASE}
 	ln ${MOUNT_POINT}/${OSREV}/${MACHINE}/bsd.rd ${MOUNT_POINT}/bsd.rd
 	ln ${MOUNT_POINT}/${OSREV}/${MACHINE}/bsd.rd ${MOUNT_POINT}/bsd
 
-	cat ${RELDIR}/SHA256 ${RELXDIR}/SHA256 > \
-	    ${MOUNT_POINT}/${OSREV}/${MACHINE}/SHA256
-	# XXX no SHA256.sig
+	cp -p ${RELDIR}/SHA256 ${MOUNT_POINT}/${OSREV}/${MACHINE}/SHA256
+	cp -p ${RELDIR}/SHA256.sig ${MOUNT_POINT}/${OSREV}/${MACHINE}/SHA256.sig
 	df -i ${MOUNT_POINT}
 	umount ${MOUNT_POINT}
 	vnconfig -u `cat vnd`
 	rm -f vnd
 
-${CDROM}: ${BASE} ${XBASE} cdbr
+${CDROM}: ${BASE} ${XBASE} ${SIG} cdbr
 	rm -rf ${.OBJDIR}/cd-dir
 	mkdir -p ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 	mkdir -p ${.OBJDIR}/cd-dir/etc
@@ -115,17 +115,16 @@ ${CDROM}: ${BASE} ${XBASE} cdbr
 	cp -p ${BASE} ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 	cp -p ${XBASE} ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 
-	cat ${RELDIR}/SHA256 ${RELXDIR}/SHA256 > \
-	    ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}/SHA256
-	# XXX no SHA256.sig
+	cp -p ${RELDIR}/SHA256 ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}/SHA256
+	cp -p ${RELDIR}/SHA256.sig ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}/SHA256.sig
 
 	cp -p ${.OBJDIR}/cdbr ${.OBJDIR}/cd-dir/${OSREV}/${MACHINE}
 
 	mkhybrid -a -R -T -L -l -d -D -N -o ${.OBJDIR}/${CDROM} \
-	    -A "OpenBSD ${OSREV} ${MACHINE} Install CD" \
-	    -P "Copyright (c) `date +%Y` Theo de Raadt, The OpenBSD project" \
-	    -p "Theo de Raadt <deraadt@openbsd.org>" \
-	    -V "OpenBSD/${MACHINE}   ${OSREV} Install CD" \
+	    -A "IABSD ${OSREV} ${MACHINE} Install CD" \
+	    -P "Copyright (c) `date +%Y` Thomas de Grivel" \
+	    -p "Thomas de Grivel <thodg@kmx.io>" \
+	    -V "IABSD/${MACHINE}   ${OSREV} Install CD" \
 	    -b ${OSREV}/${MACHINE}/cdbr -c ${OSREV}/${MACHINE}/boot.catalog \
 	    ${.OBJDIR}/cd-dir
 

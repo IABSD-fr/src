@@ -70,7 +70,11 @@
 #define	NMBCLUSTERS	(32 * 1024)		/* max cluster allocation */
 
 #ifndef	MSGBUFSIZE
+#if defined(__i386__)
+#define	MSGBUFSIZE	(32 * PAGE_SIZE)	/* match amd64 buffer size */
+#else
 #define	MSGBUFSIZE	(8 * PAGE_SIZE)		/* default message buffer size */
+#endif
 #endif
 
 #define __HAVE_ACPI

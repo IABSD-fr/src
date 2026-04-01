@@ -2076,6 +2076,7 @@ case $os in
 	| ohos* \
 	| onefs* \
 	| openbsd* \
+	| iabsd* \
 	| openedition* \
 	| openstep* \
 	| os108* \

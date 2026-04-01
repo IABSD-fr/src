@@ -3561,6 +3561,9 @@ EOM
 			esac
 			;;
 		nonstop-ux) osname=nonstopux ;;
+		iabsd) osname=iabsd
+			osvers="$3"
+			;;
 		openbsd) osname=openbsd
 			osvers="$3"
 			;;
