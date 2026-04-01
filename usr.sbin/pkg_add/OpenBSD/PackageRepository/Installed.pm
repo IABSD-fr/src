@@ -41,7 +41,7 @@ sub expand_locations($class, $string, $state)
 		return OpenBSD::Paths->os_version;
 	} elsif ($string eq '%m') {
 		return join('/',
-		    'pub/OpenBSD', 
+		    'pub/IABSD',
 		    '%c',
 		    'packages', 
 		    OpenBSD::Paths->machine_architecture);

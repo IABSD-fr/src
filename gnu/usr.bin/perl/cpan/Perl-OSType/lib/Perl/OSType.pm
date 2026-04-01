@@ -35,6 +35,7 @@ my %OSTYPES = qw(
   mirbsd      Unix
   next        Unix
   openbsd     Unix
+  iabsd       Unix
   netbsd      Unix
   dec_osf     Unix
   nto         Unix

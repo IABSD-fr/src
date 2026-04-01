@@ -1,5 +1,7 @@
 #!/bin/ksh
 #
+# Copyright 2026 kmx.io <contact@kmx.io>
+#
 # $OpenBSD: dbupdate.sh,v 1.11 2026/10/22 02:52:49 dgl Exp $
 #
 # Copyright (c) 2026 Theo de Raadt <deraadt@openbsd.org>
@@ -44,13 +46,13 @@ done
 
 CACHE=/var/dbupdate
 R=$(sysctl -n kern.osrelease | sed -e 's/\.//')
-PUBKEY=/etc/signify/openbsd-${R}-base.pub
+PUBKEY=/etc/signify/iabsd-${R}-base.pub
 
 mkdir -p ${CACHE}	# XXX created by mtree, but help systems without..
 cd $D
 
 if ! ftp -o out-SHA256.sig \
-    https://ftp.openbsd.org/pub/OpenBSD/dbupdates/$R/SHA256.sig \
+    https://ftp.iabsd.fr/pub/IABSD/dbupdates/$R/SHA256.sig \
     > /dev/null 2>&1 ; then
 	echo $PROG: no databases available.
 	exit 0
@@ -64,7 +66,7 @@ if cmp -s ${CACHE}/out-SHA256.sig out-SHA256.sig ; then
 fi
 
 # Get the new file & verify the signing
-ftp https://ftp.openbsd.org/pub/OpenBSD/dbupdates/dbupdates.tgz > /dev/null
+ftp https://ftp.iabsd.fr/pub/IABSD/dbupdates/dbupdates.tgz > /dev/null
 signify -C -q -p "${PUBKEY}" -x out-SHA256.sig
 
 # extract

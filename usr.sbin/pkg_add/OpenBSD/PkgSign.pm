@@ -99,73 +99,69 @@ sub sign_existing_package($self, $state, $pkg)
 sub sign_list($self, $l, $repo, $maxjobs, $state)
 {
 	$state->{total} = scalar @$l;
-	$maxjobs //= 1;
-	my $code = sub($name) {
+	$state->{done} = 0;
+
+	# Batch mode: copy all packages to output, then sign all at once
+	my @files;
+	for my $name (@$l) {
 		my $pkg = $repo->find($name);
 		if (!defined $pkg) {
 			$state->errsay("#1 not found", $name);
-		} else {
-			$self->sign_existing_package($state, $pkg);
+			next;
 		}
-	    };
-	my $display = $state->verbose ?
-	    sub($name) {
-		$state->progress->set_header("Signed ".$name);
+		my $output = $state->{output_dir};
+		my $dest = $output.'/'.$pkg->name.".tgz";
+		if ($state->opt('i') && -f $dest) {
+			next;
+		}
+		my $url = $pkg->url;
+		if (!$pkg->{repository}->is_local_file) {
+			$state->fatal("Signing distant package #1 is not supported",
+			    $url);
+		}
+		$url =~ s/^file://;
+		# Copy package to output dir
+		require File::Copy;
+		File::Copy::copy($url, $dest) or
+		    $state->fatal("Can't copy #1 to #2: #3", $url, $dest, $!);
+		chmod((0666 & ~umask), $dest);
+		push(@files, $dest);
 		$state->{done}++;
-		$state->progress->next($state->ntogo);
-	    } :
-	    sub($) {
-	    };
-	if ($maxjobs > 1) {
-		my $jobs = {};
-		my $n = 0;
-		my $reap_job = sub() {
-			my $pid = wait;
-			if (!defined $jobs->{$pid}) {
-				$state->fatal("Wait returned #1: unknown process", $pid);
-			}
-			if ($? != 0) {
-				$state->fatal("Signature of #1 failed\n", 
-				    $jobs->{$pid});
-			}
-			$n--;
-			&$display($jobs->{$pid});
-			delete $state->{signer}{pubkey};
-			delete $jobs->{$pid};
-		};
-			
-		while (@$l > 0) {
-			my $name = shift @$l;
-			my $pid = fork();
-			if ($pid == 0) {
-				$repo->reinitialize;
-				&$code($name);
-				exit(0);
-			} else {
-				$jobs->{$pid} = $name;
-				$n++;
-			}
-			if ($n >= $maxjobs) {
-				&$reap_job();
-			}
-		}
-		while ($n != 0) {
-			&$reap_job();
-		}
-	} else {
-		for my $name (@$l) {
-			&$code($name);
-			&$display($name);
-			delete $state->{signer}{pubkey};
+		if ($state->verbose) {
+			$state->progress->set_header("Copied ".$name);
+			$state->progress->next($state->ntogo);
 		}
 	}
-	if ($state->opt('C')) {
+
+	if (@files > 0) {
+		# Write file list and sign all at once
+		require File::Temp;
+		my ($fh, $filelist) = File::Temp::tempfile(
+		    "pkgsign-XXXXXXXXXX", DIR => "/tmp", UNLINK => 1);
+		for my $f (@files) {
+			print $fh "$f\n";
+		}
+		close($fh);
+		my $privkey = $state->{signer}{privkey};
+		$state->system(OpenBSD::Paths->signify,
+		    '-S', '-z', '-s', $privkey, '-F', $filelist);
+		unlink($filelist);
+	}
+
+	if ($state->opt('C') && @files > 0) {
+		$state->system(
+		    sub() {
+			chdir($state->{output_dir});
+			open(STDOUT, '>', 'SHA256');
+		    },
+		    OpenBSD::Paths->sha256, '-b',
+		    map { my $f = $_; $f =~ s,.*/,,; $f } @files);
 		$state->system(
 		    sub() {
 			chdir($state->{output_dir});
 			open(STDOUT, '>', 'SHA256.new');
 		    }, 'sort', 'SHA256');
-		rename($state->{output_dir}.'/SHA256.new', 
+		rename($state->{output_dir}.'/SHA256.new',
 		    $state->{output_dir}.'/SHA256');
 	}
 }

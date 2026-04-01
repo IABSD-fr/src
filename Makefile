@@ -83,7 +83,7 @@ do-build:
 		false; \
 	fi
 	cd ${.CURDIR}/share/mk && exec ${MAKE} install
-	exec ${MAKE} cleandir
+#	exec ${MAKE} cleandir
 	exec ${MAKE} includes
 	cd ${.CURDIR}/lib && \
 	    su ${BUILDUSER} -c 'exec ${MAKE}' && \

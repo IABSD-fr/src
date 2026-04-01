@@ -30,7 +30,7 @@ require File::Find;
 
 use constant {
 	BACKUP_DIR => '/var/backups/',
-	RELINK_DIR => '/usr/share/relink/',
+	RELINK_DIR => '/var/relink/',
 };
 
 $ENV{PATH} = '/bin:/usr/bin:/sbin:/usr/sbin';

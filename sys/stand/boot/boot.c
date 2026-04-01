@@ -1,6 +1,8 @@
+/* IABSD - AI-enhanced BSD */
 /*	$OpenBSD: boot.c,v 1.57 2023/02/23 19:48:22 miod Exp $	*/
 
 /*
+ * Copyright (c) 2026 Thomas de Grivel
  * Copyright (c) 2003 Dale Rahn
  * Copyright (c) 1997,1998 Michael Shalayeff
  * All rights reserved.
@@ -68,7 +70,7 @@ boot(dev_t bootdev)
 	machdep();
 
 	snprintf(prog_ident, sizeof(prog_ident),
-	    ">> OpenBSD/" MACHINE " %s %s", progname, version);
+	    ">> IABSD/" MACHINE " %s %s", progname, version);
 	printf("%s\n", prog_ident);
 
 	devboot(bootdev, cmd.bootdev);
