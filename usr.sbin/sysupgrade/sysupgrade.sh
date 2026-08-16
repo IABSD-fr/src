@@ -196,7 +196,7 @@ SETS=$(sed -n -e 's/^SHA256 (\(.*\)) .*/\1/' \
     -e '/^INSTALL\./p;/^bsd/p;/\.tgz$/p' SHA256)
 
 OLD_FILES=$(ls)
-OLD_FILES=$(rmel SHA256 $OLD_FILES)
+OLD_FILES=$(rmel SHA256 SHA256.sig $OLD_FILES)
 DL=$SETS
 
 [[ -n ${OLD_FILES} ]] && echo Verifying old sets.
