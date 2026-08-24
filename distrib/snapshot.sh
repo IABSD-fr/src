@@ -19,6 +19,12 @@ umask 022
 
 ARCH=$(machine)
 
+# The kernel machine name and the package architecture name differ on arm64.
+case ${ARCH} in
+arm64)	PORTS_ARCH=aarch64;;
+*)	PORTS_ARCH=${ARCH};;
+esac
+
 BASE_MP=/usr/xobj
 BASE_DESTDIR=/usr/xobj/destdir
 BASE_RELEASEDIR=/home/release
@@ -28,7 +34,7 @@ XENO_DESTDIR=/usr/obj/destdir
 XENO_RELEASEDIR=/home/xenocara
 
 CHROOT=/home/dpb
-PACKAGES=${CHROOT}/usr/ports/packages/${ARCH}/ftp
+PACKAGES=${CHROOT}/usr/ports/packages/${PORTS_ARCH}/ftp
 
 run() {
 	echo "+ $@" >&2
