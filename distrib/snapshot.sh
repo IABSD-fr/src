@@ -236,7 +236,9 @@ if ${DO_FIRMWARE}; then
 	run cksum -a sha256 -b -h SHA256 *.tgz
 	run signify -S -s /root/signify/iabsd-01-fw.sec -m SHA256 -e
 	run ls -ln > index.txt
-	run rsync -aP --delete . ../firmware/snapshots/
+	run cd /var/www/firmware.iabsd.fr
+	run rsync -aP --delete .tmp/. ../firmware/snapshots/
+	run rm -rf .tmp
 fi
 
 echo ""
