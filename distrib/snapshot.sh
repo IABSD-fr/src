@@ -109,7 +109,7 @@ if ${DO_BASE}; then
 	run cd /usr/src
 	run make obj
 	run cd /usr/src/usr.bin/arch
-	run make
+	run doas -u build make
 	run make install
 	run cd /usr/src
 	run make -j${NCPU} build
