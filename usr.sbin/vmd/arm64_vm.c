@@ -115,6 +115,12 @@ vcpu_deassert_irq(uint32_t vm_id, uint32_t vcpu_id, int irq)
 	fatalx("%s: unimplemented", __func__);
 }
 
+void
+vcpu_assert_vector(uint32_t vm_id, uint32_t vcpu_id, uint8_t vector)
+{
+	fatalx("%s: unimplemented", __func__);
+}
+
 int
 vcpu_exit(struct vm_run_params *vrp)
 {
