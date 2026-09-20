@@ -45,8 +45,6 @@
 #include "fsutil.h"
 #include "extern.h"
 
-#define EXT4FS_DINODE_SIZE 256
-
 #define fsck_ino_to_fsba(fs, x) \
 	(letoh32((fs)->m_gd[((x)-1) / (fs)->m_inodes_per_group].bgd_inode_table_block_lo) + \
 	(((x)-1) % (fs)->m_inodes_per_group) / (fs)->m_inodes_per_block)
