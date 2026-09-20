@@ -41,27 +41,30 @@
 
 #include "mntopts.h"
 
-void ext4fs_usage(void);
+void	ext4fs_usage (void);
 
 static const struct mntopt mopts[] = {
 	MOPT_STDOPTS,
+	MOPT_WXALLOWED,
+	MOPT_SYNC,
 	MOPT_UPDATE,
 	{ NULL }
 };
 
 int
-main(int argc, char *argv[])
+main (int argc, char *argv[])
 {
 	struct ufs_args args;		/* XXX ffs_args */
-	int ch, mntflags;
-	char fs_name[PATH_MAX], *errcause;
+	char fs_name[PATH_MAX], *context, *errcause;
+	char **oargv;
+	int ch, mntflags, oargc;
 
-	mntflags = 0;
+	oargc = argc;
+	oargv = argv;
 	optind = optreset = 1;		/* Reset for parse of new argv. */
 	while ((ch = getopt(argc, argv, "o:")) != -1)
 		switch (ch) {
 		case 'o':
-			getmntopts(optarg, mopts, &mntflags);
 			break;
 		default:
 			ext4fs_usage();
@@ -75,8 +78,22 @@ main(int argc, char *argv[])
 	args.fspec = argv[0];		/* The name of the device file. */
 	if (realpath(argv[1], fs_name) == NULL)	/* The mount point. */
 		err(1, "realpath %s", argv[1]);
+	if (asprintf(&context, "%s on %s", args.fspec, fs_name) == -1)
+		err(1, "%s on %s", args.fspec, fs_name);
 
-	#define DEFAULT_ROOTUID	-2
+	mntflags = 0;
+	optind = optreset = 1;
+	while ((ch = getopt(oargc, oargv, "o:")) != -1)
+		switch (ch) {
+		case 'o':
+			getmntoptsctx(optarg, mopts, &mntflags, context);
+			break;
+		default:
+			ext4fs_usage();
+		}
+	free(context);
+
+#define DEFAULT_ROOTUID	-2
 	args.export_info.ex_root = DEFAULT_ROOTUID;
 
 	if (mntflags & MNT_RDONLY)
@@ -89,8 +106,8 @@ main(int argc, char *argv[])
 			errcause = "mount table full";
 			break;
 		case EINVAL:
-			errcause =
-			    "specified device does not match mounted device";
+			errcause = "invalid filesystem or mount argument; "
+			    "see dmesg";
 			break;
 		case EOPNOTSUPP:
 			errcause = "filesystem not supported by kernel";
@@ -105,9 +122,9 @@ main(int argc, char *argv[])
 }
 
 void
-ext4fs_usage(void)
+ext4fs_usage (void)
 {
 	(void)fprintf(stderr,
-		"usage: mount_ext4fs [-o options] special node\n");
+	    "usage: mount_ext4fs [-o options] special node\n");
 	exit(1);
 }

@@ -16,4 +16,3 @@ config:
 cleandir clean:
 
 .include <bsd.obj.mk>
-

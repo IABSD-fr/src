@@ -36,6 +36,8 @@ enum actions {
 	CMD_WAITFOR,
 	CMD_PAUSE,
 	CMD_UNPAUSE,
+	CMD_DISK_FAIL,
+	CMD_FLUSH_STOP,
 };
 
 struct ctl_command;
@@ -59,6 +61,10 @@ struct parse_result {
 	unsigned int		 flags;
 	unsigned int		 mode;
 	unsigned int		 bootdevice;
+	uint32_t		 disk_index;
+	uint32_t		 fail_operation;
+	uint32_t		 fail_count;
+	uint32_t		 flush_count;
 	struct ctl_command	*ctl;
 };
 
@@ -107,6 +113,11 @@ void	 pause_vm(uint32_t, const char *);
 int	 pause_vm_complete(struct imsg *, int *);
 void	 unpause_vm(uint32_t, const char *);
 int	 unpause_vm_complete(struct imsg *, int *);
+void	 disk_fail_vm(uint32_t, const char *, uint32_t, uint32_t,
+	    uint32_t);
+int	 disk_fail_vm_complete(struct imsg *, int *);
+void	 flush_stop_vm(uint32_t, const char *, uint32_t, uint32_t);
+int	 flush_stop_vm_complete(struct imsg *, int *);
 int	 check_info_id(const char *, uint32_t);
 void	 get_info_vm(uint32_t, const char *, enum actions, unsigned int);
 int	 add_info(struct imsg *, int *);

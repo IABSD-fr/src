@@ -36,24 +36,62 @@
 #include <err.h>
 #include <errno.h>
 #include <fstab.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
 
 #include "mntopts.h"
 
+static int getmntoptctx(char **, union mntval *, const struct mntopt *,
+    int *, const char *);
+static void mntopt_errx(const char *, const char *, ...)
+    __attribute__((__noreturn__, __format__(__printf__, 2, 3)));
+
+static void
+mntopt_errx(const char *context, const char *fmt, ...)
+{
+	char *message;
+	va_list ap;
+	int error;
+
+	va_start(ap, fmt);
+	message = NULL;
+	error = vasprintf(&message, fmt, ap);
+	va_end(ap);
+	if (error == -1) {
+		if (context != NULL)
+			err(1, "%s", context);
+		err(1, NULL);
+	}
+	if (context != NULL)
+		errx(1, "%s: %s", context, message);
+	errx(1, "%s", message);
+}
+
 int
 getmntopts(const char *optionp, const struct mntopt *m0, int *flagp)
+{
+	return (getmntoptsctx(optionp, m0, flagp, NULL));
+}
+
+int
+getmntoptsctx(const char *optionp, const struct mntopt *m0, int *flagp,
+    const char *context)
 {
 	char *p, *q;
 	union mntval val;
 	int ret = 0;
 
 	p = q = strdup(optionp);
-	if (p == NULL)
+	if (p == NULL) {
+		if (context != NULL)
+			err(1, "%s", context);
 		err(1, NULL);
+	}
 	while (p != NULL) {
-		ret |= getmntopt(&p, &val, m0, flagp);
+		ret |= getmntoptctx(&p, &val, m0, flagp, context);
 	}
 	free(q);
 	return (ret);
@@ -62,6 +100,13 @@ getmntopts(const char *optionp, const struct mntopt *m0, int *flagp)
 int
 getmntopt(char **optionp, union mntval *valuep, const struct mntopt *m0,
     int *flagp)
+{
+	return (getmntoptctx(optionp, valuep, m0, flagp, NULL));
+}
+
+static int
+getmntoptctx(char **optionp, union mntval *valuep,
+    const struct mntopt *m0, int *flagp, const char *context)
 {
 	const struct mntopt *m;
 	char *opt, *value, *endp;
@@ -95,7 +140,7 @@ getmntopt(char **optionp, union mntval *valuep, const struct mntopt *m0,
 	if (m->m_option) {
 		needval = (m->m_oflags & (MFLAG_INTVAL|MFLAG_STRVAL)) != 0;
 		if (needval != (value != NULL) && !(m->m_oflags & MFLAG_OPT))
-			errx(1, "-o %s: option %s a value", opt,
+			mntopt_errx(context, "-o %s: option %s a value", opt,
 			    needval ? "needs" : "does not need");
 		inverse = (m->m_oflags & MFLAG_INVERSE) ? 1 : 0;
 		if (m->m_oflags & MFLAG_SET) {
@@ -107,7 +152,7 @@ getmntopt(char **optionp, union mntval *valuep, const struct mntopt *m0,
 		else if (negative == inverse)
 			ret = m->m_flag;
 	} else
-		errx(1, "-o %s: option not supported", opt);
+		mntopt_errx(context, "-o %s: option not supported", opt);
 
 	/* Store the value for options with assignments in them. */
 	if (value != NULL) {
@@ -116,7 +161,8 @@ getmntopt(char **optionp, union mntval *valuep, const struct mntopt *m0,
 			l = strtol(value, &endp, 10);
 			if (endp == value || l == -1 || l > INT_MAX ||
 			    (l == LONG_MAX && errno == ERANGE))
-				errx(1, "%s: illegal value '%s'",
+				mntopt_errx(context,
+				    "%s: illegal value '%s'",
 				    opt, value);
 			valuep->ival = (int)l;
 		} else

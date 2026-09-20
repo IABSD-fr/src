@@ -1174,6 +1174,7 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 
 	if ((pledge & PLEDGE_DISKLABEL)) {
 		switch (com) {
+		case DIOCCACHESYNC:
 		case DIOCGDINFO:
 		case DIOCGPDINFO:
 		case DIOCRLDINFO:

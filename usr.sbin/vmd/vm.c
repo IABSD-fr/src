@@ -335,6 +335,10 @@ vm_dispatch_vmm(int fd, short event, void *arg)
 	struct vmd_vm		*vm = arg;
 	struct vmop_result	 vmr;
 	struct vmop_addr_result	 var;
+	struct vmop_disk_fail	 vdf;
+	struct vmop_disk_fail_result vdfr;
+	struct vmop_flush_stop	 vfs;
+	struct vmop_flush_stop_result vfr;
 	struct imsgev		*iev = &vm->vm_iev;
 	struct imsgbuf		*ibuf = &iev->ibuf;
 	struct imsg		 imsg;
@@ -401,6 +405,37 @@ vm_dispatch_vmm(int fd, short event, void *arg)
 			imsg_compose_event(&vm->vm_iev,
 			    IMSG_VMDOP_UNPAUSE_VM_RESPONSE, id, pid, -1, &vmr,
 			    sizeof(vmr));
+			break;
+		case IMSG_VMDOP_DISK_FAIL:
+			vmop_disk_fail_read(&imsg, &vdf);
+			n = vioblk_disk_fail(vm, &vdf);
+			if (n != 0) {
+				memset(&vdfr, 0, sizeof(vdfr));
+				vdfr.vdfr_result = n;
+				vdfr.vdfr_id = vdf.vdf_id;
+				vdfr.vdfr_peer_id = vdf.vdf_peer_id;
+				vdfr.vdfr_disk = vdf.vdf_disk;
+				vdfr.vdfr_operation = vdf.vdf_operation;
+				vdfr.vdfr_count = vdf.vdf_count;
+				imsg_compose_event(&vm->vm_iev,
+				    IMSG_VMDOP_DISK_FAIL_ARMED, id, pid,
+				    -1, &vdfr, sizeof(vdfr));
+			}
+			break;
+		case IMSG_VMDOP_FLUSH_STOP:
+			vmop_flush_stop_read(&imsg, &vfs);
+			n = vioblk_flush_stop(vm, &vfs);
+			if (n != 0) {
+				memset(&vfr, 0, sizeof(vfr));
+				vfr.vfr_result = n;
+				vfr.vfr_id = vfs.vfs_id;
+				vfr.vfr_peer_id = vfs.vfs_peer_id;
+				vfr.vfr_disk = vfs.vfs_disk;
+				vfr.vfr_count = vfs.vfs_count;
+				imsg_compose_event(&vm->vm_iev,
+				    IMSG_VMDOP_FLUSH_STOP_ARMED, id, pid,
+				    -1, &vfr, sizeof(vfr));
+			}
 			break;
 		case IMSG_VMDOP_PRIV_GET_ADDR_RESPONSE:
 			vmop_addr_result_read(&imsg, &var);
@@ -493,6 +528,12 @@ pause_vm(struct vmd_vm *vm)
 		return;
 
 	pause_vm_md(vm);
+}
+
+void
+vm_pause_at_flush(struct vmd_vm *vm)
+{
+	pause_vm(vm);
 }
 
 static void

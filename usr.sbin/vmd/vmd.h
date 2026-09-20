@@ -120,6 +120,12 @@ enum imsg_type {
 	IMSG_VMDOP_PAUSE_VM_RESPONSE,
 	IMSG_VMDOP_UNPAUSE_VM,
 	IMSG_VMDOP_UNPAUSE_VM_RESPONSE,
+	IMSG_VMDOP_FLUSH_STOP,
+	IMSG_VMDOP_FLUSH_STOP_ARMED,
+	IMSG_VMDOP_FLUSH_STOPPED,
+	IMSG_VMDOP_DISK_FAIL,
+	IMSG_VMDOP_DISK_FAIL_ARMED,
+	IMSG_VMDOP_DISK_FAILED,
 	IMSG_VMDOP_WAIT_VM_REQUEST,
 	IMSG_VMDOP_TERMINATE_VM_REQUEST,
 	IMSG_VMDOP_TERMINATE_VM_RESPONSE,
@@ -150,6 +156,13 @@ enum imsg_type {
 	IMSG_DEVOP_HOSTMAC,
 	IMSG_DEVOP_MSG,
 	IMSG_DEVOP_VIONET_MSG,
+	IMSG_DEVOP_FLUSH_STOP,
+	IMSG_DEVOP_FLUSH_STOP_ARMED,
+	IMSG_DEVOP_FLUSH_STOPPED,
+	IMSG_DEVOP_FLUSH_CONTINUE,
+	IMSG_DEVOP_DISK_FAIL,
+	IMSG_DEVOP_DISK_FAIL_ARMED,
+	IMSG_DEVOP_DISK_FAILED,
 };
 
 struct vmop_result {
@@ -181,6 +194,46 @@ struct vmop_id {
 	unsigned int		 vid_flags;
 #define VMOP_FORCE		0x01
 #define VMOP_WAIT		0x02
+};
+
+struct vmop_flush_stop {
+	uint32_t		 vfs_id;
+	char			 vfs_name[VMM_MAX_NAME_LEN];
+	uid_t			 vfs_uid;
+	uint32_t		 vfs_peer_id;
+	uint32_t		 vfs_disk;
+	uint32_t		 vfs_count;
+};
+
+struct vmop_flush_stop_result {
+	int32_t			 vfr_result;
+	uint32_t		 vfr_id;
+	uint32_t		 vfr_peer_id;
+	uint32_t		 vfr_disk;
+	uint32_t		 vfr_count;
+};
+
+#define VMOP_DISK_FAIL_READ	1
+#define VMOP_DISK_FAIL_WRITE	2
+#define VMOP_DISK_FAIL_FLUSH	3
+
+struct vmop_disk_fail {
+	uint32_t		 vdf_id;
+	char			 vdf_name[VMM_MAX_NAME_LEN];
+	uid_t			 vdf_uid;
+	uint32_t		 vdf_peer_id;
+	uint32_t		 vdf_disk;
+	uint32_t		 vdf_operation;
+	uint32_t		 vdf_count;
+};
+
+struct vmop_disk_fail_result {
+	int32_t			 vdfr_result;
+	uint32_t		 vdfr_id;
+	uint32_t		 vdfr_peer_id;
+	uint32_t		 vdfr_disk;
+	uint32_t		 vdfr_operation;
+	uint32_t		 vdfr_count;
 };
 
 struct vmop_ifreq {
@@ -505,6 +558,12 @@ void	 vmop_addr_req_read(struct imsg *, struct vmop_addr_req *);
 void	 vmop_addr_result_read(struct imsg *, struct vmop_addr_result *);
 void	 vmop_owner_read(struct imsg *, struct vmop_owner *);
 void	 vmop_create_params_read(struct imsg *, struct vmop_create_params *);
+void	 vmop_flush_stop_read(struct imsg *, struct vmop_flush_stop *);
+void	 vmop_flush_stop_result_read(struct imsg *,
+	    struct vmop_flush_stop_result *);
+void	 vmop_disk_fail_read(struct imsg *, struct vmop_disk_fail *);
+void	 vmop_disk_fail_result_read(struct imsg *,
+	    struct vmop_disk_fail_result *);
 void	 vmop_config_read(struct imsg *, struct vmd_config *);
 
 /* priv.c */
@@ -533,6 +592,7 @@ int	 init_emulated_hw(struct vmd_vm *, int, int[][VM_MAX_BASE_PER_DISK],
 int	 vcpu_reset(int, uint32_t, struct vcpu_reg_state *);
 void	 pause_vm_md(struct vmd_vm *);
 void	 unpause_vm_md(struct vmd_vm *);
+void	 vm_pause_at_flush(struct vmd_vm *);
 void	*hvaddr_mem(paddr_t, size_t);
 struct vm_mem_range *
 	 find_gpa_range(struct vmop_create_params *, paddr_t, size_t);

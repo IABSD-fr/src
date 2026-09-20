@@ -100,4 +100,6 @@ union mntval {
 	MOPT_RDONLY
 
 int getmntopts(const char *, const struct mntopt *, int *);
+int getmntoptsctx(const char *, const struct mntopt *, int *,
+    const char *);
 int getmntopt(char **, union mntval *, const struct mntopt *, int *);
