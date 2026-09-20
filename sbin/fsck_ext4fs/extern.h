@@ -70,7 +70,7 @@ int	reply(char *);
 void	resetinodebuf(void);
 int	setup(char *);
 struct	ext4fs_dinode * getnextinode(ino_t);
-int	fsck_journal_replay(void);
+int	fsck_journal_replay(int);
 void	catch(int);
 void	catchquit(int);
 void	voidquit(int);

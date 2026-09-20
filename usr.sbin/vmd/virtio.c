@@ -57,6 +57,7 @@
 #endif	/* VIRTIO_DEBUG */
 
 extern struct vmd *env;
+extern struct vmd_vm *current_vm;
 
 struct virtio_dev viornd;
 struct virtio_dev *vioscsi = NULL;
@@ -106,6 +107,10 @@ static int virtio_io_dispatch(int, uint16_t, uint32_t *, uint8_t *, void *,
 static int virtio_io_isr(int, uint16_t, uint32_t *, uint8_t *, void *, uint8_t);
 static int virtio_io_notify(int, uint16_t, uint32_t *, uint8_t *, void *,
     uint8_t);
+static void vioblk_flush_stop_response(struct virtio_dev *, uint32_t,
+    int);
+static void vioblk_disk_fail_response(struct virtio_dev *, uint32_t,
+    int);
 static int viornd_notifyq(struct virtio_dev *, uint16_t);
 
 static void vmmci_ack(struct virtio_dev *, unsigned int);
@@ -1343,7 +1348,8 @@ virtio_init(struct vmd_vm *vm, int child_cdrom,
 			}
 			virtio_dev_init(vm, dev, id, VIOBLK_QUEUE_SIZE_DEFAULT,
 			    VIRTIO_BLK_QUEUES,
-			    (VIRTIO_F_VERSION_1 | VIRTIO_BLK_F_SEG_MAX));
+			    (VIRTIO_F_VERSION_1 | VIRTIO_BLK_F_SEG_MAX |
+			    VIRTIO_BLK_F_FLUSH));
 
 			bar_id = pci_add_bar(id, PCI_MAPREG_TYPE_IO, virtio_pci_io,
 			    dev);
@@ -1581,6 +1587,69 @@ void
 virtio_start(struct vmd_vm *vm)
 {
 	return virtio_broadcast_imsg(vm, IMSG_VMDOP_UNPAUSE_VM, NULL, 0);
+}
+
+int
+vioblk_flush_stop(struct vmd_vm *vm, struct vmop_flush_stop *vfs)
+{
+	struct virtio_dev *dev;
+	int ret;
+
+	if (vfs->vfs_count == 0 ||
+	    vfs->vfs_disk >= vm->vm_params.vmc_ndisks)
+		return (EINVAL);
+	SLIST_FOREACH(dev, &virtio_devs, dev_next) {
+		if (dev->dev_type == VMD_DEVTYPE_DISK &&
+		    dev->vioblk.idx == vfs->vfs_disk)
+			break;
+	}
+	if (dev == NULL)
+		return (ENODEV);
+	if (dev->vioblk.flush_stop_pending ||
+	    dev->vioblk.disk_fail_pending)
+		return (EBUSY);
+	dev->vioblk.flush_stop = *vfs;
+	dev->vioblk.flush_stop_pending = 1;
+	ret = imsg_compose_event(&dev->async_iev,
+	    IMSG_DEVOP_FLUSH_STOP, 0, 0, -1, &vfs->vfs_count,
+	    sizeof(vfs->vfs_count));
+	if (ret == -1) {
+		dev->vioblk.flush_stop_pending = 0;
+		return (EIO);
+	}
+	return (0);
+}
+
+int
+vioblk_disk_fail(struct vmd_vm *vm, struct vmop_disk_fail *vdf)
+{
+	struct virtio_dev *dev;
+	int ret;
+
+	if (vdf->vdf_count == 0 ||
+	    vdf->vdf_operation < VMOP_DISK_FAIL_READ ||
+	    vdf->vdf_operation > VMOP_DISK_FAIL_FLUSH ||
+	    vdf->vdf_disk >= vm->vm_params.vmc_ndisks)
+		return (EINVAL);
+	SLIST_FOREACH(dev, &virtio_devs, dev_next) {
+		if (dev->dev_type == VMD_DEVTYPE_DISK &&
+		    dev->vioblk.idx == vdf->vdf_disk)
+			break;
+	}
+	if (dev == NULL)
+		return (ENODEV);
+	if (dev->vioblk.disk_fail_pending ||
+	    dev->vioblk.flush_stop_pending)
+		return (EBUSY);
+	dev->vioblk.disk_fail = *vdf;
+	dev->vioblk.disk_fail_pending = 1;
+	ret = imsg_compose_event(&dev->async_iev,
+	    IMSG_DEVOP_DISK_FAIL, 0, 0, -1, vdf, sizeof(*vdf));
+	if (ret == -1) {
+		dev->vioblk.disk_fail_pending = 0;
+		return (EIO);
+	}
+	return (0);
 }
 
 /*
@@ -2023,6 +2092,52 @@ virtio_dispatch_dev(int fd, short event, void *arg)
 			viodev_msg_read(&imsg, &msg);
 			handle_dev_msg(&msg, dev);
 			break;
+		case IMSG_DEVOP_DISK_FAIL_ARMED:
+			if (dev->dev_type != VMD_DEVTYPE_DISK ||
+			    ! dev->vioblk.disk_fail_pending) {
+				log_warnx("%s: unexpected disk-fail arm",
+				    __func__);
+				break;
+			}
+			vioblk_disk_fail_response(dev,
+			    IMSG_VMDOP_DISK_FAIL_ARMED, 0);
+			break;
+		case IMSG_DEVOP_DISK_FAILED:
+			if (dev->dev_type != VMD_DEVTYPE_DISK ||
+			    ! dev->vioblk.disk_fail_pending) {
+				log_warnx("%s: unexpected disk failure",
+				    __func__);
+				break;
+			}
+			vioblk_disk_fail_response(dev,
+			    IMSG_VMDOP_DISK_FAILED, 0);
+			break;
+		case IMSG_DEVOP_FLUSH_STOP_ARMED:
+			if (dev->dev_type != VMD_DEVTYPE_DISK ||
+			    !dev->vioblk.flush_stop_pending) {
+				log_warnx("%s: unexpected flush-stop arm",
+				    __func__);
+				break;
+			}
+			vioblk_flush_stop_response(dev,
+			    IMSG_VMDOP_FLUSH_STOP_ARMED, 0);
+			break;
+		case IMSG_DEVOP_FLUSH_STOPPED:
+			if (dev->dev_type != VMD_DEVTYPE_DISK ||
+			    !dev->vioblk.flush_stop_pending) {
+				log_warnx("%s: unexpected flush stop",
+				    __func__);
+				break;
+			}
+			vm_pause_at_flush(current_vm);
+			if (imsg_compose_event(&dev->async_iev,
+			    IMSG_DEVOP_FLUSH_CONTINUE, 0, 0, -1,
+			    NULL, 0) == -1)
+				fatal("%s: flush continue", __func__);
+			vioblk_flush_stop_response(dev,
+			    IMSG_VMDOP_FLUSH_STOPPED, 0);
+			dev->vioblk.flush_stop_pending = 0;
+			break;
 		default:
 			log_warnx("%s: got non devop imsg %d", __func__, type);
 			break;
@@ -2030,6 +2145,45 @@ virtio_dispatch_dev(int fd, short event, void *arg)
 		imsg_free(&imsg);
 	}
 	imsg_event_add(iev);
+}
+
+static void
+vioblk_disk_fail_response(struct virtio_dev *dev, uint32_t type,
+    int error)
+{
+	struct vmop_disk_fail *vdf;
+	struct vmop_disk_fail_result vdfr;
+
+	vdf = &dev->vioblk.disk_fail;
+	memset(&vdfr, 0, sizeof(vdfr));
+	vdfr.vdfr_result = error;
+	vdfr.vdfr_id = vdf->vdf_id;
+	vdfr.vdfr_peer_id = vdf->vdf_peer_id;
+	vdfr.vdfr_disk = vdf->vdf_disk;
+	vdfr.vdfr_operation = vdf->vdf_operation;
+	vdfr.vdfr_count = vdf->vdf_count;
+	if (imsg_compose_event(&current_vm->vm_iev, type,
+	    vdfr.vdfr_peer_id, 0, -1, &vdfr, sizeof(vdfr)) == -1)
+		fatal("%s", __func__);
+}
+
+static void
+vioblk_flush_stop_response(struct virtio_dev *dev, uint32_t type,
+    int error)
+{
+	struct vmop_flush_stop *vfs;
+	struct vmop_flush_stop_result vfr;
+
+	vfs = &dev->vioblk.flush_stop;
+	memset(&vfr, 0, sizeof(vfr));
+	vfr.vfr_result = error;
+	vfr.vfr_id = vfs->vfs_id;
+	vfr.vfr_peer_id = vfs->vfs_peer_id;
+	vfr.vfr_disk = vfs->vfs_disk;
+	vfr.vfr_count = vfs->vfs_count;
+	if (imsg_compose_event(&current_vm->vm_iev, type,
+	    vfr.vfr_peer_id, 0, -1, &vfr, sizeof(vfr)) == -1)
+		fatal("%s", __func__);
 }
 
 

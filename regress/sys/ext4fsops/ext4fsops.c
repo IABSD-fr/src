@@ -1,0 +1,3937 @@
+/*
+ * Copyright (c) 2026 kmx.io.
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/param.h>
+#include <sys/types.h>
+#include <sys/mount.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+
+#include <dirent.h>
+#include <err.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define GROW_FILES	180
+#define REFILL_FILES	60
+#define EXTENT_WRITES	12
+#define SHRINK_EXTENT_LBN	10
+#define SHRINK_EXTENT_BYTES	37
+#define EXTENT_NODE_HEADER_BYTES	12
+#define EXTENT_NODE_ENTRY_BYTES	12
+#define EXTENT_PARTIAL_BYTES	37
+#define EXTENT_BATCH_BYTES	(4 * MAXBSIZE)
+#define ALLOCATION_RUN_BYTES	(1024 * 1024)
+#define ALLOCATION_TOTAL_BYTES	(3 * ALLOCATION_RUN_BYTES)
+#define DIR_TAIL_BYTES	12
+#define FAST_SYMLINK_BYTES	60
+#define ORPHAN_INODE_BYTES	256
+#define IO_CHUNK	4096
+#define HANDOFF_WORKERS	8
+#define HANDOFF_ITERATIONS	16
+#define FSYNC_GROUP_WORKERS	8
+#define READ_THROUGH_ITERATIONS	16
+#define RENAME_EXTENTS	5
+#define EXT4_DIRENT_HEADER	8
+#define DIRECTORY_CHURN_TARGETS	12
+#define DIRECTORY_CHURN_RENAMES	64
+
+#define DATA_SEED	0x31U
+#define APPEND_SEED	0x52U
+#define OVERWRITE_SEED	0x93U
+#define EXTENT_SEED	0xb4U
+#define EXTENT_SPLIT_SEED	0x68U
+#define EXTENT_APPEND_SEED	0x79U
+#define EXTENT_BATCH_SEED	0xadU
+#define ALLOCATION_RUN_SEED	0x5eU
+#define BITMAP_SEED	0xc7U
+#define FSYNC_INITIAL_SEED	0x2dU
+#define FSYNC_UPDATE_SEED	0xe1U
+#define SYNC_INITIAL_SEED	0x46U
+#define OSYNC_UPDATE_SEED	0x8bU
+#define MOUNT_SYNC_SEED		0xf2U
+#define VFS_SYNC_UPDATE_SEED	0x6dU
+#define REMOUNT_INITIAL_SEED	0x37U
+#define REMOUNT_DIRTY_SEED	0x9aU
+#define REMOUNT_FINAL_SEED	0xd4U
+#define REMOUNT_ORPHAN_SEED	0x63U
+
+static char root[PATH_MAX];
+static size_t block_size;
+
+static void	make_path (char *, size_t, const char *);
+static void	make_indexed_path (char *, size_t, const char *, int);
+static void	make_rename_growth_path (char *, size_t, char,
+		    unsigned int);
+static void	make_directory_churn_path (char *, size_t,
+		    const char *, unsigned int);
+static unsigned char pattern_byte (off_t, unsigned int);
+static void	fill_pattern (unsigned char *, size_t, off_t, unsigned int);
+static void	write_pattern_fd (int, off_t, size_t, unsigned int);
+static void	write_pattern_once_fd (int, off_t, size_t,
+		    unsigned int);
+static void	check_pattern_fd (int, off_t, size_t, unsigned int);
+static void	check_zero_fd (int, off_t, size_t);
+static void	write_text_file (const char *, const char *);
+static void	check_text_file (const char *, const char *);
+static void	check_absent (const char *);
+static void	check_directory (const char *);
+static void	check_regular (const char *);
+static void	check_symlink (const char *, const char *);
+static void	check_data_file (const char *, int);
+static void	check_sparse_file (const char *, int);
+static void	check_large_sparse (const char *, int);
+static void	check_extent_file (const char *);
+static void	check_shrunk_extent_file (const char *);
+static void	check_empty_file (const char *);
+static void	create_link_growth_tree (void);
+static void	check_link_growth_tree (int);
+static void	check_grow_directory (const char *, int);
+static void	fsync_path (const char *);
+static void	expect_ro_failure (const char *, int);
+static void	create_unix_socket (const char *);
+static void	create_special_files (void);
+static void	verify_special_files (void);
+static void	remove_special_files (void);
+static void	create_grow_directory (void);
+static void	create_filesystem_tree (void);
+static void	verify_created_tree (void);
+static void	mutate_filesystem_tree (void);
+static void	verify_final_tree (void);
+static void	verify_readonly_tree (void);
+static void	create_allocation_probe (void);
+static void	verify_allocation_probe (void);
+static void	write_allocation_run (void);
+static void	verify_allocation_run (void);
+static void	create_extent_file (const char *);
+static size_t	extent_leaf_capacity (void);
+static off_t	extent_lbn_offset (size_t);
+static int	check_extent_fixture (off_t, size_t);
+static void	check_extent_source (int, size_t);
+static void	extent_split_fixture (void);
+static void	extent_append_fixture (void);
+static void	extent_shrink_fixture (void);
+static void	extent_prune_fixture (void);
+static void	extent_zero_fixture (void);
+static void	extent_verify_zero_fixture (void);
+static void	extent_reject_deep_growth (void);
+static void	create_directory_fixture (void);
+static void	verify_directory_fixture (int);
+static void	mutate_directory_fixture (void);
+static void	reject_corrupt_directory (void);
+static void	create_orphan_fixture (void);
+static void	cycle_orphan_fixture (void);
+static void	verify_orphan_fixture (void);
+static void	reject_corrupt_orphan_file (void);
+static void	allocate_bitmap_probe (void);
+static void	verify_bitmap_probe (int);
+static void	free_bitmap_probe (void);
+static void	reuse_bitmap_probe (void);
+static void	retire_bitmap_probe (void);
+static void	allocate_inode_probe (void);
+static void	verify_inode_probe (void);
+static void	free_inode_probe (void);
+static void	reject_block_counter (void);
+static void	reject_inode_counter (void);
+static void	create_fsync_fixture (void);
+static void	update_fsync_fixture (void);
+static void	clean_fsync_fixture (void);
+static void	verify_fsync_fixture (void);
+static void	create_sync_fixture (void);
+static void	update_sync_fixture (int, unsigned int, int);
+static void	clean_vfs_sync_fixture (void);
+static void	clean_osync_fixture (void);
+static void	verify_sync_fixture (unsigned int);
+static void	create_remount_fixture (void);
+static void	update_remount_fixture (unsigned int, int);
+static void	verify_remount_fixture (unsigned int, int);
+static void	hold_remount_orphan (void);
+static void	journal_handoff_stress (void);
+static void	create_group_fixture (void);
+static void	concurrent_group_fsync (void);
+static void	age_group_path_lookup (void);
+static void	check_group_ordered_data (void);
+static void	verify_group_ordered_data (void);
+static void	join_group_transaction (void);
+static void	age_group_transaction (void);
+static void	read_through_stress (void);
+static size_t	rename_growth_entries (void);
+static void	rename_growth_fixture (void);
+static void	verify_rename_growth_fixture (void);
+static void	directory_churn_fixture (void);
+static void	verify_directory_churn_fixture (void);
+
+static void
+make_path (char *path, size_t pathlen, const char *suffix)
+{
+	int n;
+
+	n = snprintf(path, pathlen, "%s/%s", root, suffix);
+	if (n < 0 || (size_t)n >= pathlen)
+		errx(1, "path too long: %s", suffix);
+}
+
+static void
+make_indexed_path (char *path, size_t pathlen, const char *directory,
+    int index)
+{
+	char suffix[128];
+	int n;
+
+	n = snprintf(suffix, sizeof(suffix), "%s/entry-%03d-abcdefghijkl",
+	    directory, index);
+	if (n < 0 || (size_t)n >= sizeof(suffix))
+		errx(1, "indexed suffix too long");
+	make_path(path, pathlen, suffix);
+}
+
+static void
+make_rename_growth_path (char *path, size_t pathlen, char prefix,
+    unsigned int index)
+{
+	char name[NAME_MAX + 1];
+	int n;
+
+	n = snprintf(name, sizeof(name), "%c%03u-", prefix, index);
+	if (n < 0 || (size_t)n >= sizeof(name))
+		errx(1, "rename-growth name prefix is too long");
+	memset(name + n, 'a' + index % 26,
+	    NAME_MAX - (size_t)n);
+	name[NAME_MAX] = '\0';
+	n = snprintf(path, pathlen, "%s/%s", root, name);
+	if (n < 0 || (size_t)n >= pathlen)
+		errx(1, "rename-growth path is too long");
+}
+
+static void
+make_directory_churn_path (char *path, size_t pathlen,
+    const char *prefix, unsigned int index)
+{
+	char suffix[96];
+	int n;
+
+	n = snprintf(suffix, sizeof(suffix), "%s-%04u-abcdefghijkl",
+	    prefix, index);
+	if (n < 0 || (size_t)n >= sizeof(suffix))
+		errx(1, "directory-churn suffix is too long");
+	make_path(path, pathlen, suffix);
+}
+
+static unsigned char
+pattern_byte (off_t offset, unsigned int seed)
+{
+	uint64_t value;
+
+	value = (uint64_t)offset;
+	value ^= value >> 17;
+	value *= UINT64_C(0x9e3779b185ebca87);
+	value ^= value >> 29;
+	return ((unsigned char)(value + seed));
+}
+
+static void
+fill_pattern (unsigned char *buf, size_t len, off_t offset,
+    unsigned int seed)
+{
+	size_t i;
+
+	for (i = 0; i < len; i++)
+		buf[i] = pattern_byte(offset + (off_t)i, seed);
+}
+
+static void
+write_pattern_fd (int fd, off_t offset, size_t len, unsigned int seed)
+{
+	unsigned char buf[IO_CHUNK];
+	size_t done, chunk;
+	ssize_t n;
+
+	for (done = 0; done < len; done += chunk) {
+		chunk = len - done;
+		if (chunk > sizeof(buf))
+			chunk = sizeof(buf);
+		fill_pattern(buf, chunk, offset + (off_t)done, seed);
+		n = pwrite(fd, buf, chunk, offset + (off_t)done);
+		if (n == -1)
+			err(1, "pwrite at offset %lld",
+			    (long long)(offset + (off_t)done));
+		if ((size_t)n != chunk)
+			errx(1, "short pwrite: %zd of %zu", n, chunk);
+	}
+}
+
+static void
+write_pattern_once_fd (int fd, off_t offset, size_t len,
+    unsigned int seed)
+{
+	unsigned char *buf;
+	ssize_t n;
+
+	buf = malloc(len);
+	if (buf == NULL)
+		err(1, "malloc write pattern");
+	fill_pattern(buf, len, offset, seed);
+	n = pwrite(fd, buf, len, offset);
+	if (n == -1)
+		err(1, "pwrite at offset %lld", (long long)offset);
+	if ((size_t)n != len)
+		errx(1, "short pwrite: %zd of %zu", n, len);
+	free(buf);
+}
+
+static void
+check_pattern_fd (int fd, off_t offset, size_t len, unsigned int seed)
+{
+	unsigned char actual[IO_CHUNK], expected[IO_CHUNK];
+	size_t done, chunk;
+	ssize_t n;
+
+	for (done = 0; done < len; done += chunk) {
+		chunk = len - done;
+		if (chunk > sizeof(actual))
+			chunk = sizeof(actual);
+		n = pread(fd, actual, chunk, offset + (off_t)done);
+		if (n == -1)
+			err(1, "pread");
+		if ((size_t)n != chunk)
+			errx(1, "short pread: %zd of %zu", n, chunk);
+		fill_pattern(expected, chunk, offset + (off_t)done, seed);
+		if (memcmp(actual, expected, chunk) != 0)
+			errx(1, "data mismatch at offset %lld",
+			    (long long)(offset + (off_t)done));
+	}
+}
+
+static void
+check_zero_fd (int fd, off_t offset, size_t len)
+{
+	unsigned char buf[IO_CHUNK];
+	size_t done, chunk, i;
+	ssize_t n;
+
+	for (done = 0; done < len; done += chunk) {
+		chunk = len - done;
+		if (chunk > sizeof(buf))
+			chunk = sizeof(buf);
+		n = pread(fd, buf, chunk, offset + (off_t)done);
+		if (n == -1)
+			err(1, "pread zero range");
+		if ((size_t)n != chunk)
+			errx(1, "short zero-range pread: %zd of %zu", n, chunk);
+		for (i = 0; i < chunk; i++) {
+			if (buf[i] != 0)
+				errx(1, "non-zero hole byte at offset %lld",
+				    (long long)(offset + (off_t)done +
+				    (off_t)i));
+		}
+	}
+}
+
+static void
+write_text_file (const char *path, const char *text)
+{
+	size_t len;
+	ssize_t n;
+	int fd;
+
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	len = strlen(text);
+	n = write(fd, text, len);
+	if (n == -1)
+		err(1, "write %s", path);
+	if ((size_t)n != len)
+		errx(1, "short write to %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+check_text_file (const char *path, const char *text)
+{
+	char buf[128];
+	size_t len;
+	ssize_t n;
+	int fd;
+
+	len = strlen(text);
+	if (len >= sizeof(buf))
+		errx(1, "test text too long");
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	n = read(fd, buf, sizeof(buf));
+	if (n == -1)
+		err(1, "read %s", path);
+	if ((size_t)n != len || memcmp(buf, text, len) != 0)
+		errx(1, "text mismatch in %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+check_absent (const char *path)
+{
+	struct stat st;
+
+	errno = 0;
+	if (lstat(path, &st) != -1 || errno != ENOENT)
+		errx(1, "%s unexpectedly exists", path);
+}
+
+static void
+check_directory (const char *path)
+{
+	struct stat st;
+
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (! S_ISDIR(st.st_mode))
+		errx(1, "%s is not a directory", path);
+}
+
+static void
+check_regular (const char *path)
+{
+	struct stat st;
+
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (! S_ISREG(st.st_mode))
+		errx(1, "%s is not a regular file", path);
+}
+
+static void
+check_symlink (const char *path, const char *target)
+{
+	char buf[PATH_MAX];
+	struct stat st;
+	blkcnt_t blocks;
+	ssize_t n;
+	size_t target_len;
+
+	target_len = strlen(target);
+	if (lstat(path, &st) == -1)
+		err(1, "lstat %s", path);
+	blocks = target_len <= FAST_SYMLINK_BYTES ? 0 :
+	    (blkcnt_t)(block_size / 512);
+	if (! S_ISLNK(st.st_mode) || st.st_size != (off_t)target_len ||
+	    st.st_blocks != blocks)
+		errx(1, "symlink inode shape mismatch for %s", path);
+	n = readlink(path, buf, sizeof(buf));
+	if (n == -1)
+		err(1, "readlink %s", path);
+	if ((size_t)n != target_len ||
+	    memcmp(buf, target, (size_t)n) != 0)
+		errx(1, "symlink target mismatch for %s", path);
+}
+
+static void
+check_data_file (const char *path, int mutated)
+{
+	struct stat st;
+	off_t base, append, overwrite;
+	int fd;
+
+	base = (off_t)(3 * block_size + 257);
+	append = 73;
+	overwrite = (off_t)block_size - 17;
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (! S_ISREG(st.st_mode) || st.st_size != base + append)
+		errx(1, "wrong type or size for %s", path);
+	if ((st.st_mode & 07777) != (mutated ? 0604 : 0640))
+		errx(1, "wrong mode for %s: %04o", path,
+		    st.st_mode & 07777);
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (mutated) {
+		check_pattern_fd(fd, 0, (size_t)overwrite, DATA_SEED);
+		check_pattern_fd(fd, overwrite, 91, OVERWRITE_SEED);
+		check_pattern_fd(fd, overwrite + 91,
+		    (size_t)(base - overwrite - 91), DATA_SEED);
+	} else {
+		check_pattern_fd(fd, 0, (size_t)base, DATA_SEED);
+	}
+	check_pattern_fd(fd, base, (size_t)append, APPEND_SEED);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+check_sparse_file (const char *path, int mutated)
+{
+	struct stat st;
+	off_t marker;
+	int fd;
+
+	marker = (off_t)(8 * block_size + 31);
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (! mutated) {
+		if (st.st_size != marker + 47)
+			errx(1, "wrong sparse-file size");
+		check_zero_fd(fd, 0, (size_t)marker);
+		check_pattern_fd(fd, marker, 47, 0xd5U);
+	} else {
+		if (st.st_size != (off_t)(5 * block_size + 9))
+			errx(1, "wrong regrown sparse-file size");
+		check_zero_fd(fd, 0, (size_t)st.st_size);
+	}
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+check_large_sparse (const char *path, int mutated)
+{
+	struct stat st;
+	off_t marker;
+	int fd;
+
+	marker = mutated ? ((off_t)3 * 1024 * 1024 * 1024 + 211) :
+	    ((off_t)5 * 1024 * 1024 * 1024 + 123);
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (st.st_size != marker + 17)
+		errx(1, "wrong large sparse-file size: %lld",
+		    (long long)st.st_size);
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	check_zero_fd(fd, marker - 31, 31);
+	check_pattern_fd(fd, marker, 17, mutated ? 0xf6U : 0xe5U);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+check_extent_file (const char *path)
+{
+	struct stat st;
+	off_t offset;
+	int fd, i;
+
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (st.st_size != (off_t)((EXTENT_WRITES * 2 - 1) * block_size))
+		errx(1, "wrong extent test size");
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	for (i = 0; i < EXTENT_WRITES; i++) {
+		offset = (off_t)i * 2 * (off_t)block_size;
+		check_pattern_fd(fd, offset, block_size, EXTENT_SEED + i);
+		if (i != EXTENT_WRITES - 1)
+			check_zero_fd(fd, offset + (off_t)block_size,
+			    block_size);
+	}
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+check_shrunk_extent_file (const char *path)
+{
+	struct stat st;
+	off_t offset;
+	int fd, i;
+
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (st.st_size != (off_t)(SHRINK_EXTENT_LBN + 1) *
+	    (off_t)block_size)
+		errx(1, "wrong shrunk extent-file size");
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	for (i = 0; i < SHRINK_EXTENT_LBN / 2; i++) {
+		offset = (off_t)i * 2 * (off_t)block_size;
+		check_pattern_fd(fd, offset, block_size, EXTENT_SEED + i);
+		check_zero_fd(fd, offset + (off_t)block_size, block_size);
+	}
+	offset = (off_t)SHRINK_EXTENT_LBN * (off_t)block_size;
+	check_pattern_fd(fd, offset, SHRINK_EXTENT_BYTES,
+	    EXTENT_SEED + SHRINK_EXTENT_LBN / 2);
+	check_zero_fd(fd, offset + SHRINK_EXTENT_BYTES,
+	    block_size - SHRINK_EXTENT_BYTES);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+check_empty_file (const char *path)
+{
+	struct stat st;
+
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (! S_ISREG(st.st_mode) || st.st_size != 0 ||
+	    st.st_blocks != 0)
+		errx(1, "%s retained data or allocated blocks", path);
+}
+
+static void
+create_link_growth_tree (void)
+{
+	struct stat st;
+	char directory[PATH_MAX], linkpath[PATH_MAX], name[256];
+	char suffix[320], target[PATH_MAX];
+	size_t consume, namelen, record;
+	int fd, index, n;
+
+	make_path(directory, sizeof(directory), "link-grow");
+	if (mkdir(directory, 0755) == -1)
+		err(1, "mkdir %s", directory);
+	make_path(target, sizeof(target), "link-target");
+	write_text_file(target, "journaled-link-data");
+
+	/*
+	 * The regression images use metadata_csum.  Leave eight bytes of slack
+	 * in the first linear directory block, less than any valid dirent, so
+	 * the hard link below must allocate the next block itself.
+	 */
+	consume = block_size - DIR_TAIL_BYTES - 24 - 8;
+	index = 0;
+	while (consume != 0) {
+		record = consume > 264 ? 264 : consume;
+		if (consume > record && consume - record < 12)
+			record -= 12 - (consume - record);
+		if (record < 12 || (record & 3) != 0)
+			errx(1, "invalid directory packing record");
+		namelen = record == 264 ? 255 : record - 8;
+		memset(name, 'f', namelen);
+		n = snprintf(name, namelen + 1, "%03d-", index);
+		if (n < 0 || (size_t)n >= namelen)
+			errx(1, "directory filler name too short");
+		memset(name + n, 'f', namelen - (size_t)n);
+		name[namelen] = '\0';
+		n = snprintf(suffix, sizeof(suffix), "link-grow/%s", name);
+		if (n < 0 || (size_t)n >= sizeof(suffix))
+			errx(1, "directory filler path too long");
+		make_path(linkpath, sizeof(linkpath), suffix);
+		fd = open(linkpath, O_WRONLY | O_CREAT | O_EXCL, 0644);
+		if (fd == -1)
+			err(1, "open %s", linkpath);
+		if (close(fd) == -1)
+			err(1, "close %s", linkpath);
+		consume -= record;
+		index++;
+	}
+	if (stat(directory, &st) == -1)
+		err(1, "stat %s", directory);
+	if (st.st_size != (off_t)block_size)
+		errx(1, "directory packing unexpectedly grew the directory");
+	make_path(linkpath, sizeof(linkpath),
+	    "link-grow/journal-growth-link");
+	if (link(target, linkpath) == -1)
+		err(1, "link %s", linkpath);
+	if (stat(directory, &st) == -1)
+		err(1, "stat %s", directory);
+	if (st.st_size != (off_t)(2 * block_size))
+		errx(1, "hard link did not grow its directory");
+}
+
+static void
+check_link_growth_tree (int removed)
+{
+	struct stat directory_st, link_st, target_st;
+	char directory[PATH_MAX], linkpath[PATH_MAX], target[PATH_MAX];
+
+	make_path(directory, sizeof(directory), "link-grow");
+	make_path(target, sizeof(target), "link-target");
+	make_path(linkpath, sizeof(linkpath),
+	    "link-grow/journal-growth-link");
+	if (stat(directory, &directory_st) == -1)
+		err(1, "stat %s", directory);
+	if (! S_ISDIR(directory_st.st_mode) ||
+	    directory_st.st_size != (off_t)(2 * block_size))
+		errx(1, "link-growth directory has wrong type or size");
+	if (stat(target, &target_st) == -1)
+		err(1, "stat %s", target);
+	if (removed) {
+		check_absent(linkpath);
+		if (target_st.st_nlink != 1)
+			errx(1, "journaled link removal count mismatch");
+	} else {
+		if (stat(linkpath, &link_st) == -1)
+			err(1, "stat %s", linkpath);
+		if (target_st.st_ino != link_st.st_ino ||
+		    target_st.st_nlink != 2 || link_st.st_nlink != 2)
+			errx(1, "journaled growth link identity or count mismatch");
+		check_text_file(linkpath, "journaled-link-data");
+	}
+	check_text_file(target, "journaled-link-data");
+}
+
+static void
+create_extent_file (const char *path)
+{
+	int fd, i;
+
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	for (i = 0; i < EXTENT_WRITES; i++)
+		write_pattern_fd(fd, (off_t)i * 2 * (off_t)block_size,
+		    block_size, EXTENT_SEED + i);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static size_t
+extent_leaf_capacity (void)
+{
+	return ((block_size - EXTENT_NODE_HEADER_BYTES) /
+	    EXTENT_NODE_ENTRY_BYTES);
+}
+
+static off_t
+extent_lbn_offset (size_t lbn)
+{
+	return ((off_t)lbn * (off_t)block_size);
+}
+
+static int
+check_extent_fixture (off_t expected_size, size_t expected_blocks)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	blkcnt_t expected_sectors;
+	int fd;
+
+	make_path(path, sizeof(path), "extent-probe");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	expected_sectors = (blkcnt_t)expected_blocks *
+	    (blkcnt_t)(block_size / 512);
+	if (! S_ISREG(st.st_mode) || st.st_nlink != 1 ||
+	    st.st_size != expected_size ||
+	    st.st_blocks != expected_sectors)
+		errx(1, "extent fixture has wrong inode shape");
+	return (fd);
+}
+
+static void
+check_extent_source (int fd, size_t index)
+{
+	unsigned char byte;
+	off_t offset;
+	ssize_t n;
+
+	offset = extent_lbn_offset(2 * index);
+	n = pread(fd, &byte, 1, offset);
+	if (n == -1)
+		err(1, "pread source extent");
+	if (n != 1 || byte != 'x')
+		errx(1, "source extent mismatch at logical block %zu",
+		    2 * index);
+	check_zero_fd(fd, offset + 1, block_size - 1);
+}
+
+static void
+extent_split_fixture (void)
+{
+	struct stat st;
+	size_t capacity, split_lbn;
+	off_t original_size, split_size;
+	int fd;
+
+	capacity = extent_leaf_capacity();
+	split_lbn = 2 * capacity;
+	original_size = extent_lbn_offset(2 * capacity - 1);
+	split_size = extent_lbn_offset(split_lbn + 1);
+	fd = check_extent_fixture(original_size, capacity + 1);
+	check_extent_source(fd, 0);
+	check_extent_source(fd, capacity - 1);
+	check_zero_fd(fd, extent_lbn_offset(1), block_size);
+	write_pattern_fd(fd, extent_lbn_offset(split_lbn), block_size,
+	    EXTENT_SPLIT_SEED);
+	if (fsync(fd) == -1)
+		err(1, "fsync split extent fixture");
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat split extent fixture");
+	if (st.st_size != split_size ||
+	    st.st_blocks != (blkcnt_t)(capacity + 3) *
+	    (blkcnt_t)(block_size / 512))
+		errx(1, "extent split has wrong inode shape");
+	check_pattern_fd(fd, extent_lbn_offset(split_lbn), block_size,
+	    EXTENT_SPLIT_SEED);
+	if (close(fd) == -1)
+		err(1, "close split extent fixture");
+}
+
+static void
+extent_append_fixture (void)
+{
+	struct stat st;
+	size_t append_lbn, capacity, split_lbn;
+	off_t append_size, batch_offset, split_size;
+	int fd;
+
+	capacity = extent_leaf_capacity();
+	split_lbn = 2 * capacity;
+	append_lbn = split_lbn + 2;
+	split_size = extent_lbn_offset(split_lbn + 1);
+	append_size = extent_lbn_offset(append_lbn + 1);
+	fd = check_extent_fixture(split_size, capacity + 3);
+	check_pattern_fd(fd, extent_lbn_offset(split_lbn), block_size,
+	    EXTENT_SPLIT_SEED);
+	write_pattern_fd(fd, extent_lbn_offset(append_lbn), block_size,
+	    EXTENT_APPEND_SEED);
+	batch_offset = append_size;
+	write_pattern_fd(fd, batch_offset, EXTENT_BATCH_BYTES,
+	    EXTENT_BATCH_SEED);
+	check_pattern_fd(fd, batch_offset, EXTENT_BATCH_BYTES,
+	    EXTENT_BATCH_SEED);
+	if (ftruncate(fd, append_size) == -1)
+		err(1, "truncate batched extent fixture");
+	if (fsync(fd) == -1)
+		err(1, "fsync appended extent fixture");
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat appended extent fixture");
+	if (st.st_size != append_size ||
+	    st.st_blocks != (blkcnt_t)(capacity + 4) *
+	    (blkcnt_t)(block_size / 512))
+		errx(1, "extent append has wrong inode shape");
+	check_pattern_fd(fd, extent_lbn_offset(append_lbn), block_size,
+	    EXTENT_APPEND_SEED);
+	if (close(fd) == -1)
+		err(1, "close appended extent fixture");
+}
+
+static void
+extent_shrink_fixture (void)
+{
+	struct stat st;
+	size_t append_lbn, capacity, split_lbn;
+	off_t append_size, retained_size, split_offset, split_size;
+	int fd;
+
+	capacity = extent_leaf_capacity();
+	split_lbn = 2 * capacity;
+	append_lbn = split_lbn + 2;
+	split_offset = extent_lbn_offset(split_lbn);
+	split_size = extent_lbn_offset(split_lbn + 1);
+	append_size = extent_lbn_offset(append_lbn + 1);
+	retained_size = split_offset + EXTENT_PARTIAL_BYTES;
+	fd = check_extent_fixture(append_size, capacity + 4);
+	check_pattern_fd(fd, extent_lbn_offset(append_lbn), block_size,
+	    EXTENT_APPEND_SEED);
+	if (ftruncate(fd, retained_size) == -1)
+		err(1, "shrink extent fixture");
+	if (fsync(fd) == -1)
+		err(1, "fsync shrunken extent fixture");
+	if (ftruncate(fd, split_size) == -1)
+		err(1, "regrow extent fixture");
+	if (fsync(fd) == -1)
+		err(1, "fsync regrown extent fixture");
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat regrown extent fixture");
+	if (st.st_size != split_size ||
+	    st.st_blocks != (blkcnt_t)(capacity + 3) *
+	    (blkcnt_t)(block_size / 512))
+		errx(1, "extent shrink has wrong inode shape");
+	check_pattern_fd(fd, split_offset, EXTENT_PARTIAL_BYTES,
+	    EXTENT_SPLIT_SEED);
+	check_zero_fd(fd, split_offset + EXTENT_PARTIAL_BYTES,
+	    block_size - EXTENT_PARTIAL_BYTES);
+	if (close(fd) == -1)
+		err(1, "close shrunken extent fixture");
+}
+
+static void
+extent_prune_fixture (void)
+{
+	struct stat st;
+	size_t capacity, first_entries, split_lbn;
+	off_t pruned_size, split_size;
+	int fd;
+
+	capacity = extent_leaf_capacity();
+	split_lbn = 2 * capacity;
+	first_entries = capacity - capacity / 2;
+	split_size = extent_lbn_offset(split_lbn + 1);
+	pruned_size = extent_lbn_offset(2 * first_entries);
+	fd = check_extent_fixture(split_size, capacity + 3);
+	if (ftruncate(fd, pruned_size) == -1)
+		err(1, "prune extent fixture");
+	if (fsync(fd) == -1)
+		err(1, "fsync pruned extent fixture");
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat pruned extent fixture");
+	if (st.st_size != pruned_size ||
+	    st.st_blocks != (blkcnt_t)(first_entries + 1) *
+	    (blkcnt_t)(block_size / 512))
+		errx(1, "extent prune has wrong inode shape");
+	check_extent_source(fd, 0);
+	check_extent_source(fd, first_entries - 1);
+	if (close(fd) == -1)
+		err(1, "close pruned extent fixture");
+}
+
+static void
+extent_zero_fixture (void)
+{
+	struct stat st;
+	size_t capacity, first_entries;
+	off_t pruned_size;
+	int fd;
+
+	capacity = extent_leaf_capacity();
+	first_entries = capacity - capacity / 2;
+	pruned_size = extent_lbn_offset(2 * first_entries);
+	fd = check_extent_fixture(pruned_size, first_entries + 1);
+	if (ftruncate(fd, 0) == -1)
+		err(1, "zero extent fixture");
+	if (fsync(fd) == -1)
+		err(1, "fsync zeroed extent fixture");
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat zeroed extent fixture");
+	if (st.st_size != 0 || st.st_blocks != 0)
+		errx(1, "zeroed extent fixture retains blocks");
+	if (close(fd) == -1)
+		err(1, "close zeroed extent fixture");
+}
+
+static void
+extent_verify_zero_fixture (void)
+{
+	int fd;
+
+	fd = check_extent_fixture(0, 0);
+	if (close(fd) == -1)
+		err(1, "close verified extent fixture");
+}
+
+static void
+extent_reject_deep_growth (void)
+{
+	struct stat st;
+	struct statfs before, after;
+	unsigned char buf[IO_CHUNK];
+	size_t capacity, entries, reject_lbn;
+	off_t original_size;
+	ssize_t n;
+	int fd;
+
+	capacity = extent_leaf_capacity();
+	entries = 4 * capacity - 3;
+	reject_lbn = 2 * entries;
+	original_size = extent_lbn_offset(2 * entries - 1);
+	fd = check_extent_fixture(original_size, entries + 4);
+	check_extent_source(fd, 0);
+	check_extent_source(fd, entries - 1);
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before rejected extent growth");
+	fill_pattern(buf, block_size, extent_lbn_offset(reject_lbn),
+	    EXTENT_APPEND_SEED);
+	errno = 0;
+	n = pwrite(fd, buf, block_size,
+	    extent_lbn_offset(reject_lbn));
+	if (n != -1)
+		errx(1, "unsupported deep extent growth succeeded");
+	if (errno != EOPNOTSUPP)
+		errx(1, "deep extent growth failed with %s",
+		    strerror(errno));
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat rejected extent fixture");
+	if (st.st_size != original_size ||
+	    st.st_blocks != (blkcnt_t)(entries + 4) *
+	    (blkcnt_t)(block_size / 512))
+		errx(1, "rejected extent growth changed inode shape");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after rejected extent growth");
+	if (after.f_bfree != before.f_bfree ||
+	    after.f_ffree != before.f_ffree)
+		errx(1, "rejected extent growth changed free counts");
+	if (close(fd) == -1)
+		err(1, "close rejected extent fixture");
+}
+
+static void
+create_directory_fixture (void)
+{
+	char path[PATH_MAX];
+
+	if (mkdir(root, 0755) == -1)
+		err(1, "mkdir %s", root);
+	make_path(path, sizeof(path), "first");
+	write_text_file(path, "first-data");
+	make_path(path, sizeof(path), "replace-source");
+	write_text_file(path, "replacement-data");
+	make_path(path, sizeof(path), "replace-target");
+	write_text_file(path, "retired-data");
+	make_path(path, sizeof(path), "remove");
+	if (mkdir(path, 0755) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "remove/one");
+	write_text_file(path, "one-data");
+	make_path(path, sizeof(path), "remove/two");
+	write_text_file(path, "two-data");
+	make_path(path, sizeof(path), "remove/three");
+	write_text_file(path, "three-data");
+	make_path(path, sizeof(path), "old-parent");
+	if (mkdir(path, 0755) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "new-parent");
+	if (mkdir(path, 0755) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "old-parent/moved");
+	if (mkdir(path, 0710) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "empty-dir");
+	if (mkdir(path, 0755) == -1)
+		err(1, "mkdir %s", path);
+	create_link_growth_tree();
+	make_path(path, sizeof(path), "remove");
+	fsync_path(path);
+	make_path(path, sizeof(path), "old-parent");
+	fsync_path(path);
+	make_path(path, sizeof(path), "new-parent");
+	fsync_path(path);
+	fsync_path(root);
+}
+
+static void
+verify_directory_fixture (int mutated)
+{
+	char path[PATH_MAX];
+
+	check_directory(root);
+	make_path(path, sizeof(path), mutated ? "renamed" : "first");
+	check_text_file(path, "first-data");
+	make_path(path, sizeof(path),
+	    mutated ? "first" : "renamed");
+	check_absent(path);
+	make_path(path, sizeof(path), "replace-target");
+	check_text_file(path,
+	    mutated ? "replacement-data" : "retired-data");
+	make_path(path, sizeof(path), "replace-source");
+	if (mutated)
+		check_absent(path);
+	else
+		check_text_file(path, "replacement-data");
+	make_path(path, sizeof(path), "remove/one");
+	check_text_file(path, "one-data");
+	make_path(path, sizeof(path), "remove/two");
+	if (mutated)
+		check_absent(path);
+	else
+		check_text_file(path, "two-data");
+	make_path(path, sizeof(path), "remove/three");
+	check_text_file(path, "three-data");
+	make_path(path, sizeof(path), "old-parent/moved");
+	if (mutated)
+		check_absent(path);
+	else
+		check_directory(path);
+	make_path(path, sizeof(path), "new-parent/moved");
+	if (mutated)
+		check_directory(path);
+	else
+		check_absent(path);
+	make_path(path, sizeof(path), "empty-dir");
+	if (mutated)
+		check_absent(path);
+	else
+		check_directory(path);
+	make_path(path, sizeof(path), "new-entry");
+	if (mutated)
+		check_text_file(path, "new-entry-data");
+	else
+		check_absent(path);
+	check_link_growth_tree(mutated);
+}
+
+static void
+mutate_directory_fixture (void)
+{
+	char from[PATH_MAX], path[PATH_MAX], to[PATH_MAX];
+
+	verify_directory_fixture(0);
+	make_path(from, sizeof(from), "first");
+	make_path(to, sizeof(to), "renamed");
+	if (rename(from, to) == -1)
+		err(1, "rename first");
+	make_path(from, sizeof(from), "replace-source");
+	make_path(to, sizeof(to), "replace-target");
+	if (rename(from, to) == -1)
+		err(1, "rename replacement");
+	make_path(from, sizeof(from), "old-parent/moved");
+	make_path(to, sizeof(to), "new-parent/moved");
+	if (rename(from, to) == -1)
+		err(1, "rename moved directory");
+	make_path(path, sizeof(path), "remove/two");
+	if (unlink(path) == -1)
+		err(1, "unlink %s", path);
+	make_path(path, sizeof(path),
+	    "link-grow/journal-growth-link");
+	if (unlink(path) == -1)
+		err(1, "unlink %s", path);
+	make_path(path, sizeof(path), "empty-dir");
+	if (rmdir(path) == -1)
+		err(1, "rmdir %s", path);
+	make_path(path, sizeof(path), "new-entry");
+	write_text_file(path, "new-entry-data");
+	make_path(path, sizeof(path), "remove");
+	fsync_path(path);
+	make_path(path, sizeof(path), "old-parent");
+	fsync_path(path);
+	make_path(path, sizeof(path), "new-parent");
+	fsync_path(path);
+	fsync_path(root);
+	verify_directory_fixture(1);
+}
+
+static void
+reject_corrupt_directory (void)
+{
+	char path[PATH_MAX];
+	int fd, saved_errno;
+
+	make_path(path, sizeof(path), "one");
+	errno = 0;
+	fd = open(path, O_RDONLY);
+	saved_errno = errno;
+	if (fd != -1) {
+		(void)close(fd);
+		errx(1, "lookup accepted a corrupt directory tail");
+	}
+	if (saved_errno != EINVAL && saved_errno != EIO)
+		errx(1, "corrupt lookup failed with %s",
+		    strerror(saved_errno));
+	make_path(path, sizeof(path), "new");
+	errno = 0;
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+	saved_errno = errno;
+	if (fd != -1) {
+		(void)close(fd);
+		errx(1, "create accepted a corrupt directory tail");
+	}
+	if (saved_errno != EINVAL && saved_errno != EIO)
+		errx(1, "corrupt create failed with %s",
+		    strerror(saved_errno));
+}
+
+static u_int64_t
+orphan_file_blocks (const struct stat *st)
+{
+	u_int64_t ratio;
+
+	ratio = block_size / DEV_BSIZE;
+	if (ratio == 0 || st->st_blocks < 0 ||
+	    (u_int64_t)st->st_blocks % ratio != 0)
+		errx(1, "invalid orphan fixture block accounting");
+	return ((u_int64_t)st->st_blocks / ratio);
+}
+
+static void
+create_orphan_fixture (void)
+{
+	char path[PATH_MAX];
+
+	if (mkdir(root, 0755) == -1)
+		err(1, "mkdir %s", root);
+	make_path(path, sizeof(path), "held-first");
+	write_text_file(path, "");
+	make_path(path, sizeof(path), "held-second");
+	write_text_file(path, "");
+	make_path(path, sizeof(path), "corrupt-target");
+	write_text_file(path, "orphan-target-data");
+	make_path(path, sizeof(path), "rename-source");
+	write_text_file(path, "rename-source-data");
+	make_path(path, sizeof(path), "rename-target");
+	write_text_file(path, "rename-target-data");
+	make_path(path, sizeof(path), "empty-dir");
+	if (mkdir(path, 0755) == -1)
+		err(1, "mkdir %s", path);
+	fsync_path(root);
+}
+
+static void
+cycle_orphan_fixture (void)
+{
+	struct stat first, parent, second, target;
+	struct statfs after, before;
+	char path[PATH_MAX], other[PATH_MAX];
+	u_int64_t first_blocks, second_blocks, target_blocks;
+	int fd, fd2;
+
+	make_path(path, sizeof(path), "corrupt-target");
+	if (stat(path, &target) == -1)
+		err(1, "stat %s", path);
+	target_blocks = orphan_file_blocks(&target);
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before closed orphan retirement");
+	if (unlink(path) == -1)
+		err(1, "unlink %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after closed orphan retirement");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree + target_blocks)
+		errx(1, "closed orphan retirement accounting mismatch");
+
+	make_path(path, sizeof(path), "rename-target");
+	if (stat(path, &target) == -1)
+		err(1, "stat %s", path);
+	target_blocks = orphan_file_blocks(&target);
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before orphan replacement");
+	make_path(other, sizeof(other), "rename-source");
+	if (rename(other, path) == -1)
+		err(1, "rename orphan replacement");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after orphan replacement");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree + target_blocks)
+		errx(1, "orphan replacement accounting mismatch");
+	check_text_file(path, "rename-source-data");
+	check_absent(other);
+
+	make_path(path, sizeof(path), "empty-dir");
+	if (stat(path, &target) == -1)
+		err(1, "stat %s", path);
+	target_blocks = orphan_file_blocks(&target);
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before orphan directory retirement");
+	if (rmdir(path) == -1)
+		err(1, "rmdir %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after orphan directory retirement");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree + target_blocks)
+		errx(1, "orphan directory accounting mismatch");
+
+	make_path(path, sizeof(path), "held-first");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	make_path(other, sizeof(other), "held-second");
+	fd2 = open(other, O_RDWR);
+	if (fd2 == -1)
+		err(1, "open %s", other);
+	write_pattern_fd(fd, 0, block_size + 7, 0x71U);
+	write_pattern_fd(fd2, 0, 2 * block_size + 11, 0x82U);
+	if (fsync(fd) == -1 || fsync(fd2) == -1)
+		err(1, "fsync orphan fixtures");
+	if (fstat(fd, &first) == -1 || fstat(fd2, &second) == -1)
+		err(1, "fstat orphan fixtures");
+	if (stat(root, &parent) == -1)
+		err(1, "stat %s", root);
+	if (((u_int64_t)parent.st_ino - 1) /
+	    (block_size / ORPHAN_INODE_BYTES) !=
+	    ((u_int64_t)first.st_ino - 1) /
+	    (block_size / ORPHAN_INODE_BYTES))
+		errx(1, "orphan fixture does not share an inode block");
+	first_blocks = orphan_file_blocks(&first);
+	second_blocks = orphan_file_blocks(&second);
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before open orphan retirement");
+	if (unlink(path) == -1 || unlink(other) == -1)
+		err(1, "unlink open orphan fixtures");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs while orphan fixtures are open");
+	if (after.f_ffree != before.f_ffree ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "open orphan was retired before final close");
+
+	if (close(fd) == -1)
+		err(1, "close first inserted orphan");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after non-head orphan close");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree + first_blocks)
+		errx(1, "non-head orphan accounting mismatch");
+	check_pattern_fd(fd2, 0, 2 * block_size + 11, 0x82U);
+	if (close(fd2) == -1)
+		err(1, "close second inserted orphan");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after final orphan close");
+	if (after.f_ffree != before.f_ffree + 2 ||
+	    after.f_bfree != before.f_bfree + first_blocks +
+	    second_blocks)
+		errx(1, "final orphan retirement accounting mismatch");
+
+	before = after;
+	make_path(path, sizeof(path), "reuse");
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after orphan inode reuse");
+	if (after.f_ffree + 1 != before.f_ffree ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "orphan inode was not reusable exactly once");
+	fsync_path(root);
+}
+
+static void
+verify_orphan_fixture (void)
+{
+	char path[PATH_MAX];
+
+	make_path(path, sizeof(path), "corrupt-target");
+	check_absent(path);
+	make_path(path, sizeof(path), "held-first");
+	check_absent(path);
+	make_path(path, sizeof(path), "held-second");
+	check_absent(path);
+	make_path(path, sizeof(path), "rename-source");
+	check_absent(path);
+	make_path(path, sizeof(path), "rename-target");
+	check_text_file(path, "rename-source-data");
+	make_path(path, sizeof(path), "empty-dir");
+	check_absent(path);
+	make_path(path, sizeof(path), "reuse");
+	check_empty_file(path);
+}
+
+static void
+check_orphan_reject_errno (const char *operation)
+{
+	int saved_errno;
+
+	saved_errno = errno;
+	if (saved_errno != EINVAL && saved_errno != EIO)
+		errx(1, "corrupt orphan %s failed with %s", operation,
+		    strerror(saved_errno));
+}
+
+static void
+reject_corrupt_orphan_file (void)
+{
+	struct stat st;
+	struct statfs after, before;
+	char other[PATH_MAX], path[PATH_MAX];
+
+	make_path(path, sizeof(path), "corrupt-target");
+	check_text_file(path, "orphan-target-data");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before corrupt orphan-file unlink");
+	errno = 0;
+	if (unlink(path) != -1)
+		errx(1, "unlink accepted a corrupt orphan file");
+	check_orphan_reject_errno("unlink");
+	check_text_file(path, "orphan-target-data");
+
+	make_path(path, sizeof(path), "rename-source");
+	make_path(other, sizeof(other), "rename-target");
+	errno = 0;
+	if (rename(path, other) != -1)
+		errx(1, "rename accepted a corrupt orphan file");
+	check_orphan_reject_errno("rename");
+	check_text_file(path, "rename-source-data");
+	check_text_file(other, "rename-target-data");
+
+	make_path(path, sizeof(path), "empty-dir");
+	errno = 0;
+	if (rmdir(path) != -1)
+		errx(1, "rmdir accepted a corrupt orphan file");
+	check_orphan_reject_errno("rmdir");
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (! S_ISDIR(st.st_mode))
+		errx(1, "rejected orphan rmdir changed file type");
+
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after corrupt orphan operations");
+	if (after.f_ffree != before.f_ffree ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "rejected orphan operation changed accounting");
+}
+
+static void
+check_grow_directory (const char *path, int mutated)
+{
+	struct dirent *de;
+	DIR *dir;
+	int count, expected;
+
+	dir = opendir(path);
+	if (dir == NULL)
+		err(1, "opendir %s", path);
+	count = 0;
+	while ((de = readdir(dir)) != NULL) {
+		if (strcmp(de->d_name, ".") == 0 ||
+		    strcmp(de->d_name, "..") == 0)
+			continue;
+		if (de->d_type != DT_REG)
+			errx(1, "wrong directory-entry type for %s", de->d_name);
+		count++;
+	}
+	if (closedir(dir) == -1)
+		err(1, "closedir %s", path);
+	expected = mutated ? GROW_FILES / 2 + REFILL_FILES : GROW_FILES;
+	if (count != expected)
+		errx(1, "%s contains %d entries, expected %d", path, count,
+		    expected);
+}
+
+static void
+fsync_path (const char *path)
+{
+	int fd;
+
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open for fsync %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+expect_ro_failure (const char *operation, int result)
+{
+	if (result != -1)
+		errx(1, "%s unexpectedly succeeded on a read-only mount",
+		    operation);
+	if (errno != EROFS)
+		errx(1, "%s failed with %s instead of EROFS", operation,
+		    strerror(errno));
+}
+
+static void
+create_unix_socket (const char *path)
+{
+	struct sockaddr_un sun;
+	int fd;
+
+	fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd == -1)
+		err(1, "socket");
+	memset(&sun, 0, sizeof(sun));
+	sun.sun_len = sizeof(sun);
+	sun.sun_family = AF_UNIX;
+	if (strlcpy(sun.sun_path, path, sizeof(sun.sun_path)) >=
+	    sizeof(sun.sun_path))
+		errx(1, "UNIX socket path too long: %s", path);
+	if (bind(fd, (struct sockaddr *)&sun, sizeof(sun)) == -1)
+		err(1, "bind %s", path);
+	if (close(fd) == -1)
+		err(1, "close UNIX socket");
+}
+
+static void
+create_special_files (void)
+{
+	struct statfs before, after;
+	char path[PATH_MAX];
+
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before special-file creation");
+	make_path(path, sizeof(path), "char-device");
+	if (mknod(path, S_IFCHR | 0600, makedev(1, 7)) == -1)
+		err(1, "mknod %s", path);
+	make_path(path, sizeof(path), "block-device");
+	if (mknod(path, S_IFBLK | 0600, makedev(2, 3)) == -1)
+		err(1, "mknod %s", path);
+	make_path(path, sizeof(path), "fifo");
+	if (mkfifo(path, 0600) == -1)
+		err(1, "mkfifo %s", path);
+	make_path(path, sizeof(path), "unix-socket");
+	create_unix_socket(path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after special-file creation");
+	if (after.f_ffree != before.f_ffree - 4)
+		errx(1, "special-file creation did not allocate four inodes");
+	if (after.f_bfree != before.f_bfree)
+		errx(1, "blockless special-file creation allocated a block");
+	fsync_path(root);
+}
+
+static void
+verify_special_files (void)
+{
+	struct stat st;
+	char path[PATH_MAX];
+
+	make_path(path, sizeof(path), "fifo");
+	if (lstat(path, &st) == -1)
+		err(1, "lstat %s", path);
+	if (! S_ISFIFO(st.st_mode))
+		errx(1, "%s is not a fifo", path);
+	make_path(path, sizeof(path), "char-device");
+	if (lstat(path, &st) == -1)
+		err(1, "lstat %s", path);
+	if (! S_ISCHR(st.st_mode))
+		errx(1, "%s is not a character device", path);
+	if (st.st_rdev != makedev(1, 7))
+		errx(1, "%s has wrong device number", path);
+	make_path(path, sizeof(path), "block-device");
+	if (lstat(path, &st) == -1)
+		err(1, "lstat %s", path);
+	if (! S_ISBLK(st.st_mode))
+		errx(1, "%s is not a block device", path);
+	if (st.st_rdev != makedev(2, 3))
+		errx(1, "%s has wrong device number", path);
+	make_path(path, sizeof(path), "unix-socket");
+	if (lstat(path, &st) == -1)
+		err(1, "lstat %s", path);
+	if (! S_ISSOCK(st.st_mode))
+		errx(1, "%s is not a socket", path);
+}
+
+static void
+remove_special_files (void)
+{
+	struct statfs before, after;
+	char path[PATH_MAX];
+	const char *names[] = {
+		"char-device",
+		"block-device",
+		"fifo",
+		"unix-socket",
+	};
+	size_t i;
+
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before special-file removal");
+	for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		make_path(path, sizeof(path), names[i]);
+		if (unlink(path) == -1)
+			err(1, "unlink %s", path);
+	}
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after special-file removal");
+	if (after.f_ffree != before.f_ffree + 4)
+		errx(1, "special-file removal did not free four inodes");
+	if (after.f_bfree != before.f_bfree)
+		errx(1, "blockless special-file removal freed a block");
+	fsync_path(root);
+}
+
+static void
+create_grow_directory (void)
+{
+	char path[PATH_MAX];
+	int i;
+
+	make_path(path, sizeof(path), "growdir");
+	if (mkdir(path, 0755) == -1)
+		err(1, "mkdir %s", path);
+	for (i = 0; i < GROW_FILES; i++) {
+		make_indexed_path(path, sizeof(path), "growdir", i);
+		write_text_file(path, "");
+	}
+	make_path(path, sizeof(path), "growdir");
+	fsync_path(path);
+	fsync_path(root);
+}
+
+static void
+create_filesystem_tree (void)
+{
+	struct statfs before, after;
+	char path[PATH_MAX], other[PATH_MAX], longname[256], toolong[257];
+	char slow_target[97];
+	off_t base, marker;
+	unsigned char append_buf[73];
+	int fd;
+	ssize_t n;
+
+	if (statfs(root, &before) == -1 && errno != ENOENT)
+		err(1, "statfs %s", root);
+	if (mkdir(root, 0755) == -1)
+		err(1, "mkdir %s", root);
+	if (statfs(root, &before) == -1)
+		err(1, "statfs %s", root);
+
+	make_path(path, sizeof(path), "a");
+	if (mkdir(path, 0755) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "b");
+	if (mkdir(path, 0755) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "a/nested");
+	if (mkdir(path, 0711) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "a/nested/leaf");
+	write_text_file(path, "nested-data");
+	make_path(path, sizeof(path), "a/same-old");
+	write_text_file(path, "same-directory-rename");
+
+	make_path(path, sizeof(path), "data");
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0640);
+	if (fd == -1)
+		err(1, "open %s", path);
+	base = (off_t)(3 * block_size + 257);
+	write_pattern_fd(fd, 0, (size_t)base, DATA_SEED);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	fd = open(path, O_WRONLY | O_APPEND);
+	if (fd == -1)
+		err(1, "open append %s", path);
+	fill_pattern(append_buf, sizeof(append_buf), base, APPEND_SEED);
+	n = write(fd, append_buf, sizeof(append_buf));
+	if (n == -1)
+		err(1, "append %s", path);
+	if ((size_t)n != sizeof(append_buf))
+		errx(1, "short append to %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync append %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	make_path(other, sizeof(other), "data.link");
+	if (link(path, other) == -1)
+		err(1, "link %s", other);
+
+	make_path(path, sizeof(path), "sparse");
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	marker = (off_t)(8 * block_size + 31);
+	write_pattern_fd(fd, marker, 47, 0xd5U);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+
+	make_path(path, sizeof(path), "large-sparse");
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	marker = (off_t)5 * 1024 * 1024 * 1024 + 123;
+	write_pattern_fd(fd, marker, 17, 0xe5U);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+
+	make_path(path, sizeof(path), "extents");
+	create_extent_file(path);
+	make_path(path, sizeof(path), "free-extents");
+	create_extent_file(path);
+	make_path(path, sizeof(path), "shrink-extents");
+	create_extent_file(path);
+	create_link_growth_tree();
+
+	make_path(path, sizeof(path), "empty");
+	write_text_file(path, "");
+	create_special_files();
+	make_path(path, sizeof(path), "fast-link");
+	if (symlink("data", path) == -1)
+		err(1, "symlink %s", path);
+	memset(slow_target, 's', sizeof(slow_target) - 1);
+	slow_target[sizeof(slow_target) - 1] = '\0';
+	make_path(path, sizeof(path), "slow-link");
+	if (symlink(slow_target, path) == -1)
+		err(1, "symlink %s", path);
+	make_path(path, sizeof(path), "xattr-unique");
+	write_text_file(path, "");
+	make_path(path, sizeof(path), "xattr-shared-a");
+	write_text_file(path, "");
+	make_path(path, sizeof(path), "xattr-shared-b");
+	write_text_file(path, "");
+
+	memset(longname, 'n', sizeof(longname) - 1);
+	longname[sizeof(longname) - 1] = '\0';
+	make_path(path, sizeof(path), longname);
+	write_text_file(path, "max-name");
+	memset(toolong, 'x', sizeof(toolong) - 1);
+	toolong[sizeof(toolong) - 1] = '\0';
+	make_path(path, sizeof(path), toolong);
+	errno = 0;
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd != -1 || errno != ENAMETOOLONG)
+		errx(1, "256-byte component did not fail with ENAMETOOLONG");
+
+	fsync_path(root);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs %s", root);
+	if (after.f_bfree >= before.f_bfree || after.f_ffree >= before.f_ffree)
+		errx(1, "free-space counters did not decrease after creation");
+}
+
+static void
+verify_created_tree (void)
+{
+	struct stat first, second;
+	char path[PATH_MAX], other[PATH_MAX], longname[256];
+	char slow_target[97];
+
+	check_directory(root);
+	make_path(path, sizeof(path), "a");
+	check_directory(path);
+	make_path(path, sizeof(path), "b");
+	check_directory(path);
+	make_path(path, sizeof(path), "a/nested/leaf");
+	check_text_file(path, "nested-data");
+	make_path(path, sizeof(path), "a/same-old");
+	check_text_file(path, "same-directory-rename");
+
+	make_path(path, sizeof(path), "data");
+	check_data_file(path, 0);
+	if (stat(path, &first) == -1)
+		err(1, "stat %s", path);
+	make_path(other, sizeof(other), "data.link");
+	if (stat(other, &second) == -1)
+		err(1, "stat %s", other);
+	if (first.st_ino != second.st_ino || first.st_nlink != 2 ||
+	    second.st_nlink != 2)
+		errx(1, "hard-link identity or count mismatch");
+
+	make_path(path, sizeof(path), "sparse");
+	check_sparse_file(path, 0);
+	make_path(path, sizeof(path), "large-sparse");
+	check_large_sparse(path, 0);
+	make_path(path, sizeof(path), "extents");
+	check_extent_file(path);
+	make_path(path, sizeof(path), "free-extents");
+	check_extent_file(path);
+	make_path(path, sizeof(path), "shrink-extents");
+	check_extent_file(path);
+	check_link_growth_tree(0);
+	make_path(path, sizeof(path), "empty");
+	check_regular(path);
+
+	verify_special_files();
+	make_path(path, sizeof(path), "fast-link");
+	check_symlink(path, "data");
+	memset(slow_target, 's', sizeof(slow_target) - 1);
+	slow_target[sizeof(slow_target) - 1] = '\0';
+	make_path(path, sizeof(path), "slow-link");
+	check_symlink(path, slow_target);
+	make_path(path, sizeof(path), "xattr-unique");
+	check_regular(path);
+	make_path(path, sizeof(path), "xattr-shared-a");
+	check_regular(path);
+	make_path(path, sizeof(path), "xattr-shared-b");
+	check_regular(path);
+	make_path(path, sizeof(path), "growdir");
+	check_grow_directory(path, 0);
+
+	memset(longname, 'n', sizeof(longname) - 1);
+	longname[sizeof(longname) - 1] = '\0';
+	make_path(path, sizeof(path), longname);
+	check_text_file(path, "max-name");
+}
+
+static void
+mutate_filesystem_tree (void)
+{
+	struct statfs before, after;
+	struct statfs orphan_before, orphan_during, orphan_after;
+	struct stat directory, parent_after, parent_before, parent_during;
+	struct timeval times[2];
+	char path[PATH_MAX], other[PATH_MAX];
+	off_t marker, overwrite;
+	int fd, fd2, i;
+
+	/* Exercise journaled retirement with and without extent data. */
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before non-regular unlink");
+	make_path(path, sizeof(path), "fast-link");
+	if (unlink(path) == -1)
+		err(1, "unlink fast-link");
+	make_path(path, sizeof(path), "fifo");
+	if (unlink(path) == -1)
+		err(1, "unlink fifo");
+	make_path(path, sizeof(path), "char-device");
+	if (unlink(path) == -1)
+		err(1, "unlink char-device");
+	make_path(path, sizeof(path), "block-device");
+	if (unlink(path) == -1)
+		err(1, "unlink block-device");
+	make_path(path, sizeof(path), "unix-socket");
+	if (unlink(path) == -1)
+		err(1, "unlink unix-socket");
+	make_path(path, sizeof(path), "slow-link");
+	if (unlink(path) == -1)
+		err(1, "unlink slow-link");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after non-regular unlink");
+	if (after.f_ffree != before.f_ffree + 6)
+		errx(1, "non-regular unlink did not free exactly six inodes");
+	if (after.f_bfree != before.f_bfree + 1)
+		errx(1, "slow symlink unlink did not free exactly one block");
+
+	/* Release unique and shared external-xattr blocks exactly once. */
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before unique xattr unlink");
+	make_path(path, sizeof(path), "xattr-unique");
+	if (unlink(path) == -1)
+		err(1, "unlink xattr-unique");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after unique xattr unlink");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree + 1)
+		errx(1, "unique xattr unlink accounting mismatch");
+	before = after;
+	make_path(path, sizeof(path), "xattr-shared-a");
+	if (unlink(path) == -1)
+		err(1, "unlink xattr-shared-a");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after first shared xattr unlink");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "shared xattr was freed while still referenced");
+	before = after;
+	make_path(path, sizeof(path), "xattr-shared-b");
+	if (unlink(path) == -1)
+		err(1, "unlink xattr-shared-b");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after last shared xattr unlink");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree + 1)
+		errx(1, "last shared xattr unlink accounting mismatch");
+
+	/* Exercise non-final unlink independently of rename replacement. */
+	make_path(path, sizeof(path),
+	    "link-grow/journal-growth-link");
+	if (unlink(path) == -1)
+		err(1, "unlink journal-growth-link");
+
+	make_path(path, sizeof(path), "data");
+	make_path(other, sizeof(other), "a/renamed");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before cross-directory file rename");
+	if (rename(path, other) == -1)
+		err(1, "rename data");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after cross-directory file rename");
+	if (after.f_ffree != before.f_ffree ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "cross-directory file rename changed accounting");
+	make_path(path, sizeof(path), "data.link");
+	if (unlink(path) == -1)
+		err(1, "unlink data.link");
+	make_path(path, sizeof(path), "a/renamed");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	overwrite = (off_t)block_size - 17;
+	write_pattern_fd(fd, overwrite, 91, OVERWRITE_SEED);
+	if (fchmod(fd, 0604) == -1)
+		err(1, "fchmod %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	times[0].tv_sec = 1700000000;
+	times[0].tv_usec = 123456;
+	times[1].tv_sec = 1700000001;
+	times[1].tv_usec = 654321;
+	if (utimes(path, times) == -1)
+		err(1, "utimes %s", path);
+
+	make_path(path, sizeof(path), "a/replacement.new");
+	write_text_file(path, "replacement-data");
+	make_path(other, sizeof(other), "b/replaced");
+	write_text_file(other, "obsolete-data");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before replacement rename");
+	if (rename(path, other) == -1)
+		err(1, "replacement rename");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after replacement rename");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree + 1)
+		errx(1, "replacement rename retirement accounting mismatch");
+	check_absent(path);
+	check_text_file(other, "replacement-data");
+
+	/* Replacing one of several target names must not orphan its inode. */
+	make_path(path, sizeof(path), "a/multilink-source");
+	write_text_file(path, "new-multilink-data");
+	make_path(other, sizeof(other), "b/multilink-target");
+	write_text_file(other, "old-multilink-data");
+	make_path(path, sizeof(path), "b/multilink-alias");
+	if (link(other, path) == -1)
+		err(1, "link multilink replacement target");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before multilink replacement rename");
+	make_path(path, sizeof(path), "a/multilink-source");
+	if (rename(path, other) == -1)
+		err(1, "multilink replacement rename");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after multilink replacement rename");
+	if (after.f_ffree != before.f_ffree ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "multilink replacement rename changed accounting");
+	check_absent(path);
+	check_text_file(other, "new-multilink-data");
+	make_path(path, sizeof(path), "b/multilink-alias");
+	check_text_file(path, "old-multilink-data");
+
+	/* POSIX same-inode rename is a no-op which preserves both names. */
+	make_path(path, sizeof(path), "a/same-inode-source");
+	write_text_file(path, "same-inode-rename");
+	make_path(other, sizeof(other), "b/same-inode-target");
+	if (link(path, other) == -1)
+		err(1, "link same-inode rename target");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before same-inode rename");
+	if (rename(path, other) == -1)
+		err(1, "same-inode rename");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after same-inode rename");
+	if (after.f_ffree != before.f_ffree ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "same-inode rename changed accounting");
+	if (stat(path, &parent_before) == -1 ||
+	    stat(other, &parent_after) == -1)
+		err(1, "stat same-inode rename names");
+	if (parent_before.st_ino != parent_after.st_ino ||
+	    parent_before.st_nlink != 2 || parent_after.st_nlink != 2)
+		errx(1, "same-inode rename changed link identity");
+
+	make_path(path, sizeof(path), "a/same-old");
+	make_path(other, sizeof(other), "a/same-new");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before same-directory rename");
+	if (rename(path, other) == -1)
+		err(1, "same-directory rename");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after same-directory rename");
+	if (after.f_ffree != before.f_ffree ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "same-directory rename changed accounting");
+
+	make_path(path, sizeof(path), "a/move");
+	if (mkdir(path, 0750) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "a/move/child");
+	write_text_file(path, "moved-child");
+	make_path(path, sizeof(path), "a/move");
+	make_path(other, sizeof(other), "b/moved");
+	make_path(path, sizeof(path), "a");
+	if (stat(path, &parent_before) == -1)
+		err(1, "stat old parent before directory rename");
+	make_path(path, sizeof(path), "b");
+	if (stat(path, &parent_during) == -1)
+		err(1, "stat new parent before directory rename");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before cross-directory rename");
+	make_path(path, sizeof(path), "a/move");
+	if (rename(path, other) == -1)
+		err(1, "cross-directory rename");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after cross-directory rename");
+	if (after.f_ffree != before.f_ffree ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "cross-directory rename changed accounting");
+	make_path(path, sizeof(path), "a");
+	if (stat(path, &parent_after) == -1)
+		err(1, "stat old parent after directory rename");
+	if (parent_after.st_nlink != parent_before.st_nlink - 1)
+		errx(1, "directory rename did not decrement old parent links");
+	make_path(path, sizeof(path), "b");
+	if (stat(path, &parent_after) == -1)
+		err(1, "stat new parent after directory rename");
+	if (parent_after.st_nlink != parent_during.st_nlink + 1)
+		errx(1, "directory rename did not increment new parent links");
+
+	/* Same-parent directory replacement retires exactly one directory. */
+	make_path(path, sizeof(path), "a/dir-replace-source");
+	if (mkdir(path, 0710) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "a/dir-replace-source/child");
+	write_text_file(path, "same-parent-directory-replacement");
+	make_path(path, sizeof(path), "a/dir-replace-target");
+	if (mkdir(path, 0700) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "a");
+	if (stat(path, &parent_before) == -1)
+		err(1, "stat parent before directory replacement");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before directory replacement");
+	make_path(path, sizeof(path), "a/dir-replace-source");
+	make_path(other, sizeof(other), "a/dir-replace-target");
+	if (rename(path, other) == -1)
+		err(1, "same-parent directory replacement");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after directory replacement");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree + 1)
+		errx(1, "directory replacement retirement accounting mismatch");
+	make_path(path, sizeof(path), "a");
+	if (stat(path, &parent_after) == -1)
+		err(1, "stat parent after directory replacement");
+	if (parent_after.st_nlink != parent_before.st_nlink - 1)
+		errx(1, "directory replacement parent link mismatch");
+	make_path(path, sizeof(path), "a/dir-replace-source");
+	check_absent(path);
+	make_path(path, sizeof(path), "a/dir-replace-target/child");
+	check_text_file(path, "same-parent-directory-replacement");
+
+	/*
+	 * Cross-parent replacement changes '..' but not the new
+	 * parent's links.
+	 */
+	make_path(path, sizeof(path), "a/cross-replace-source");
+	if (mkdir(path, 0751) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "a/cross-replace-source/child");
+	write_text_file(path, "cross-parent-directory-replacement");
+	make_path(path, sizeof(path), "b/cross-replace-target");
+	if (mkdir(path, 0701) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "a");
+	if (stat(path, &parent_before) == -1)
+		err(1, "stat old parent before cross replacement");
+	make_path(path, sizeof(path), "b");
+	if (stat(path, &parent_during) == -1)
+		err(1, "stat new parent before cross replacement");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before cross-parent directory replacement");
+	make_path(path, sizeof(path), "a/cross-replace-source");
+	make_path(other, sizeof(other), "b/cross-replace-target");
+	if (rename(path, other) == -1)
+		err(1, "cross-parent directory replacement");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after cross-parent directory replacement");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree + 1)
+		errx(1, "cross-parent replacement accounting mismatch");
+	make_path(path, sizeof(path), "a");
+	if (stat(path, &parent_after) == -1)
+		err(1, "stat old parent after cross replacement");
+	if (parent_after.st_nlink != parent_before.st_nlink - 1)
+		errx(1, "cross replacement old-parent link mismatch");
+	make_path(path, sizeof(path), "b");
+	if (stat(path, &parent_after) == -1)
+		err(1, "stat new parent after cross replacement");
+	if (parent_after.st_nlink != parent_during.st_nlink)
+		errx(1, "cross replacement new-parent link mismatch");
+	make_path(path, sizeof(path), "a/cross-replace-source");
+	check_absent(path);
+	make_path(path, sizeof(path), "b/cross-replace-target/child");
+	check_text_file(path, "cross-parent-directory-replacement");
+
+	/*
+	 * A non-empty target and an ancestor move must leave both
+	 * trees intact.
+	 */
+	make_path(path, sizeof(path), "a/rejected-directory");
+	if (mkdir(path, 0755) == -1)
+		err(1, "mkdir %s", path);
+	make_path(other, sizeof(other), "b/cross-replace-target");
+	errno = 0;
+	if (rename(path, other) != -1 || errno != ENOTEMPTY)
+		errx(1, "non-empty directory replacement did not fail");
+	check_directory(path);
+	make_path(other, sizeof(other), "b/cross-replace-target/child");
+	check_text_file(other, "cross-parent-directory-replacement");
+	if (rmdir(path) == -1)
+		err(1, "rmdir %s", path);
+
+	make_path(path, sizeof(path), "b");
+	make_path(other, sizeof(other), "b/moved/loop");
+	errno = 0;
+	if (rename(path, other) != -1 || errno != EINVAL)
+		errx(1, "directory-loop rename did not fail with EINVAL");
+	make_path(path, sizeof(path), "b/moved");
+	errno = 0;
+	if (rmdir(path) != -1 || errno != ENOTEMPTY)
+		errx(1, "rmdir of non-empty directory did not fail with ENOTEMPTY");
+
+	make_path(path, sizeof(path), "open-unlinked");
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	write_pattern_fd(fd, 0, block_size + 19, 0xc5U);
+	if (statfs(root, &orphan_before) == -1)
+		err(1, "statfs before open-file unlink");
+	if (unlink(path) == -1)
+		err(1, "unlink open file");
+	if (statfs(root, &orphan_during) == -1)
+		err(1, "statfs during open-file unlink");
+	if (orphan_during.f_ffree != orphan_before.f_ffree)
+		errx(1, "open-file unlink freed its inode before last close");
+	check_pattern_fd(fd, 0, block_size + 19, 0xc5U);
+	if (fsync(fd) == -1)
+		err(1, "fsync unlinked file");
+	if (close(fd) == -1)
+		err(1, "close unlinked file");
+	check_absent(path);
+	if (statfs(root, &orphan_after) == -1)
+		err(1, "statfs after open-file close");
+	if (orphan_after.f_ffree != orphan_before.f_ffree + 1)
+		errx(1, "last close did not free exactly one orphan inode");
+	make_path(path, sizeof(path), "orphan-reuse");
+	write_text_file(path, "orphan-inode-reused");
+	if (statfs(root, &orphan_during) == -1)
+		err(1, "statfs after orphan inode reuse");
+	if (orphan_during.f_ffree != orphan_before.f_ffree)
+		errx(1, "freed orphan inode was not reusable exactly once");
+
+	/* Close two unlinked files out of orphan insertion order. */
+	make_path(path, sizeof(path), "orphan-order-a");
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	make_path(other, sizeof(other), "orphan-order-b");
+	fd2 = open(other, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd2 == -1)
+		err(1, "open %s", other);
+	write_pattern_fd(fd, 0, block_size + 7, 0xd6U);
+	write_pattern_fd(fd2, 0, block_size + 11, 0xe7U);
+	if (statfs(root, &orphan_before) == -1)
+		err(1, "statfs before ordered orphan closes");
+	if (unlink(path) == -1)
+		err(1, "unlink %s", path);
+	if (unlink(other) == -1)
+		err(1, "unlink %s", other);
+	if (statfs(root, &orphan_during) == -1)
+		err(1, "statfs during ordered orphan closes");
+	if (orphan_during.f_ffree != orphan_before.f_ffree)
+		errx(1, "multiple open-file unlinks freed an inode early");
+	if (close(fd) == -1)
+		err(1, "close first inserted orphan");
+	if (statfs(root, &orphan_after) == -1)
+		err(1, "statfs after non-head orphan close");
+	if (orphan_after.f_ffree != orphan_before.f_ffree + 1)
+		errx(1, "non-head orphan close did not free exactly one inode");
+	check_pattern_fd(fd2, 0, block_size + 11, 0xe7U);
+	if (close(fd2) == -1)
+		err(1, "close second inserted orphan");
+	if (statfs(root, &orphan_after) == -1)
+		err(1, "statfs after final ordered orphan close");
+	if (orphan_after.f_ffree != orphan_before.f_ffree + 2)
+		errx(1, "ordered orphan closes did not free exactly two inodes");
+	check_absent(path);
+	check_absent(other);
+
+	make_path(path, sizeof(path), "sparse");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (ftruncate(fd, (off_t)(2 * block_size + 13)) == -1)
+		err(1, "shrink %s", path);
+	if (ftruncate(fd, (off_t)(5 * block_size + 9)) == -1)
+		err(1, "regrow %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+
+	make_path(path, sizeof(path), "large-sparse");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (ftruncate(fd, 0) == -1)
+		err(1, "truncate %s", path);
+	marker = (off_t)3 * 1024 * 1024 * 1024 + 211;
+	write_pattern_fd(fd, marker, 17, 0xf6U);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+
+	/* Free all data extents and the external depth-1 extent block. */
+	make_path(path, sizeof(path), "free-extents");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (ftruncate(fd, 0) == -1)
+		err(1, "truncate %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+
+	/*
+	 * Keep the depth-1 tree while freeing its tail and zeroing
+	 * partial EOF.
+	 */
+	make_path(path, sizeof(path), "shrink-extents");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	marker = (off_t)SHRINK_EXTENT_LBN * (off_t)block_size +
+	    SHRINK_EXTENT_BYTES;
+	if (ftruncate(fd, marker) == -1)
+		err(1, "shrink %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync shrunk %s", path);
+	marker = (off_t)(SHRINK_EXTENT_LBN + 1) * (off_t)block_size;
+	if (ftruncate(fd, marker) == -1)
+		err(1, "regrow %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync regrown %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before directory reuse");
+	for (i = 0; i < GROW_FILES; i += 2) {
+		make_indexed_path(path, sizeof(path), "growdir", i);
+		if (unlink(path) == -1)
+			err(1, "unlink %s", path);
+	}
+	for (i = 0; i < REFILL_FILES; i++) {
+		int n;
+		char suffix[64];
+
+		n = snprintf(suffix, sizeof(suffix), "growdir/refill-%03d", i);
+		if (n < 0 || (size_t)n >= sizeof(suffix))
+			errx(1, "refill suffix too long");
+		make_path(path, sizeof(path), suffix);
+		write_text_file(path, "");
+	}
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after directory reuse");
+	if (after.f_ffree <= before.f_ffree)
+		errx(1, "inode counter did not reflect directory-entry churn");
+
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before mkdir");
+	if (stat(root, &parent_before) == -1)
+		err(1, "stat parent before mkdir");
+	make_path(path, sizeof(path), "temporary-directory");
+	if (mkdir(path, 0700) == -1)
+		err(1, "mkdir %s", path);
+	if (stat(path, &directory) == -1)
+		err(1, "stat %s", path);
+	if (! S_ISDIR(directory.st_mode) || directory.st_nlink != 2 ||
+	    directory.st_size != (off_t)block_size ||
+	    (directory.st_mode & 0777) != 0700)
+		errx(1, "new directory metadata mismatch");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after mkdir");
+	if (stat(root, &parent_during) == -1)
+		err(1, "stat parent after mkdir");
+	if (after.f_ffree + 1 != before.f_ffree ||
+	    after.f_bfree + 1 != before.f_bfree)
+		errx(1, "mkdir did not consume exactly one inode and one block");
+	if (parent_during.st_nlink != parent_before.st_nlink + 1)
+		errx(1, "mkdir did not increment the parent link count");
+	if (rmdir(path) == -1)
+		err(1, "rmdir %s", path);
+	check_absent(path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after rmdir");
+	if (stat(root, &parent_after) == -1)
+		err(1, "stat parent after rmdir");
+	if (after.f_ffree != before.f_ffree ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "rmdir did not restore inode and block accounting");
+	if (parent_after.st_nlink != parent_before.st_nlink)
+		errx(1, "rmdir did not restore the parent link count");
+	fsync_path(root);
+}
+
+static void
+verify_final_tree (void)
+{
+	struct stat first, second, st;
+	char path[PATH_MAX], other[PATH_MAX], longname[256];
+
+	make_path(path, sizeof(path), "data");
+	check_absent(path);
+	make_path(path, sizeof(path), "data.link");
+	check_absent(path);
+	make_path(path, sizeof(path), "a/renamed");
+	check_data_file(path, 1);
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (st.st_nlink != 1 || st.st_mtime != 1700000001)
+		errx(1, "link count or timestamp mismatch for %s", path);
+
+	make_path(path, sizeof(path), "b/replaced");
+	check_text_file(path, "replacement-data");
+	make_path(path, sizeof(path), "a/multilink-source");
+	check_absent(path);
+	make_path(path, sizeof(path), "b/multilink-target");
+	check_text_file(path, "new-multilink-data");
+	if (stat(path, &first) == -1)
+		err(1, "stat %s", path);
+	make_path(other, sizeof(other), "b/multilink-alias");
+	check_text_file(other, "old-multilink-data");
+	if (stat(other, &second) == -1)
+		err(1, "stat %s", other);
+	if (first.st_ino == second.st_ino || first.st_nlink != 1 ||
+	    second.st_nlink != 1)
+		errx(1, "multilink replacement identity mismatch");
+	make_path(path, sizeof(path), "a/same-inode-source");
+	make_path(other, sizeof(other), "b/same-inode-target");
+	check_text_file(path, "same-inode-rename");
+	check_text_file(other, "same-inode-rename");
+	if (stat(path, &first) == -1 || stat(other, &second) == -1)
+		err(1, "stat remounted same-inode rename names");
+	if (first.st_ino != second.st_ino || first.st_nlink != 2 ||
+	    second.st_nlink != 2)
+		errx(1, "remounted same-inode rename identity mismatch");
+	make_path(path, sizeof(path), "a/same-old");
+	check_absent(path);
+	make_path(path, sizeof(path), "a/same-new");
+	check_text_file(path, "same-directory-rename");
+	make_path(path, sizeof(path), "b/moved/child");
+	check_text_file(path, "moved-child");
+	make_path(path, sizeof(path), "b/replaced");
+	if (stat(path, &first) == -1)
+		err(1, "stat %s", path);
+	make_path(other, sizeof(other), "b/moved/../replaced");
+	if (stat(other, &second) == -1)
+		err(1, "stat %s", other);
+	if (first.st_ino != second.st_ino)
+		errx(1, "moved directory has incorrect parent");
+	make_path(path, sizeof(path), "a/dir-replace-source");
+	check_absent(path);
+	make_path(path, sizeof(path), "a/dir-replace-target/child");
+	check_text_file(path, "same-parent-directory-replacement");
+	make_path(path, sizeof(path), "a/dir-replace-target");
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (! S_ISDIR(st.st_mode) || (st.st_mode & 0777) != 0710)
+		errx(1, "same-parent replacement lost source directory mode");
+	make_path(path, sizeof(path), "a/cross-replace-source");
+	check_absent(path);
+	make_path(path, sizeof(path), "b/cross-replace-target/child");
+	check_text_file(path, "cross-parent-directory-replacement");
+	make_path(path, sizeof(path), "b/cross-replace-target");
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (! S_ISDIR(st.st_mode) || (st.st_mode & 0777) != 0751)
+		errx(1, "cross-parent replacement lost source directory mode");
+	make_path(path, sizeof(path), "b/replaced");
+	if (stat(path, &first) == -1)
+		err(1, "stat %s", path);
+	make_path(other, sizeof(other),
+	    "b/cross-replace-target/../replaced");
+	if (stat(other, &second) == -1)
+		err(1, "stat %s", other);
+	if (first.st_ino != second.st_ino)
+		errx(1, "replaced directory has incorrect parent");
+
+	make_path(path, sizeof(path), "open-unlinked");
+	check_absent(path);
+	make_path(path, sizeof(path), "orphan-reuse");
+	check_text_file(path, "orphan-inode-reused");
+	make_path(path, sizeof(path), "orphan-order-a");
+	check_absent(path);
+	make_path(path, sizeof(path), "orphan-order-b");
+	check_absent(path);
+	make_path(path, sizeof(path), "temporary-directory");
+	check_absent(path);
+	make_path(path, sizeof(path), "sparse");
+	check_sparse_file(path, 1);
+	make_path(path, sizeof(path), "large-sparse");
+	check_large_sparse(path, 1);
+	make_path(path, sizeof(path), "extents");
+	check_extent_file(path);
+	make_path(path, sizeof(path), "free-extents");
+	check_empty_file(path);
+	make_path(path, sizeof(path), "shrink-extents");
+	check_shrunk_extent_file(path);
+	check_link_growth_tree(1);
+	make_path(path, sizeof(path), "growdir");
+	check_grow_directory(path, 1);
+
+	make_path(path, sizeof(path), "fast-link");
+	check_absent(path);
+	make_path(path, sizeof(path), "slow-link");
+	check_absent(path);
+	make_path(path, sizeof(path), "fifo");
+	check_absent(path);
+	make_path(path, sizeof(path), "char-device");
+	check_absent(path);
+	make_path(path, sizeof(path), "block-device");
+	check_absent(path);
+	make_path(path, sizeof(path), "unix-socket");
+	check_absent(path);
+	make_path(path, sizeof(path), "xattr-unique");
+	check_absent(path);
+	make_path(path, sizeof(path), "xattr-shared-a");
+	check_absent(path);
+	make_path(path, sizeof(path), "xattr-shared-b");
+	check_absent(path);
+
+	memset(longname, 'n', sizeof(longname) - 1);
+	longname[sizeof(longname) - 1] = '\0';
+	make_path(path, sizeof(path), longname);
+	check_text_file(path, "max-name");
+}
+
+static void
+verify_readonly_tree (void)
+{
+	char path[PATH_MAX], other[PATH_MAX];
+	int fd;
+
+	verify_final_tree();
+	make_path(path, sizeof(path), "a/renamed");
+	errno = 0;
+	fd = open(path, O_WRONLY);
+	expect_ro_failure("open for write", fd);
+	make_path(path, sizeof(path), "readonly-create");
+	errno = 0;
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	expect_ro_failure("create", fd);
+	check_absent(path);
+	make_path(path, sizeof(path), "readonly-directory");
+	errno = 0;
+	expect_ro_failure("mkdir", mkdir(path, 0700));
+	check_absent(path);
+	make_path(path, sizeof(path), "b/replaced");
+	errno = 0;
+	expect_ro_failure("unlink", unlink(path));
+	check_text_file(path, "replacement-data");
+	make_path(other, sizeof(other), "b/replaced-new");
+	errno = 0;
+	expect_ro_failure("rename", rename(path, other));
+	check_absent(other);
+	errno = 0;
+	expect_ro_failure("chmod", chmod(path, 0600));
+	errno = 0;
+	expect_ro_failure("truncate", truncate(path, 0));
+	check_text_file(path, "replacement-data");
+}
+
+static void
+create_allocation_probe (void)
+{
+	char path[PATH_MAX];
+	int fd;
+
+	make_path(path, sizeof(path), "allocation-probe");
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	write_pattern_fd(fd, 0, block_size + 31, 0xa7U);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+verify_allocation_probe (void)
+{
+	char path[PATH_MAX];
+	struct stat st;
+	int fd;
+
+	make_path(path, sizeof(path), "allocation-probe");
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (! S_ISREG(st.st_mode) ||
+	    st.st_size != (off_t)block_size + 31)
+		errx(1, "allocation probe has wrong type or size");
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	check_pattern_fd(fd, 0, block_size + 31, 0xa7U);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+write_allocation_run (void)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	off_t offset;
+	size_t lengths[3], i;
+	int fd;
+
+	make_path(path, sizeof(path), "allocation-run");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	lengths[0] = ALLOCATION_RUN_BYTES - block_size;
+	lengths[1] = ALLOCATION_RUN_BYTES;
+	lengths[2] = ALLOCATION_RUN_BYTES + block_size;
+	offset = 0;
+	for (i = 0; i < nitems(lengths); i++) {
+		write_pattern_once_fd(fd, offset, lengths[i],
+		    ALLOCATION_RUN_SEED);
+		offset += lengths[i];
+	}
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (st.st_size != ALLOCATION_TOTAL_BYTES ||
+	    st.st_blocks != ALLOCATION_TOTAL_BYTES / DEV_BSIZE)
+		errx(1, "allocation run has wrong inode shape");
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+verify_allocation_run (void)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	int fd;
+
+	make_path(path, sizeof(path), "allocation-run");
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (! S_ISREG(st.st_mode) ||
+	    st.st_size != ALLOCATION_TOTAL_BYTES ||
+	    st.st_blocks != ALLOCATION_TOTAL_BYTES / DEV_BSIZE)
+		errx(1, "allocation run has wrong inode shape");
+	check_pattern_fd(fd, 0, ALLOCATION_TOTAL_BYTES,
+	    ALLOCATION_RUN_SEED);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+allocate_bitmap_probe (void)
+{
+	struct statfs before, after;
+	char path[PATH_MAX];
+	int fd;
+
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before block allocation");
+	make_path(path, sizeof(path), "bitmap-probe");
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	write_pattern_fd(fd, 0, block_size, BITMAP_SEED);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after block allocation");
+	if (after.f_bfree + 1 != before.f_bfree ||
+	    after.f_ffree + 1 != before.f_ffree)
+		errx(1, "block allocation accounting mismatch");
+	verify_bitmap_probe(1);
+}
+
+static void
+verify_bitmap_probe (int allocated)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	int fd;
+
+	make_path(path, sizeof(path), "bitmap-probe");
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (! S_ISREG(st.st_mode))
+		errx(1, "bitmap probe is not a regular file");
+	if (! allocated) {
+		if (st.st_size != 0 || st.st_blocks != 0)
+			errx(1, "freed bitmap probe retains blocks");
+		return;
+	}
+	if (st.st_size != (off_t)block_size ||
+	    st.st_blocks != (blkcnt_t)(block_size / 512))
+		errx(1, "allocated bitmap probe has wrong shape");
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	check_pattern_fd(fd, 0, block_size, BITMAP_SEED);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+free_bitmap_probe (void)
+{
+	struct statfs before, after;
+	char path[PATH_MAX];
+	int fd;
+
+	verify_bitmap_probe(1);
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before block free");
+	make_path(path, sizeof(path), "bitmap-probe");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (ftruncate(fd, 0) == -1)
+		err(1, "ftruncate %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after block free");
+	if (after.f_bfree != before.f_bfree + 1 ||
+	    after.f_ffree != before.f_ffree)
+		errx(1, "block free accounting mismatch");
+	verify_bitmap_probe(0);
+}
+
+static void
+reuse_bitmap_probe (void)
+{
+	struct statfs before, after;
+	char path[PATH_MAX];
+	int fd;
+
+	verify_bitmap_probe(0);
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before block reuse");
+	make_path(path, sizeof(path), "bitmap-probe");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	write_pattern_fd(fd, 0, block_size, BITMAP_SEED);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after block reuse");
+	if (after.f_bfree + 1 != before.f_bfree ||
+	    after.f_ffree != before.f_ffree)
+		errx(1, "block reuse accounting mismatch");
+	verify_bitmap_probe(1);
+}
+
+static void
+retire_bitmap_probe (void)
+{
+	struct statfs before, after;
+	char path[PATH_MAX];
+
+	verify_bitmap_probe(1);
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before block retirement");
+	make_path(path, sizeof(path), "bitmap-probe");
+	if (unlink(path) == -1)
+		err(1, "unlink %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after block retirement");
+	if (after.f_bfree != before.f_bfree + 1 ||
+	    after.f_ffree != before.f_ffree + 1)
+		errx(1, "block retirement accounting mismatch");
+	check_absent(path);
+}
+
+static void
+allocate_inode_probe (void)
+{
+	struct statfs before, after;
+	char path[PATH_MAX];
+	int fd;
+
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before inode allocation");
+	make_path(path, sizeof(path), "inode-probe");
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after inode allocation");
+	if (after.f_bfree != before.f_bfree ||
+	    after.f_ffree + 1 != before.f_ffree)
+		errx(1, "inode allocation accounting mismatch");
+	verify_inode_probe();
+}
+
+static void
+verify_inode_probe (void)
+{
+	struct stat st;
+	char path[PATH_MAX];
+
+	make_path(path, sizeof(path), "inode-probe");
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (! S_ISREG(st.st_mode) || st.st_size != 0 ||
+	    st.st_blocks != 0 || st.st_nlink != 1)
+		errx(1, "inode probe has wrong shape");
+}
+
+static void
+free_inode_probe (void)
+{
+	struct statfs before, after;
+	char path[PATH_MAX];
+
+	verify_inode_probe();
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before inode free");
+	make_path(path, sizeof(path), "inode-probe");
+	if (unlink(path) == -1)
+		err(1, "unlink %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after inode free");
+	if (after.f_bfree != before.f_bfree ||
+	    after.f_ffree != before.f_ffree + 1)
+		errx(1, "inode free accounting mismatch");
+	check_absent(path);
+}
+
+static void
+reject_block_counter (void)
+{
+	struct stat st;
+	struct statfs after, before;
+	char path[PATH_MAX];
+	char value;
+	ssize_t n;
+	int fd, saved_errno;
+
+	make_path(path, sizeof(path), "counter-block-probe");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (! S_ISREG(st.st_mode) || st.st_size != 0 ||
+	    st.st_blocks != 0)
+		errx(1, "counter block probe has wrong shape");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before rejected block allocation");
+	value = 'x';
+	errno = 0;
+	n = pwrite(fd, &value, sizeof(value), 0);
+	saved_errno = errno;
+	if (n != -1)
+		errx(1, "bad block counter allowed allocation");
+	if (saved_errno != EIO)
+		errx(1, "bad block counter failed with %s",
+		    strerror(saved_errno));
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat rejected block allocation");
+	if (st.st_size != 0 || st.st_blocks != 0)
+		errx(1, "rejected block allocation changed the file");
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after rejected block allocation");
+	if (after.f_bfree != before.f_bfree ||
+	    after.f_ffree != before.f_ffree)
+		errx(1, "rejected block allocation changed counters");
+}
+
+static void
+reject_inode_counter (void)
+{
+	struct statfs after, before;
+	char path[PATH_MAX];
+	int fd, saved_errno;
+
+	make_path(path, sizeof(path), "counter-inode-probe");
+	check_absent(path);
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before rejected inode allocation");
+	errno = 0;
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	saved_errno = errno;
+	if (fd != -1) {
+		(void)close(fd);
+		errx(1, "bad inode counter allowed allocation");
+	}
+	if (saved_errno != EIO)
+		errx(1, "bad inode counter failed with %s",
+		    strerror(saved_errno));
+	check_absent(path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after rejected inode allocation");
+	if (after.f_bfree != before.f_bfree ||
+	    after.f_ffree != before.f_ffree)
+		errx(1, "rejected inode allocation changed counters");
+}
+
+static void
+create_fsync_fixture (void)
+{
+	char path[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "fsync-file");
+	length = 3 * block_size + 37;
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	write_pattern_fd(fd, 0, length, FSYNC_INITIAL_SEED);
+	if (fsync(fd) == -1)
+		err(1, "initial fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+update_fsync_fixture (void)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "fsync-file");
+	length = 3 * block_size + 37;
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (! S_ISREG(st.st_mode) || st.st_size != (off_t)length)
+		errx(1, "fsync fixture has wrong shape");
+	write_pattern_fd(fd, 0, length, FSYNC_UPDATE_SEED);
+	if (fsync(fd) == -1)
+		err(1, "update fsync %s", path);
+	check_pattern_fd(fd, 0, length, FSYNC_UPDATE_SEED);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+clean_fsync_fixture (void)
+{
+	char path[PATH_MAX];
+	int fd;
+
+	make_path(path, sizeof(path), "fsync-file");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fsync(fd) == -1)
+		err(1, "clean fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+verify_fsync_fixture (void)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "fsync-file");
+	length = 3 * block_size + 37;
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (! S_ISREG(st.st_mode) || st.st_size != (off_t)length)
+		errx(1, "remounted fsync fixture has wrong shape");
+	check_pattern_fd(fd, 0, length, FSYNC_UPDATE_SEED);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+create_sync_fixture (void)
+{
+	char path[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "sync-file");
+	length = 2 * block_size + 73;
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	write_pattern_fd(fd, 0, length, SYNC_INITIAL_SEED);
+	if (fsync(fd) == -1)
+		err(1, "initial fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+update_sync_fixture (int flags, unsigned int seed, int do_vfs_sync)
+{
+	struct stat after, before;
+	char path[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "sync-file");
+	length = 2 * block_size + 73;
+	fd = open(path, O_RDWR | flags);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &before) == -1)
+		err(1, "fstat %s", path);
+	if (! S_ISREG(before.st_mode) ||
+	    before.st_size != (off_t)length)
+		errx(1, "synchronous-write fixture has wrong shape");
+	write_pattern_once_fd(fd, 0, length, seed);
+	if (do_vfs_sync)
+		sync();
+	if (fstat(fd, &after) == -1)
+		err(1, "fstat updated %s", path);
+	if (after.st_size != before.st_size ||
+	    after.st_blocks != before.st_blocks)
+		errx(1, "synchronous in-place write changed allocation");
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+clean_vfs_sync_fixture (void)
+{
+	sync();
+}
+
+static void
+clean_osync_fixture (void)
+{
+	char path[PATH_MAX];
+	ssize_t n;
+	int fd;
+
+	make_path(path, sizeof(path), "sync-file");
+	fd = open(path, O_RDWR | O_SYNC);
+	if (fd == -1)
+		err(1, "open %s", path);
+	n = write(fd, "", 0);
+	if (n == -1)
+		err(1, "zero-length O_SYNC write %s", path);
+	if (n != 0)
+		errx(1, "non-zero result from empty O_SYNC write");
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+verify_sync_fixture (unsigned int seed)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "sync-file");
+	length = 2 * block_size + 73;
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (! S_ISREG(st.st_mode) || st.st_size != (off_t)length)
+		errx(1, "remounted synchronous-write fixture is invalid");
+	check_pattern_fd(fd, 0, length, seed);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+create_remount_fixture (void)
+{
+	char path[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "remount-file");
+	length = 2 * block_size + 119;
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	write_pattern_fd(fd, 0, length, REMOUNT_INITIAL_SEED);
+	if (fsync(fd) == -1)
+		err(1, "initial fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+update_remount_fixture (unsigned int seed, int do_fsync)
+{
+	struct stat after, before;
+	char path[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "remount-file");
+	length = 2 * block_size + 119;
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &before) == -1)
+		err(1, "fstat %s", path);
+	if (! S_ISREG(before.st_mode) ||
+	    before.st_size != (off_t)length)
+		errx(1, "remount fixture has wrong shape");
+	write_pattern_fd(fd, 0, length, seed);
+	if (do_fsync && fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (fstat(fd, &after) == -1)
+		err(1, "fstat updated %s", path);
+	if (after.st_size != before.st_size ||
+	    after.st_blocks != before.st_blocks)
+		errx(1, "remount update changed allocation");
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+verify_remount_fixture (unsigned int seed, int readonly)
+{
+	struct stat st;
+	char path[PATH_MAX], create_path[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "remount-file");
+	length = 2 * block_size + 119;
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (! S_ISREG(st.st_mode) || st.st_size != (off_t)length)
+		errx(1, "remounted fixture has wrong shape");
+	check_pattern_fd(fd, 0, length, seed);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (! readonly)
+		return;
+
+	errno = 0;
+	fd = open(path, O_WRONLY);
+	expect_ro_failure("remounted open for write", fd);
+	make_path(create_path, sizeof(create_path),
+	    "remount-create");
+	errno = 0;
+	fd = open(create_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	expect_ro_failure("remounted create", fd);
+	check_absent(create_path);
+}
+
+static void
+hold_remount_orphan (void)
+{
+	struct stat st;
+	char path[PATH_MAX], ready[PATH_MAX], release[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "remount-held-orphan");
+	length = block_size + 73;
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	write_pattern_fd(fd, 0, length, REMOUNT_ORPHAN_SEED);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (unlink(path) == -1)
+		err(1, "unlink %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync unlinked %s", path);
+	check_pattern_fd(fd, 0, length, REMOUNT_ORPHAN_SEED);
+
+	make_path(ready, sizeof(ready), "remount-orphan-ready");
+	make_path(release, sizeof(release),
+	    "remount-orphan-release");
+	write_text_file(ready, "ready");
+	for (;;) {
+		if (lstat(release, &st) == 0)
+			break;
+		if (errno != ENOENT)
+			err(1, "lstat %s", release);
+		(void)usleep(10000);
+	}
+
+	check_pattern_fd(fd, 0, length, REMOUNT_ORPHAN_SEED);
+	if (close(fd) == -1)
+		err(1, "close held orphan");
+	if (unlink(ready) == -1)
+		err(1, "unlink %s", ready);
+	if (unlink(release) == -1)
+		err(1, "unlink %s", release);
+}
+
+static void
+journal_handoff_child (unsigned int worker, int startfd)
+{
+	char from[PATH_MAX], to[PATH_MAX];
+	unsigned char value;
+	ssize_t n;
+	int fd, i;
+
+	do {
+		n = read(startfd, &value, sizeof(value));
+	} while (n == -1 && errno == EINTR);
+	if (n == -1)
+		err(1, "read start gate");
+	if (n != 0)
+		errx(1, "unexpected start-gate data");
+	if (close(startfd) == -1)
+		err(1, "close start gate");
+
+	for (i = 0; i < HANDOFF_ITERATIONS; i++) {
+		if (snprintf(from, sizeof(from), "%s/worker-%u-a",
+		    root, worker) >= (int)sizeof(from) ||
+		    snprintf(to, sizeof(to), "%s/worker-%u-b",
+		    root, worker) >= (int)sizeof(to))
+			errx(1, "handoff path too long");
+		fd = open(from, O_RDWR | O_CREAT | O_EXCL, 0600);
+		if (fd == -1)
+			err(1, "open %s", from);
+		value = (unsigned char)(worker + i);
+		n = write(fd, &value, sizeof(value));
+		if (n == -1)
+			err(1, "write %s", from);
+		if (n != (ssize_t)sizeof(value))
+			errx(1, "short write %s", from);
+		if (fsync(fd) == -1)
+			err(1, "fsync %s", from);
+		if (fchmod(fd, 0640) == -1)
+			err(1, "fchmod %s", from);
+		if (rename(from, to) == -1)
+			err(1, "rename %s", from);
+		if (unlink(to) == -1)
+			err(1, "unlink %s", to);
+		if (close(fd) == -1)
+			err(1, "close %s", to);
+	}
+}
+
+static void
+journal_handoff_stress (void)
+{
+	pid_t children[HANDOFF_WORKERS], pid;
+	int gate[2], failed, i, status;
+
+	if (pipe(gate) == -1)
+		err(1, "pipe");
+	for (i = 0; i < HANDOFF_WORKERS; i++) {
+		pid = fork();
+		if (pid == -1)
+			err(1, "fork");
+		if (pid == 0) {
+			if (close(gate[1]) == -1)
+				err(1, "close start writer");
+			journal_handoff_child((unsigned int)i, gate[0]);
+			_exit(0);
+		}
+		children[i] = pid;
+	}
+	if (close(gate[0]) == -1)
+		err(1, "close start reader");
+	if (close(gate[1]) == -1)
+		err(1, "release start gate");
+
+	failed = 0;
+	for (i = 0; i < HANDOFF_WORKERS; i++) {
+		do {
+			pid = waitpid(children[i], &status, 0);
+		} while (pid == -1 && errno == EINTR);
+		if (pid == -1)
+			err(1, "waitpid");
+		if (! WIFEXITED(status) || WEXITSTATUS(status) != 0)
+			failed = 1;
+	}
+	if (failed)
+		errx(1, "journal handoff child failed");
+	if (rmdir(root) == -1)
+		err(1, "rmdir %s", root);
+}
+
+static void
+create_group_fixture (void)
+{
+	char path[PATH_MAX];
+	unsigned char value;
+	unsigned int i;
+	ssize_t n;
+	int fd;
+
+	make_path(path, sizeof(path), "group-file");
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+
+	for (i = 0; i < FSYNC_GROUP_WORKERS; i++) {
+		if (snprintf(path, sizeof(path),
+		    "%s/group-fsync-%u", root, i) >=
+		    (int)sizeof(path))
+			errx(1, "group fsync path too long");
+		fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+		if (fd == -1)
+			err(1, "open %s", path);
+		value = (unsigned char)i;
+		n = write(fd, &value, sizeof(value));
+		if (n == -1)
+			err(1, "write %s", path);
+		if (n != (ssize_t)sizeof(value))
+			errx(1, "short write %s", path);
+		if (fsync(fd) == -1)
+			err(1, "fsync %s", path);
+		if (close(fd) == -1)
+			err(1, "close %s", path);
+	}
+	fsync_path(root);
+}
+
+static void
+group_fsync_child (unsigned int worker, int readyfd, int startfd)
+{
+	char path[PATH_MAX];
+	unsigned char value;
+	ssize_t n;
+	int fd;
+
+	if (snprintf(path, sizeof(path), "%s/group-fsync-%u", root,
+	    worker) >= (int)sizeof(path))
+		errx(1, "group fsync path too long");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	value = (unsigned char)(worker + 0x40U);
+	n = pwrite(fd, &value, sizeof(value), 0);
+	if (n == -1)
+		err(1, "pwrite %s", path);
+	if (n != (ssize_t)sizeof(value))
+		errx(1, "short pwrite %s", path);
+	do {
+		n = write(readyfd, &value, sizeof(value));
+	} while (n == -1 && errno == EINTR);
+	if (n == -1)
+		err(1, "write fsync ready gate");
+	if (n != (ssize_t)sizeof(value))
+		errx(1, "short fsync ready gate");
+	do {
+		n = read(startfd, &value, sizeof(value));
+	} while (n == -1 && errno == EINTR);
+	if (n == -1)
+		err(1, "read fsync start gate");
+	if (n != (ssize_t)sizeof(value))
+		errx(1, "short fsync start gate");
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+concurrent_group_fsync (void)
+{
+	pid_t children[FSYNC_GROUP_WORKERS], pid;
+	char path[PATH_MAX];
+	unsigned char gates[FSYNC_GROUP_WORKERS];
+	unsigned char value;
+	size_t done;
+	ssize_t n;
+	int failed, fd, i, ready[2], start[2], status;
+
+	if (pipe(ready) == -1 || pipe(start) == -1)
+		err(1, "pipe");
+	for (i = 0; i < FSYNC_GROUP_WORKERS; i++) {
+		pid = fork();
+		if (pid == -1)
+			err(1, "fork");
+		if (pid == 0) {
+			if (close(ready[0]) == -1 ||
+			    close(start[1]) == -1)
+				err(1, "close group fsync gate");
+			group_fsync_child((unsigned int)i, ready[1],
+			    start[0]);
+			_exit(0);
+		}
+		children[i] = pid;
+	}
+	if (close(ready[1]) == -1 || close(start[0]) == -1)
+		err(1, "close group fsync parent gate");
+	done = 0;
+	while (done < sizeof(gates)) {
+		do {
+			n = read(ready[0], gates + done,
+			    sizeof(gates) - done);
+		} while (n == -1 && errno == EINTR);
+		if (n == -1)
+			err(1, "read group fsync ready gate");
+		if (n == 0)
+			errx(1, "short group fsync ready gate");
+		done += (size_t)n;
+	}
+	do {
+		n = write(start[1], gates, sizeof(gates));
+	} while (n == -1 && errno == EINTR);
+	if (n == -1)
+		err(1, "write group fsync start gate");
+	if (n != (ssize_t)sizeof(gates))
+		errx(1, "short group fsync start gate");
+	if (close(ready[0]) == -1 || close(start[1]) == -1)
+		err(1, "close group fsync gates");
+
+	failed = 0;
+	for (i = 0; i < FSYNC_GROUP_WORKERS; i++) {
+		do {
+			pid = waitpid(children[i], &status, 0);
+		} while (pid == -1 && errno == EINTR);
+		if (pid == -1)
+			err(1, "waitpid");
+		if (! WIFEXITED(status) || WEXITSTATUS(status) != 0)
+			failed = 1;
+	}
+	if (failed)
+		errx(1, "group fsync child failed");
+
+	for (i = 0; i < FSYNC_GROUP_WORKERS; i++) {
+		if (snprintf(path, sizeof(path),
+		    "%s/group-fsync-%u", root, i) >=
+		    (int)sizeof(path))
+			errx(1, "group fsync path too long");
+		fd = open(path, O_RDONLY);
+		if (fd == -1)
+			err(1, "open %s", path);
+		n = read(fd, &value, sizeof(value));
+		if (n == -1)
+			err(1, "read %s", path);
+		if (n != (ssize_t)sizeof(value) ||
+		    value != (unsigned char)(i + 0x40U))
+			errx(1, "group fsync data mismatch: %s", path);
+		if (close(fd) == -1)
+			err(1, "close %s", path);
+	}
+}
+
+static void
+age_group_path_lookup (void)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	int fd;
+
+	make_path(path, sizeof(path), "group-path");
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (lstat(path, &st) == -1)
+		err(1, "lstat %s", path);
+	if (! S_ISREG(st.st_mode))
+		errx(1, "group path is not a regular file");
+	fsync_path(root);
+}
+
+static void
+check_group_ordered_data (void)
+{
+	char path[PATH_MAX];
+	unsigned char actual, expected, initial;
+	ssize_t n;
+	int fd;
+
+	make_path(path, sizeof(path), "group-ordered");
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+	if (fd == -1)
+		err(1, "open %s", path);
+	initial = 0xa7;
+	n = write(fd, &initial, sizeof(initial));
+	if (n == -1)
+		err(1, "write %s", path);
+	if (n != (ssize_t)sizeof(initial))
+		errx(1, "short write %s", path);
+	expected = 0x5c;
+	n = pwrite(fd, &expected, sizeof(expected), 0);
+	if (n == -1)
+		err(1, "overwrite %s", path);
+	if (n != (ssize_t)sizeof(expected))
+		errx(1, "short overwrite %s", path);
+	n = pread(fd, &actual, sizeof(actual), 0);
+	if (n == -1)
+		err(1, "pread %s", path);
+	if (n != (ssize_t)sizeof(actual) || actual != expected)
+		errx(1, "ordered data mismatch");
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+
+	make_path(path, sizeof(path), "group-reuse-old");
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+	if (fd == -1)
+		err(1, "open %s", path);
+	n = write(fd, &initial, sizeof(initial));
+	if (n == -1)
+		err(1, "write %s", path);
+	if (n != (ssize_t)sizeof(initial))
+		errx(1, "short write %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (unlink(path) == -1)
+		err(1, "unlink %s", path);
+
+	make_path(path, sizeof(path), "group-reuse-new");
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+	if (fd == -1)
+		err(1, "open %s", path);
+	n = write(fd, &expected, sizeof(expected));
+	if (n == -1)
+		err(1, "write %s", path);
+	if (n != (ssize_t)sizeof(expected))
+		errx(1, "short write %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	n = pread(fd, &actual, sizeof(actual), 0);
+	if (n == -1)
+		err(1, "pread %s", path);
+	if (n != (ssize_t)sizeof(actual) || actual != expected)
+		errx(1, "reused ordered data mismatch");
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+verify_group_ordered_data (void)
+{
+	char path[PATH_MAX];
+	unsigned char actual, expected;
+	ssize_t n;
+	int fd;
+
+	expected = 0x5c;
+	make_path(path, sizeof(path), "group-ordered");
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	n = read(fd, &actual, sizeof(actual));
+	if (n == -1)
+		err(1, "read %s", path);
+	if (n != (ssize_t)sizeof(actual) || actual != expected)
+		errx(1, "durable ordered data mismatch");
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+
+	make_path(path, sizeof(path), "group-reuse-old");
+	check_absent(path);
+	make_path(path, sizeof(path), "group-reuse-new");
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	n = read(fd, &actual, sizeof(actual));
+	if (n == -1)
+		err(1, "read %s", path);
+	if (n != (ssize_t)sizeof(actual) || actual != expected)
+		errx(1, "durable reused data mismatch");
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+join_group_transaction (void)
+{
+	static const mode_t modes[] = { 0640, 0600, 0644, 0604 };
+	char path[PATH_MAX];
+	size_t i;
+	int fd;
+
+	make_path(path, sizeof(path), "group-file");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	for (i = 0; i < nitems(modes); i++) {
+		if (fchmod(fd, modes[i]) == -1)
+			err(1, "fchmod %s", path);
+	}
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+age_group_transaction (void)
+{
+	char path[PATH_MAX];
+	int fd;
+
+	make_path(path, sizeof(path), "group-file");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fchmod(fd, 0640) == -1)
+		err(1, "fchmod %s", path);
+	/* Force the dirty mode into an ordinary journal transaction. */
+	if (futimes(fd, NULL) == -1)
+		err(1, "futimes %s", path);
+	if (usleep(250000) == -1)
+		err(1, "usleep");
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+read_through_stress (void)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	unsigned int i;
+	int fd, n;
+
+	for (i = 0; i < READ_THROUGH_ITERATIONS; i++) {
+		n = snprintf(path, sizeof(path), "%s/entry-%02u",
+		    root, i);
+		if (n < 0 || (size_t)n >= sizeof(path))
+			errx(1, "read-through path too long");
+		fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		if (fd == -1)
+			err(1, "open %s", path);
+		if (close(fd) == -1)
+			err(1, "close %s", path);
+
+		n = snprintf(path, sizeof(path), "%s/missing-%02u",
+		    root, i);
+		if (n < 0 || (size_t)n >= sizeof(path))
+			errx(1, "read-through miss path too long");
+		errno = 0;
+		if (lstat(path, &st) != -1 || errno != ENOENT)
+			errx(1, "unexpected lookup result: %s", path);
+	}
+	fsync_path(root);
+}
+
+static size_t
+rename_growth_entries (void)
+{
+	size_t entry_size, first, later, usable;
+
+	entry_size = roundup(EXT4_DIRENT_HEADER + NAME_MAX, 4);
+	usable = block_size - DIR_TAIL_BYTES;
+	if (usable <= 24 || entry_size > usable)
+		errx(1, "block is too small for rename-growth fixture");
+	first = (usable - 24) / entry_size;
+	later = usable / entry_size;
+	if (first == 0 || later == 0)
+		errx(1, "rename-growth directory capacity is zero");
+	return (first + (RENAME_EXTENTS - 1) * later);
+}
+
+static void
+verify_rename_growth_fixture (void)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	size_t entries, i;
+
+	entries = rename_growth_entries();
+	if (stat(root, &st) == -1)
+		err(1, "stat %s", root);
+	if (! S_ISDIR(st.st_mode) ||
+	    st.st_size != (off_t)((RENAME_EXTENTS + 1) * block_size))
+		errx(1, "rename-growth directory has wrong size");
+	if ((uint64_t)st.st_blocks * DEV_BSIZE <=
+	    (uint64_t)st.st_size)
+		errx(1, "rename-growth directory has no extent node");
+
+	make_rename_growth_path(path, sizeof(path), 's', 0);
+	check_absent(path);
+	make_rename_growth_path(path, sizeof(path), 't', 0);
+	check_text_file(path, "x");
+	for (i = 1; i < entries; i++) {
+		make_rename_growth_path(path, sizeof(path), 's', i);
+		check_text_file(path, "x");
+	}
+}
+
+static void
+rename_growth_fixture (void)
+{
+	struct stat st;
+	char from[PATH_MAX], path[PATH_MAX], to[PATH_MAX];
+	size_t entries, i;
+
+	entries = rename_growth_entries();
+	for (i = 0; i < entries; i++) {
+		make_rename_growth_path(path, sizeof(path), 's', i);
+		write_text_file(path, "x");
+	}
+	if (stat(root, &st) == -1)
+		err(1, "stat %s", root);
+	if (! S_ISDIR(st.st_mode) ||
+	    st.st_size != (off_t)(RENAME_EXTENTS * block_size))
+		errx(1, "rename-growth fixture has wrong initial size");
+	if ((uint64_t)st.st_blocks * DEV_BSIZE <=
+	    (uint64_t)st.st_size)
+		errx(1, "rename-growth fixture has no extent node");
+
+	make_rename_growth_path(from, sizeof(from), 's', 0);
+	make_rename_growth_path(to, sizeof(to), 't', 0);
+	if (rename(from, to) == -1)
+		err(1, "rename extent-backed directory entry");
+	fsync_path(root);
+	verify_rename_growth_fixture();
+}
+
+static void
+verify_directory_churn_fixture (void)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	unsigned int i;
+
+	if (stat(root, &st) == -1)
+		err(1, "stat %s", root);
+	if (! S_ISDIR(st.st_mode) ||
+	    st.st_size != (off_t)(2 * block_size))
+		errx(1, "directory-churn directory has wrong size");
+	for (i = 0; i < DIRECTORY_CHURN_TARGETS; i++) {
+		make_directory_churn_path(path, sizeof(path), "uniA", i);
+		check_text_file(path, "replacement-data");
+	}
+	make_path(path, sizeof(path), ".checksum-probe");
+	check_absent(path);
+}
+
+static void
+directory_churn_fixture (void)
+{
+	struct stat st;
+	char final[PATH_MAX], path[PATH_MAX];
+	char temporary[PATH_MAX];
+	unsigned int fill, i, target;
+	ssize_t n;
+	int fd;
+
+	for (fill = 0; ; fill++) {
+		if (stat(root, &st) == -1)
+			err(1, "stat %s", root);
+		if (st.st_size >= (off_t)(2 * block_size))
+			break;
+		make_directory_churn_path(path, sizeof(path), "fill",
+		    fill);
+		fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+		if (fd == -1)
+			err(1, "open %s", path);
+		if (close(fd) == -1)
+			err(1, "close %s", path);
+	}
+	if (st.st_size != (off_t)(2 * block_size))
+		errx(1, "directory-churn fixture grew past two blocks");
+
+	for (i = 0; i < DIRECTORY_CHURN_RENAMES; i++) {
+		target = i % DIRECTORY_CHURN_TARGETS;
+		make_directory_churn_path(final, sizeof(final), "uniA",
+		    target);
+		if (snprintf(temporary, sizeof(temporary),
+		    "%s/.uniA-%04u-XXXXXXXX", root, target) >=
+		    (int)sizeof(temporary))
+			errx(1, "directory-churn template is too long");
+		fd = mkstemp(temporary);
+		if (fd == -1)
+			err(1, "mkstemp %s", temporary);
+		n = write(fd, "replacement-data", 16);
+		if (n == -1)
+			err(1, "write %s", temporary);
+		if (n != 16)
+			errx(1, "short write to %s", temporary);
+		if (fsync(fd) == -1)
+			err(1, "fsync %s", temporary);
+		if (close(fd) == -1)
+			err(1, "close %s", temporary);
+		if (rename(temporary, final) == -1)
+			err(1, "rename %s", temporary);
+	}
+
+	make_path(path, sizeof(path), ".checksum-probe");
+	if (mkdir(path, 0755) == -1)
+		err(1, "mkdir %s", path);
+	if (rmdir(path) == -1)
+		err(1, "rmdir %s", path);
+	fsync_path(root);
+	verify_directory_churn_fixture();
+}
+
+int
+main (int argc, char **argv)
+{
+	struct statfs sfs;
+
+	if (argc != 3)
+		errx(1, "usage: ext4fsops mode root");
+	if (strlcpy(root, argv[2], sizeof(root)) >= sizeof(root))
+		errx(1, "root path too long");
+
+	if (strcmp(argv[1], "create") == 0) {
+		/* The root does not exist until this mode creates it. */
+		block_size = 0;
+		if (mkdir(root, 0755) == -1)
+			err(1, "mkdir %s", root);
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs %s", root);
+		if (rmdir(root) == -1)
+			err(1, "rmdir %s", root);
+		block_size = (size_t)sfs.f_bsize;
+		create_filesystem_tree();
+	} else if (strcmp(argv[1], "bitmap-allocate") == 0) {
+		block_size = 0;
+		if (mkdir(root, 0755) == -1)
+			err(1, "mkdir %s", root);
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs %s", root);
+		block_size = (size_t)sfs.f_bsize;
+		allocate_bitmap_probe();
+	} else if (strcmp(argv[1], "inode-allocate") == 0) {
+		block_size = 0;
+		if (mkdir(root, 0755) == -1)
+			err(1, "mkdir %s", root);
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs %s", root);
+		block_size = (size_t)sfs.f_bsize;
+		allocate_inode_probe();
+	} else if (strcmp(argv[1], "create-special") == 0) {
+		block_size = 0;
+		if (mkdir(root, 0755) == -1)
+			err(1, "mkdir %s", root);
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs %s", root);
+		block_size = (size_t)sfs.f_bsize;
+		create_special_files();
+	} else if (strcmp(argv[1], "directory-create") == 0) {
+		block_size = 0;
+		if (mkdir(root, 0755) == -1)
+			err(1, "mkdir %s", root);
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs %s", root);
+		if (rmdir(root) == -1)
+			err(1, "rmdir %s", root);
+		block_size = (size_t)sfs.f_bsize;
+		create_directory_fixture();
+	} else if (strcmp(argv[1], "orphan-create") == 0) {
+		block_size = 0;
+		if (mkdir(root, 0755) == -1)
+			err(1, "mkdir %s", root);
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs %s", root);
+		if (rmdir(root) == -1)
+			err(1, "rmdir %s", root);
+		block_size = (size_t)sfs.f_bsize;
+		create_orphan_fixture();
+	} else if (strcmp(argv[1], "journal-handoff") == 0) {
+		if (mkdir(root, 0755) == -1)
+			err(1, "mkdir %s", root);
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs %s", root);
+		block_size = (size_t)sfs.f_bsize;
+		journal_handoff_stress();
+	} else if (strcmp(argv[1], "group-create") == 0) {
+		if (mkdir(root, 0755) == -1)
+			err(1, "mkdir %s", root);
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs %s", root);
+		block_size = (size_t)sfs.f_bsize;
+		create_group_fixture();
+	} else if (strcmp(argv[1], "read-through") == 0) {
+		if (mkdir(root, 0755) == -1)
+			err(1, "mkdir %s", root);
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs %s", root);
+		block_size = (size_t)sfs.f_bsize;
+		read_through_stress();
+	} else if (strcmp(argv[1], "rename-growth") == 0) {
+		if (mkdir(root, 0755) == -1)
+			err(1, "mkdir %s", root);
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs %s", root);
+		block_size = (size_t)sfs.f_bsize;
+		rename_growth_fixture();
+	} else if (strcmp(argv[1], "directory-churn") == 0) {
+		if (mkdir(root, 0755) == -1)
+			err(1, "mkdir %s", root);
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs %s", root);
+		block_size = (size_t)sfs.f_bsize;
+		fsync_path(root);
+		directory_churn_fixture();
+	} else {
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs %s", root);
+		block_size = (size_t)sfs.f_bsize;
+		if (strcmp(argv[1], "verify-create") == 0)
+			verify_created_tree();
+		else if (strcmp(argv[1], "create-growdir") == 0)
+			create_grow_directory();
+		else if (strcmp(argv[1], "mutate") == 0)
+			mutate_filesystem_tree();
+		else if (strcmp(argv[1], "verify-final") == 0)
+			verify_final_tree();
+		else if (strcmp(argv[1], "verify-readonly") == 0)
+			verify_readonly_tree();
+		else if (strcmp(argv[1], "create-allocation-probe") == 0)
+			create_allocation_probe();
+		else if (strcmp(argv[1], "verify-allocation-probe") == 0)
+			verify_allocation_probe();
+		else if (strcmp(argv[1], "allocation-run-write") == 0)
+			write_allocation_run();
+		else if (strcmp(argv[1], "allocation-run-verify") == 0)
+			verify_allocation_run();
+		else if (strcmp(argv[1], "bitmap-verify") == 0)
+			verify_bitmap_probe(1);
+		else if (strcmp(argv[1], "bitmap-free") == 0)
+			free_bitmap_probe();
+		else if (strcmp(argv[1], "bitmap-verify-free") == 0)
+			verify_bitmap_probe(0);
+		else if (strcmp(argv[1], "bitmap-reuse") == 0)
+			reuse_bitmap_probe();
+		else if (strcmp(argv[1], "bitmap-retire") == 0)
+			retire_bitmap_probe();
+		else if (strcmp(argv[1],
+		    "bitmap-verify-retired") == 0) {
+			char path[PATH_MAX];
+
+			make_path(path, sizeof(path), "bitmap-probe");
+			check_absent(path);
+		} else if (strcmp(argv[1], "inode-verify") == 0)
+			verify_inode_probe();
+		else if (strcmp(argv[1], "inode-free") == 0)
+			free_inode_probe();
+		else if (strcmp(argv[1], "counter-reject-block") == 0)
+			reject_block_counter();
+		else if (strcmp(argv[1], "counter-reject-inode") == 0)
+			reject_inode_counter();
+		else if (strcmp(argv[1], "inode-reuse") == 0)
+			allocate_inode_probe();
+		else if (strcmp(argv[1],
+		    "inode-verify-retired") == 0) {
+			char path[PATH_MAX];
+
+			make_path(path, sizeof(path), "inode-probe");
+			check_absent(path);
+		} else if (strcmp(argv[1], "verify-special") == 0)
+			verify_special_files();
+		else if (strcmp(argv[1], "remove-special") == 0)
+			remove_special_files();
+		else if (strcmp(argv[1], "extent-split") == 0)
+			extent_split_fixture();
+		else if (strcmp(argv[1], "extent-append") == 0)
+			extent_append_fixture();
+		else if (strcmp(argv[1], "extent-shrink") == 0)
+			extent_shrink_fixture();
+		else if (strcmp(argv[1], "extent-prune") == 0)
+			extent_prune_fixture();
+		else if (strcmp(argv[1], "extent-zero") == 0)
+			extent_zero_fixture();
+		else if (strcmp(argv[1], "extent-verify-zero") == 0)
+			extent_verify_zero_fixture();
+		else if (strcmp(argv[1], "extent-reject") == 0)
+			extent_reject_deep_growth();
+		else if (strcmp(argv[1], "directory-verify") == 0)
+			verify_directory_fixture(0);
+		else if (strcmp(argv[1], "directory-mutate") == 0)
+			mutate_directory_fixture();
+		else if (strcmp(argv[1], "directory-verify-final") == 0)
+			verify_directory_fixture(1);
+		else if (strcmp(argv[1], "directory-reject") == 0)
+			reject_corrupt_directory();
+		else if (strcmp(argv[1], "orphan-cycle") == 0)
+			cycle_orphan_fixture();
+		else if (strcmp(argv[1], "orphan-verify") == 0)
+			verify_orphan_fixture();
+		else if (strcmp(argv[1], "orphan-reject") == 0)
+			reject_corrupt_orphan_file();
+		else if (strcmp(argv[1], "wxallowed-set") == 0) {
+			if (! (sfs.f_flags & MNT_WXALLOWED))
+				errx(1, "wxallowed mount flag is clear");
+		} else if (strcmp(argv[1], "wxallowed-clear") == 0) {
+			if (sfs.f_flags & MNT_WXALLOWED)
+				errx(1, "wxallowed mount flag is set");
+		} else if (strcmp(argv[1], "fsync-create") == 0)
+			create_fsync_fixture();
+		else if (strcmp(argv[1], "fsync-update") == 0)
+			update_fsync_fixture();
+		else if (strcmp(argv[1], "fsync-clean") == 0)
+			clean_fsync_fixture();
+		else if (strcmp(argv[1], "fsync-verify") == 0)
+			verify_fsync_fixture();
+		else if (strcmp(argv[1], "sync-create") == 0)
+			create_sync_fixture();
+		else if (strcmp(argv[1], "osync-update") == 0)
+			update_sync_fixture(O_SYNC,
+			    OSYNC_UPDATE_SEED, 0);
+		else if (strcmp(argv[1], "mount-sync-update") == 0)
+			update_sync_fixture(0, MOUNT_SYNC_SEED, 0);
+		else if (strcmp(argv[1], "vfs-sync-update") == 0)
+			update_sync_fixture(0, VFS_SYNC_UPDATE_SEED, 1);
+		else if (strcmp(argv[1], "osync-clean") == 0)
+			clean_osync_fixture();
+		else if (strcmp(argv[1], "vfs-sync-clean") == 0)
+			clean_vfs_sync_fixture();
+		else if (strcmp(argv[1], "osync-verify") == 0)
+			verify_sync_fixture(OSYNC_UPDATE_SEED);
+		else if (strcmp(argv[1], "sync-verify") == 0)
+			verify_sync_fixture(MOUNT_SYNC_SEED);
+		else if (strcmp(argv[1], "vfs-sync-verify") == 0)
+			verify_sync_fixture(VFS_SYNC_UPDATE_SEED);
+		else if (strcmp(argv[1], "remount-create") == 0)
+			create_remount_fixture();
+		else if (strcmp(argv[1], "remount-dirty") == 0)
+			update_remount_fixture(REMOUNT_DIRTY_SEED, 0);
+		else if (strcmp(argv[1], "remount-sync") == 0)
+			update_remount_fixture(REMOUNT_FINAL_SEED, 1);
+		else if (strcmp(argv[1], "remount-ro-dirty") == 0)
+			verify_remount_fixture(REMOUNT_DIRTY_SEED, 1);
+		else if (strcmp(argv[1], "remount-ro-final") == 0)
+			verify_remount_fixture(REMOUNT_FINAL_SEED, 1);
+		else if (strcmp(argv[1], "remount-hold-orphan") == 0)
+			hold_remount_orphan();
+		else if (strcmp(argv[1], "group-join") == 0)
+			join_group_transaction();
+		else if (strcmp(argv[1], "group-fsync") == 0)
+			concurrent_group_fsync();
+		else if (strcmp(argv[1], "group-age") == 0)
+			age_group_transaction();
+		else if (strcmp(argv[1], "group-path") == 0)
+			age_group_path_lookup();
+		else if (strcmp(argv[1], "group-ordered") == 0)
+			check_group_ordered_data();
+		else if (strcmp(argv[1],
+		    "group-ordered-verify") == 0)
+			verify_group_ordered_data();
+		else if (strcmp(argv[1],
+		    "rename-growth-verify") == 0)
+			verify_rename_growth_fixture();
+		else if (strcmp(argv[1],
+		    "directory-churn-verify") == 0)
+			verify_directory_churn_fixture();
+		else
+			errx(1, "unknown mode: %s", argv[1]);
+	}
+
+	if (block_size != 1024 && block_size != 2048 && block_size != 4096)
+		errx(1, "unexpected filesystem block size: %zu", block_size);
+	return (0);
+}

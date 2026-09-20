@@ -114,6 +114,10 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 	struct vmop_id		 vid;
 	struct vmop_result	 vmr;
 	struct vmop_addr_result  var;
+	struct vmop_disk_fail	 vdf;
+	struct vmop_disk_fail_result vdfr;
+	struct vmop_flush_stop	 vfs;
+	struct vmop_flush_stop_result vfr;
 	uint32_t		 id = 0, vm_id, type;
 	pid_t			 pid, vm_pid = 0;
 	unsigned int		 mode, flags;
@@ -256,6 +260,43 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		}
 		imsg_compose_event(&vm->vm_iev, type, -1, pid,
 		    imsg_get_fd(imsg), &vid, sizeof(vid));
+		break;
+	case IMSG_VMDOP_DISK_FAIL:
+		vmop_disk_fail_read(imsg, &vdf);
+		id = vdf.vdf_id;
+		if ((vm = vm_getbyvmid(id)) == NULL) {
+			memset(&vdfr, 0, sizeof(vdfr));
+			vdfr.vdfr_result = ENOENT;
+			vdfr.vdfr_id = vdf.vdf_id;
+			vdfr.vdfr_peer_id = vdf.vdf_peer_id;
+			vdfr.vdfr_disk = vdf.vdf_disk;
+			vdfr.vdfr_operation = vdf.vdf_operation;
+			vdfr.vdfr_count = vdf.vdf_count;
+			proc_compose_imsg(ps, PROC_PARENT,
+			    IMSG_VMDOP_DISK_FAIL_ARMED,
+			    vdf.vdf_peer_id, -1, &vdfr, sizeof(vdfr));
+			break;
+		}
+		imsg_compose_event(&vm->vm_iev, type, -1, pid,
+		    -1, &vdf, sizeof(vdf));
+		break;
+	case IMSG_VMDOP_FLUSH_STOP:
+		vmop_flush_stop_read(imsg, &vfs);
+		id = vfs.vfs_id;
+		if ((vm = vm_getbyvmid(id)) == NULL) {
+			memset(&vfr, 0, sizeof(vfr));
+			vfr.vfr_result = ENOENT;
+			vfr.vfr_id = vfs.vfs_id;
+			vfr.vfr_peer_id = vfs.vfs_peer_id;
+			vfr.vfr_disk = vfs.vfs_disk;
+			vfr.vfr_count = vfs.vfs_count;
+			proc_compose_imsg(ps, PROC_PARENT,
+			    IMSG_VMDOP_FLUSH_STOP_ARMED,
+			    vfs.vfs_peer_id, -1, &vfr, sizeof(vfr));
+			break;
+		}
+		imsg_compose_event(&vm->vm_iev, type, -1, pid,
+		    -1, &vfs, sizeof(vfs));
 		break;
 	case IMSG_VMDOP_PRIV_GET_ADDR_RESPONSE:
 		vmop_addr_result_read(imsg, &var);
@@ -486,6 +527,10 @@ vmm_dispatch_vm(int fd, short event, void *arg)
 			break;
 		case IMSG_VMDOP_PAUSE_VM_RESPONSE:
 		case IMSG_VMDOP_UNPAUSE_VM_RESPONSE:
+		case IMSG_VMDOP_DISK_FAIL_ARMED:
+		case IMSG_VMDOP_DISK_FAILED:
+		case IMSG_VMDOP_FLUSH_STOP_ARMED:
+		case IMSG_VMDOP_FLUSH_STOPPED:
 			for (i = 0; i < nitems(procs); i++) {
 				if (procs[i].p_id == PROC_PARENT) {
 					proc_forward_imsg(procs[i].p_ps,

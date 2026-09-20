@@ -22,6 +22,10 @@ umask 022
 
 ARCH=$(machine)
 
+KERNEL_SRCDIR=/usr/src/sys
+KERNEL_OBJDIR=/usr/obj/sys/arch/${ARCH}/compile/GENERIC.MP
+KERNEL_CONFIG=${KERNEL_SRCDIR}/arch/${ARCH}/conf/GENERIC.MP
+
 # The kernel machine name and the package architecture name differ on arm64.
 case ${ARCH} in
 arm64)	PORTS_ARCH=aarch64;;
@@ -106,9 +110,10 @@ fi
 
 if ${DO_KERNEL}; then
 	echo "=== Building kernel ==="
-	run cd /usr/src/sys/arch/${ARCH}/compile/GENERIC.MP
-	run make obj
-	run make config
+	run install -d -m 755 ${KERNEL_OBJDIR}
+	run config -b ${KERNEL_OBJDIR} -s ${KERNEL_SRCDIR} \
+	    ${KERNEL_CONFIG}
+	run cd ${KERNEL_OBJDIR}
 	run make -j${NCPU}
 	run make install
 	echo "=== Kernel done ==="

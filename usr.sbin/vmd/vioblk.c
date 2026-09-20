@@ -44,6 +44,8 @@ static uint32_t vioblk_dev_read(struct virtio_dev *, struct viodev_msg *);
 static int vioblk_notifyq(struct virtio_dev *, uint16_t);
 static ssize_t vioblk_io(struct vioblk_dev *, struct virtio_vq_info *, int,
     off_t, struct vring_desc *, struct vring_desc **);
+static void vioblk_flush_boundary(struct virtio_dev *);
+static int vioblk_fail_request(struct virtio_dev *, uint32_t);
 
 static void dev_dispatch_vm(int, short, void *);
 static void handle_sync_io(int, short, void *);
@@ -256,7 +258,7 @@ vioblk_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 	uint8_t ds;
 	off_t offset;
 	ssize_t sz;
-	int is_write, notify = 0;
+	int is_write, notify = 0, stop_after = 0;
 	char *vr;
 	size_t i;
 	struct vring_desc *table, *desc;
@@ -324,6 +326,11 @@ vioblk_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 		case VIRTIO_BLK_T_OUT:
 			/* Read (IN) & Write (OUT) */
 			is_write = (cmd->type == VIRTIO_BLK_T_OUT) ? 1 : 0;
+			if (vioblk_fail_request(dev, is_write ?
+			    VMOP_DISK_FAIL_WRITE : VMOP_DISK_FAIL_READ)) {
+				ds = VIRTIO_BLK_S_IOERR;
+				break;
+			}
 			offset = cmd->sector * VIRTIO_BLK_SECTOR_SIZE;
 			sz = vioblk_io(vioblk, vq_info, is_write, offset, table,
 			    &desc);
@@ -331,6 +338,24 @@ vioblk_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 				ds = VIRTIO_BLK_S_IOERR;
 			else
 				ds = VIRTIO_BLK_S_OK;
+			break;
+		case VIRTIO_BLK_T_FLUSH:
+		case VIRTIO_BLK_T_FLUSH_OUT:
+			if (vioblk_fail_request(dev,
+			    VMOP_DISK_FAIL_FLUSH))
+				ds = VIRTIO_BLK_S_IOERR;
+			else if (vioblk->file.flush(vioblk->file.p) == -1)
+				ds = VIRTIO_BLK_S_IOERR;
+			else {
+				ds = VIRTIO_BLK_S_OK;
+				if (vioblk->flush_stop_target != 0 &&
+				    ++vioblk->flush_stop_seen ==
+				    vioblk->flush_stop_target) {
+					vioblk->flush_stop_target = 0;
+					vioblk_flush_boundary(dev);
+					stop_after = 1;
+				}
+			}
 			break;
 		case VIRTIO_BLK_T_GET_ID:
 			/*
@@ -382,6 +407,8 @@ vioblk_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 		__sync_synchronize();
 		used->idx++;
 		idx++;
+		if (stop_after)
+			break;
 	}
 
 	vq_info->last_avail = idx;
@@ -397,10 +424,74 @@ reset:
 	return (1);
 }
 
+static int
+vioblk_fail_request(struct virtio_dev *dev, uint32_t operation)
+{
+	struct vioblk_dev *vioblk;
+
+	vioblk = &dev->vioblk;
+	if (vioblk->disk_fail_target == 0 ||
+	    vioblk->disk_fail_operation != operation)
+		return (0);
+	if (vioblk->disk_fail_seen < vioblk->disk_fail_target) {
+		vioblk->disk_fail_seen++;
+		if (vioblk->disk_fail_seen !=
+		    vioblk->disk_fail_target)
+			return (0);
+	}
+	if (! vioblk->disk_fail_fired) {
+		vioblk->disk_fail_fired = 1;
+		if (imsg_compose_event(&dev->async_iev,
+		    IMSG_DEVOP_DISK_FAILED, 0, 0, -1,
+		    NULL, 0) == -1)
+			fatal("%s: fired response", __func__);
+	}
+	return (1);
+}
+
+static void
+vioblk_flush_boundary(struct virtio_dev *dev)
+{
+	struct imsgbuf *ibuf;
+	struct imsg imsg;
+	uint32_t type;
+	int n, verbose;
+
+	ibuf = &dev->async_iev.ibuf;
+	if (imsg_compose(ibuf, IMSG_DEVOP_FLUSH_STOPPED,
+	    0, 0, -1, NULL, 0) == -1)
+		fatal("%s: compose", __func__);
+	if (imsgbuf_flush(ibuf) == -1)
+		fatal("%s: flush", __func__);
+	for (;;) {
+		n = imsgbuf_read_one(ibuf, &imsg);
+		if (n <= 0)
+			fatal("%s: read", __func__);
+		type = imsg_get_type(&imsg);
+		if (type == IMSG_DEVOP_FLUSH_CONTINUE) {
+			imsg_free(&imsg);
+			break;
+		}
+		switch (type) {
+		case IMSG_VMDOP_PAUSE_VM:
+			log_debug("%s: paused at flush boundary", __func__);
+			break;
+		case IMSG_CTL_VERBOSE:
+			verbose = imsg_int_read(&imsg);
+			log_setverbose(verbose);
+			break;
+		default:
+			fatalx("%s: unexpected response %u", __func__, type);
+		}
+		imsg_free(&imsg);
+	}
+}
+
 static void
 dev_dispatch_vm(int fd, short event, void *arg)
 {
 	struct virtio_dev	*dev = (struct virtio_dev *)arg;
+	struct vmop_disk_fail	 vdf;
 	struct imsgev		*iev = &dev->async_iev;
 	struct imsgbuf		*ibuf = &iev->ibuf;
 	struct imsg	 	 imsg;
@@ -440,6 +531,34 @@ dev_dispatch_vm(int fd, short event, void *arg)
 
 		type = imsg_get_type(&imsg);
 		switch (type) {
+		case IMSG_DEVOP_DISK_FAIL:
+			vmop_disk_fail_read(&imsg, &vdf);
+			if (vdf.vdf_count == 0 ||
+			    vdf.vdf_operation < VMOP_DISK_FAIL_READ ||
+			    vdf.vdf_operation > VMOP_DISK_FAIL_FLUSH ||
+			    dev->vioblk.disk_fail_target != 0)
+				fatalx("%s: invalid disk failure", __func__);
+			dev->vioblk.disk_fail_operation =
+			    vdf.vdf_operation;
+			dev->vioblk.disk_fail_target = vdf.vdf_count;
+			dev->vioblk.disk_fail_seen = 0;
+			dev->vioblk.disk_fail_fired = 0;
+			if (imsg_compose_event(iev,
+			    IMSG_DEVOP_DISK_FAIL_ARMED, 0, 0, -1,
+			    NULL, 0) == -1)
+				fatal("%s: disk-fail arm response", __func__);
+			break;
+		case IMSG_DEVOP_FLUSH_STOP:
+			dev->vioblk.flush_stop_target =
+			    imsg_uint_read(&imsg);
+			dev->vioblk.flush_stop_seen = 0;
+			if (dev->vioblk.flush_stop_target == 0)
+				fatalx("%s: zero flush count", __func__);
+			if (imsg_compose_event(iev,
+			    IMSG_DEVOP_FLUSH_STOP_ARMED, 0, 0, -1,
+			    NULL, 0) == -1)
+				fatal("%s: arm response", __func__);
+			break;
 		case IMSG_VMDOP_PAUSE_VM:
 			log_debug("%s: pausing", __func__);
 			break;

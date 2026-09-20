@@ -1,26 +1,27 @@
 /*
  * Copyright (c) 2025 kmx.io.
  *
- * Permission to use, copy, modify, and distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
+ * Permission to use, copy, modify, and distribute this software for
+ * any purpose with or without fee is hereby granted, provided that the
+ * above copyright notice and this permission notice appear in all
+ * copies.
  *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+ * WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE
+ * AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL
+ * DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA
+ * OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+ * TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+ * PERFORMANCE OF THIS SOFTWARE.
  */
-
-#ifndef _EXT4FS_JOURNAL_H_
-#define _EXT4FS_JOURNAL_H_
 
 /*
  * JBD2 journal on-disk structures.
  * All JBD2 fields are big-endian.
  */
+
+#include <ufs/ext4fs/ext4fs_journal_state.h>
 
 #define JBD2_MAGIC		0xC03B3998
 
@@ -45,6 +46,35 @@
 #define JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT	0x04
 #define JBD2_FEATURE_INCOMPAT_CSUM_V2		0x08
 #define JBD2_FEATURE_INCOMPAT_CSUM_V3		0x10
+#define JBD2_FEATURE_INCOMPAT_FAST_COMMIT	0x20
+
+/*
+ * Recovery currently supports metadata checksums v2/v3, but not the
+ * older transaction-wide checksum format, asynchronous commits, or fast
+ * commits.  Unknown incompatible features must never be silently
+ * ignored during replay.
+ */
+#define JBD2_FEATURE_COMPAT_SUPPORTED		0
+#define JBD2_FEATURE_RO_COMPAT_SUPPORTED	0
+#define JBD2_FEATURE_INCOMPAT_SUPPORTED		\
+	(JBD2_FEATURE_INCOMPAT_REVOKE | \
+	 JBD2_FEATURE_INCOMPAT_64BIT | \
+	 JBD2_FEATURE_INCOMPAT_CSUM_V2 | \
+	 JBD2_FEATURE_INCOMPAT_CSUM_V3)
+
+/* Checksum algorithms used by commit and journal superblocks. */
+#define JBD2_CHECKSUM_CRC32	1
+#define JBD2_CHECKSUM_MD5	2
+#define JBD2_CHECKSUM_SHA1	3
+#define JBD2_CHECKSUM_CRC32C	4
+#define JBD2_CHECKSUM_SIZE	4
+
+/* Bound wired allocation requested by a malicious superblock. */
+#define JBD2_MAX_BLOCKMAP_ENTRIES	(1U << 20)
+#define JBD2_MAX_REVOKE_ENTRIES		(1U << 18)
+
+/* Extra trailing bytes in the e2fsprogs checksum-v2 tag encoding. */
+#define JBD2_CSUM_V2_TAG_EXTRA		2
 
 /* Common block header (12 bytes) */
 struct jbd2_header {
@@ -81,11 +111,31 @@ struct jbd2_superblock {
 	u_int8_t	s_checksum_type;
 	u_int8_t	s_padding2[3];
 	/* 0x54 */
-	u_int8_t	s_padding[168];
+	u_int32_t	s_num_fc_blocks;
+	u_int32_t	s_head;
+	u_int8_t	s_padding[160];
 	/* 0xFC */
 	u_int32_t	s_checksum;
 	/* 0x100 */
 	u_int8_t	s_users[16 * 48];
+} __attribute__((packed));
+
+/*
+ * Commit block header.  The rest of the journal block is zero-filled.
+ */
+struct jbd2_commit_header {
+	struct jbd2_header h_header;
+	u_int8_t	h_checksum_type;
+	u_int8_t	h_checksum_size;
+	u_int8_t	h_padding[2];
+	u_int32_t	h_checksum[8];
+	u_int64_t	h_commit_sec;
+	u_int32_t	h_commit_nsec;
+} __attribute__((packed));
+
+/* Checksum tail at the end of descriptor and revoke blocks. */
+struct jbd2_block_tail {
+	u_int32_t	t_checksum;
 } __attribute__((packed));
 
 /* Descriptor block tag v3 (CSUM_V3, 16 bytes without UUID) */
@@ -101,24 +151,28 @@ struct jbd2_block_tag {
 	u_int32_t	t_blocknr;
 	u_int16_t	t_checksum;
 	u_int16_t	t_flags;
-	u_int32_t	t_blocknr_high;	/* only if 64BIT */
+	/* Present only with the 64BIT feature. */
+	u_int32_t	t_blocknr_high;
 } __attribute__((packed));
 
 /* Revoke block header */
 struct jbd2_revoke_header {
 	struct jbd2_header r_header;
-	u_int32_t	r_count;	/* bytes used in this block */
+	/* Bytes used in this block. */
+	u_int32_t	r_count;
 } __attribute__((packed));
 
 /* Revocation table entry */
 struct jbd2_revoke_entry {
+	/* Filesystem block + 1; zero means unused. */
 	u_int64_t	re_block;
 	u_int32_t	re_sequence;
 };
 
 /* Block map entry: journal block -> filesystem block */
 struct jbd2_blockmap_entry {
-	u_int64_t	jb_fsblock;	/* filesystem block number */
+	/* Filesystem block number. */
+	u_int64_t	jb_fsblock;
 };
 
 struct jbd2_replay_ctx {
@@ -130,15 +184,29 @@ struct jbd2_replay_ctx {
 	u_int32_t		rc_blocksize;
 	u_int32_t		rc_maxlen;
 	u_int32_t		rc_first;
-	u_int32_t		rc_sequence;	/* starting sequence */
-	u_int32_t		rc_start;	/* starting block */
+	/* Starting sequence. */
+	u_int32_t		rc_sequence;
+	/* Starting block. */
+	u_int32_t		rc_start;
+	/* Next unused block when clean. */
+	u_int32_t		rc_head;
+	u_int32_t		rc_max_transaction;
 
 	/* Journal feature flags */
+	u_int32_t		rc_features_compat;
 	u_int32_t		rc_features_incompat;
+	u_int32_t		rc_features_ro_compat;
+	u_int32_t		rc_checksum_seed;
+	u_int8_t		rc_uuid[16];
+	u_int32_t		rc_journal_ino;
+	/* Little-endian on-disk value. */
+	u_int32_t		rc_journal_gen;
 
 	/* Block map: journal block number -> filesystem block */
 	struct jbd2_blockmap_entry *rc_blockmap;
 	u_int32_t		rc_blockmap_count;
+	u_int64_t		*rc_blockset;
+	u_int32_t		rc_blockset_mask;
 
 	/* Revocation table */
 	struct jbd2_revoke_entry *rc_revoke;
@@ -150,7 +218,85 @@ struct jbd2_replay_ctx {
 	u_int32_t		rc_replay_count;
 };
 
-int ext4fs_journal_replay(struct vnode *, struct m_ext4fs *);
-int ext4fs_orphan_cleanup(struct mount *);
+struct buf;
+struct ext4fs_journal_handle;
+struct mount;
+struct proc;
+struct vnode;
 
-#endif /* _EXT4FS_JOURNAL_H_ */
+#define EXT4FS_JOURNAL_VALID_BLOCK_BITMAP	0x00000001U
+#define EXT4FS_JOURNAL_VALID_INODE_BITMAP	0x00000002U
+
+int	jbd2_journal_open (struct vnode *, struct m_ext4fs *,
+    struct jbd2_replay_ctx *, u_int64_t *);
+void	jbd2_journal_close (struct jbd2_replay_ctx *);
+int	jbd2_has_csum_v2or3 (struct jbd2_replay_ctx *);
+u_int32_t	jbd2_block_checksum (struct jbd2_replay_ctx *,
+    const void *, size_t);
+u_int32_t	jbd2_data_block_checksum (struct jbd2_replay_ctx *,
+    const void *, u_int32_t);
+u_int32_t	jbd2_descriptor_limit (struct jbd2_replay_ctx *);
+int	jbd2_superblock_csum_verify (struct jbd2_replay_ctx *,
+    struct jbd2_superblock *);
+void	jbd2_superblock_csum_set (struct jbd2_replay_ctx *,
+    struct jbd2_superblock *);
+int	jbd2_flush_device (struct vnode *, struct proc *);
+int	ext4fs_journal_replay (struct vnode *, struct m_ext4fs *,
+    struct proc *);
+
+int	ext4fs_journal_init (struct mount *);
+void	ext4fs_journal_destroy (struct mount *);
+void	ext4fs_journal_abort_impl (struct mount *, int, const char *);
+int	ext4fs_journal_error (struct mount *);
+
+#define ext4fs_journal_abort(mp, error) \
+	ext4fs_journal_abort_impl((mp), (error), __func__)
+
+/*
+ * A buffer passed to get_write_access() must be B_BUSY.  On success,
+ * the handle owns it and the caller must not bwrite(), bdwrite(),
+ * bawrite(), or brelse() it.  get_metadata() combines a
+ * filesystem-block read with this registration and reuses a busy buffer
+ * already owned by the same running transaction.  dirty_metadata()
+ * transfers ownership to the transaction; otherwise journal_end()
+ * releases it.  A transaction keeps every dirtied buffer busy until the
+ * commit/checkpoint path writes it, or abort teardown invalidates and
+ * releases it.  journal_end_commit() also captures the handle's
+ * sequence so a synchronous caller cannot commit an unrelated
+ * successor.  submit_data() transfers a busy physical data buffer to
+ * the transaction.  The precommit path waits for every such buffer;
+ * wait_data() provides the same barrier before a block can be freed and
+ * reused within the running transaction.  read_metadata() returns an
+ * anonymous, read-only copy when the requested block is stable in the
+ * running transaction, so a pre-handle reader does not block on the
+ * transaction-owned buffer.
+ */
+int	ext4fs_journal_begin (struct mount *, unsigned int,
+    struct ext4fs_journal_handle **);
+int	ext4fs_journal_add_ordered (struct ext4fs_journal_handle *,
+    struct vnode *);
+int	ext4fs_journal_dirty_metadata (struct ext4fs_journal_handle *,
+    struct buf *);
+int	ext4fs_journal_end (struct ext4fs_journal_handle *);
+int	ext4fs_journal_end_commit (struct ext4fs_journal_handle *,
+    enum ext4fs_journal_commit_reason);
+int	ext4fs_journal_commit (struct mount *,
+    enum ext4fs_journal_commit_reason);
+int	ext4fs_journal_mark_clean (struct mount *,
+    enum ext4fs_journal_commit_reason);
+int	ext4fs_journal_submit_data (struct ext4fs_journal_handle *,
+    struct buf *);
+int	ext4fs_journal_wait_data (struct ext4fs_journal_handle *);
+int	ext4fs_journal_wait_pending_data (struct mount *);
+int	ext4fs_journal_read_metadata (struct mount *, struct vnode *,
+    u_int64_t, struct buf **);
+int	ext4fs_journal_get_metadata (struct ext4fs_journal_handle *,
+    struct vnode *, u_int64_t, struct buf **);
+int	ext4fs_journal_metadata_validated (
+    struct ext4fs_journal_handle *, struct buf *, u_int32_t, int *);
+int	ext4fs_journal_metadata_mark_validated (
+    struct ext4fs_journal_handle *, struct buf *, u_int32_t);
+int	ext4fs_journal_get_write_access (struct ext4fs_journal_handle *,
+    struct buf *, u_int64_t);
+int	ext4fs_journal_revoke (struct ext4fs_journal_handle *,
+    u_int64_t);

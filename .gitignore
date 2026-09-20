@@ -15,5 +15,10 @@
 ## PERFORMANCE OF THIS SOFTWARE.
 CVS
 .claude
+*.d
 obj
+regress/sys/ext4fs/journal_core_test
+regress/sys/ext4fs_crash/ext4fs_crash
+regress/sys/ext4fsops/ext4fsops
+sbin/fsck_ext4fs/fsck_ext4fs
 tags
