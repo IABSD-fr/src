@@ -2158,6 +2158,10 @@ sr_wu_put(void *xsd, void *xwu)
 	TAILQ_INSERT_TAIL(&sd->sd_wu_freeq, wu, swu_link);
 	sd->sd_wu_pending--;
 	mtx_leave(&sd->sd_wu_mtx);
+
+	/* Wake sync waiters after the pending count has changed. */
+	if (sd->sd_sync)
+		wakeup(sd);
 }
 
 void
@@ -2302,9 +2306,6 @@ void
 sr_scsi_wu_put(struct sr_discipline *sd, struct sr_workunit *wu)
 {
 	scsi_io_put(&sd->sd_iopool, wu);
-
-	if (sd->sd_sync && sd->sd_wu_pending == 0)
-		wakeup(sd);
 }
 
 void
@@ -2316,9 +2317,6 @@ sr_scsi_done(struct sr_discipline *sd, struct scsi_xfer *xs)
 		xs->resid = 0;
 
 	scsi_done(xs);
-
-	if (sd->sd_sync && sd->sd_wu_pending == 0)
-		wakeup(sd);
 }
 
 void
@@ -4147,16 +4145,24 @@ int
 sr_raid_sync(struct sr_workunit *wu)
 {
 	struct sr_discipline	*sd = wu->swu_dis;
-	int			s, ret, rv = 0, ios;
+	int			fake, s, ret, rv = 0;
 
 	DNPRINTF(SR_D_DIS, "%s: sr_raid_sync\n", DEVNAME(sd->sd_sc));
 
-	/* when doing a fake sync don't count the wu */
-	ios = (wu->swu_flags & SR_WUF_FAKE) ? 0 : 1;
+	/*
+	 * Normal sync requests own pending work units, but perform no
+	 * I/O.  Exclude all active sync work units so concurrent syncs
+	 * do not wait for one another.  A fake sync owns no work unit.
+	 */
+	fake = ISSET(wu->swu_flags, SR_WUF_FAKE);
 
 	s = splbio();
-	sd->sd_sync = 1;
-	while (sd->sd_wu_pending > ios) {
+	sd->sd_sync++;
+	if (! fake) {
+		sd->sd_sync_wu++;
+		wakeup(sd);
+	}
+	while (sd->sd_wu_pending > sd->sd_sync_wu) {
 		ret = tsleep_nsec(sd, PRIBIO, "sr_sync", SEC_TO_NSEC(15));
 		if (ret == EWOULDBLOCK) {
 			DNPRINTF(SR_D_DIS, "%s: sr_raid_sync timeout\n",
@@ -4165,7 +4171,12 @@ sr_raid_sync(struct sr_workunit *wu)
 			break;
 		}
 	}
-	sd->sd_sync = 0;
+	if (! fake) {
+		KASSERT(sd->sd_sync_wu > 0);
+		sd->sd_sync_wu--;
+	}
+	KASSERT(sd->sd_sync > 0);
+	sd->sd_sync--;
 	splx(s);
 
 	wakeup(&sd->sd_sync);

@@ -249,6 +249,7 @@ ckfini(int markclean)
 			markclean = 0;
 		if (markclean) {
 			sblock.m_state |= EXT4FS_STATE_VALID;
+			sblock.m_state &= ~EXT4FS_STATE_ERROR;
 			sblock.m_sble.sb_state = htole16(sblock.m_state);
 			sbdirty();
 			flush(fswritefd, &sblk);
