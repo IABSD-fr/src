@@ -127,5 +127,9 @@ main(int argc, char **argv)
 			break;
 		}
 	}
+	if (qcowfile.flush(qcowfile.p) == -1)
+		err(1, "unable to flush qcow");
+	if (rawfile.flush(rawfile.p) == -1)
+		err(1, "unable to flush raw");
 	return 0;
 }

@@ -49,6 +49,12 @@ raw_pwritev(void *file, struct iovec *iov, int cnt, off_t offset)
 	return pwritev(*(int *)file, iov, cnt, offset);
 }
 
+static int
+raw_flush(void *file)
+{
+	return fsync(*(int *)file);
+}
+
 static void
 raw_close(void *file, int stayopen)
 {
@@ -83,6 +89,7 @@ virtio_raw_init(struct virtio_backing *file, off_t *szp, int *fd, size_t nfd)
 	file->preadv = raw_preadv;
 	file->pwrite = raw_pwrite;
 	file->pwritev = raw_pwritev;
+	file->flush = raw_flush;
 	file->close = raw_close;
 	*szp = sz;
 	return (0);

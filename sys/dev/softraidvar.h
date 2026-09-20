@@ -558,7 +558,8 @@ struct sr_discipline {
 	int			sd_meta_type;	/* metadata functions */
 	struct sr_meta_opt_head sd_meta_opt; /* optional metadata. */
 
-	int			sd_sync;
+	int			sd_sync;	/* active sync operations */
+	int			sd_sync_wu;	/* active sync work units */
 	int			sd_must_flush;
 
 	int			sd_deleted;

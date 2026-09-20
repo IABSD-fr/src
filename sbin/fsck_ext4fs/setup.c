@@ -56,7 +56,7 @@
 void badsb(int, char *);
 static struct disklabel *getdisklabel(char *, int);
 static int readsb(int);
-static void copyback_sb(void);
+static int load_group_descriptors(int, int);
 static char rdevname[PATH_MAX];
 
 static int
@@ -93,15 +93,59 @@ cg_has_sb(int c)
 	return 0;
 }
 
+static int
+load_group_descriptors(int verify, int strict)
+{
+	long i;
+	int asked = 0;
+
+	sblock.m_gd = calloc(sblock.m_block_group_descriptor_blocks_count,
+	    sblock.m_block_size);
+	if (sblock.m_gd == NULL) {
+		pfatal("CANNOT ALLOCATE GROUP DESCRIPTORS\n");
+		return (0);
+	}
+	for (i = 0; i < (long)sblock.m_block_group_descriptor_blocks_count;
+	    i++) {
+		u_int64_t gd_blk;
+
+		gd_blk = ((sblock.m_block_size > 1024) ? 0 : 1) + i + 1;
+		if (bread(fsreadfd, (char *)sblock.m_gd +
+		    i * sblock.m_block_size,
+		    EXT4FS_FSBTODB(&sblock, gd_blk),
+		    sblock.m_block_size) != 0 && !asked) {
+			pfatal("BAD SUMMARY INFORMATION");
+			if (reply("CONTINUE") == 0)
+				return (0);
+			asked++;
+		}
+	}
+
+	if (verify && (sblock.m_feature_ro_compat &
+	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM)) {
+		for (i = 0; i < (long)sblock.m_block_group_count; i++) {
+			if (ext4fs_bgd_csum_verify(&sblock,
+			    &sblock.m_gd[i], i) != 0) {
+				pfatal("BAD GROUP DESCRIPTOR CHECKSUM CG #%ld", i);
+				if (strict)
+					return (0);
+				if (reply("CONTINUE") == 0)
+					return (0);
+			}
+		}
+	}
+	return (1);
+}
+
 int
 setup(char *dev)
 {
-	long cg, asked, i;
+	long cg;
 	long bmapsize;
 	struct disklabel *lp;
 	struct stat statb;
 	char *realdev;
-	int doskipclean;
+	int doskipclean, error, needs_recovery;
 
 	havesb = 0;
 	fswritefd = -1;
@@ -148,13 +192,16 @@ setup(char *dev)
 		secsize = lp->d_secsize;
 	else
 		secsize = DEV_BSIZE;
+	if (secsize < DEV_BSIZE || secsize > MAXBSIZE ||
+	    secsize % DEV_BSIZE != 0)
+		errexit("invalid device sector size: %ld\n", secsize);
 
 	if (!hotroot()) {
 #ifndef SMALL
-		if (pledge("stdio getpw", NULL) == -1)
+		if (pledge("stdio getpw disklabel", NULL) == -1)
 			err(1, "pledge");
 #else
-		if (pledge("stdio", NULL) == -1)
+		if (pledge("stdio disklabel", NULL) == -1)
 			err(1, "pledge");
 #endif
 	}
@@ -184,9 +231,39 @@ setup(char *dev)
 		doskipclean = 0;
 		pwarn("USING ALTERNATE SUPERBLOCK AT %d\n", bflag);
 	}
+	needs_recovery = (sblock.m_feature_incompat &
+	    EXT4FS_FEATURE_INCOMPAT_RECOVER) != 0;
+	if (needs_recovery && !(sblock.m_feature_compat &
+	    EXT4FS_FEATURE_COMPAT_HAS_JOURNAL)) {
+		pfatal("RECOVER IS SET BUT THE FILESYSTEM HAS NO JOURNAL\n");
+		goto badsblabel;
+	}
+	/* Recovery must not trust an unverified inode-table location. */
+	if (!load_group_descriptors(1, needs_recovery))
+		goto badsblabel;
+	if (needs_recovery) {
+		if (bflag) {
+			pfatal("JOURNAL RECOVERY FROM AN ALTERNATE SUPERBLOCK "
+			    "IS NOT SUPPORTED\n");
+			goto badsblabel;
+		}
+		error = fsck_journal_replay(fswritefd >= 0);
+		if (error != 0) {
+			pfatal("JOURNAL REPLAY FAILED: %s (error %d)\n",
+			    strerror(error), error);
+			goto badsblabel;
+		}
+		free(sblock.m_gd);
+		sblock.m_gd = NULL;
+		if (readsb(1) == 0 || !load_group_descriptors(1, 0))
+			goto badsblabel;
+	}
+
 	if (debug)
 		printf("state = %d\n", sblock.m_state);
-	if (sblock.m_state & EXT4FS_STATE_VALID) {
+	if ((sblock.m_state &
+	    (EXT4FS_STATE_VALID | EXT4FS_STATE_ERROR)) ==
+	    EXT4FS_STATE_VALID) {
 		if (doskipclean) {
 			pwarn("%sile system is clean; not checking\n",
 			    preen ? "f" : "** F");
@@ -197,40 +274,6 @@ setup(char *dev)
 	}
 	maxfsblock = sblock.m_blocks_count;
 	maxino = sblock.m_block_group_count * sblock.m_inodes_per_group;
-
-	sblock.m_gd = calloc(sblock.m_block_group_descriptor_blocks_count,
-	    sblock.m_block_size);
-	if (sblock.m_gd == NULL)
-		errexit("out of memory\n");
-	asked = 0;
-	for (i = 0; i < (long)sblock.m_block_group_descriptor_blocks_count; i++) {
-		u_int64_t gd_blk = ((sblock.m_block_size > 1024) ? 0 : 1) + i + 1;
-		if (bread(fsreadfd, (char *)sblock.m_gd +
-		    i * sblock.m_block_size,
-		    EXT4FS_FSBTODB(&sblock, gd_blk),
-		    sblock.m_block_size) != 0 && !asked) {
-			pfatal("BAD SUMMARY INFORMATION");
-			if (reply("CONTINUE") == 0)
-				errexit("%s\n", "");
-			asked++;
-		}
-	}
-
-	if (sblock.m_feature_ro_compat &
-	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM) {
-		for (i = 0; i < (long)sblock.m_block_group_count; i++) {
-			if (ext4fs_bgd_csum_verify(&sblock,
-			    &sblock.m_gd[i], i) != 0) {
-				pfatal("BAD GROUP DESCRIPTOR CHECKSUM CG #%ld",
-				    i);
-				if (reply("CONTINUE") == 0)
-					errexit("%s\n", "");
-			}
-		}
-	}
-
-	if (fswritefd >= 0)
-		fsck_journal_replay();
 
 	bmapsize = roundup(howmany(maxfsblock, NBBY), sizeof(int16_t));
 	blockmap = calloc((unsigned)bmapsize, sizeof (char));
@@ -294,6 +337,10 @@ readsb(int listerr)
 
 	if (letoh16(fs->sb_magic) != EXT4FS_MAGIC) {
 		badsb(listerr, "MAGIC NUMBER WRONG");
+		return (0);
+	}
+	if (ext4fs_sb_csum_verify(fs) != 0) {
+		badsb(listerr, "BAD SUPERBLOCK CHECKSUM");
 		return (0);
 	}
 	if (letoh32(fs->sb_log_block_size) > 6) {
@@ -360,7 +407,7 @@ readsb(int listerr)
 	    howmany(sblock.m_block_group_count *
 	    sblock.m_block_group_descriptor_size, sblock.m_block_size);
 
-	sblk.b_bno = super / DEV_BSIZE;
+	sblk.b_bno = super;
 
 	if (sblock.m_block_group_count == 1) {
 		havesb = 1;
@@ -391,12 +438,6 @@ readsb(int listerr)
 
 	havesb = 1;
 	return (1);
-}
-
-static void
-copyback_sb(void)
-{
-	memcpy(sblk.b_un.b_buf, &sblock.m_sble, sizeof(struct ext4fs));
 }
 
 void

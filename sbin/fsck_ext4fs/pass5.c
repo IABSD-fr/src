@@ -143,7 +143,7 @@ pass5(void)
 		    sblock.m_first_data_block;
 
 		for (i = 0, d = dbase; d < dmax; d++, i++) {
-			if (testbmap(d) || d >= sblock.m_blocks_count) {
+			if (d >= sblock.m_blocks_count || testbmap(d)) {
 				setbit(bbmap, i);
 				continue;
 			} else {
