@@ -32,18 +32,22 @@ no-checksum, checksum-v2, and checksum-v3 journals. The resulting home block
 matched the journal payload and `e2fsck -fn` accepted each recovered image.
 Read-only validation rejected replay without changing the image hash.
 
+The automated `fsck_ext4fs` regression suite now covers checksum formats,
+descriptor boundaries, deleted tags, revoke ordering, log and transaction-ID
+wraparound, failure atomicity, malformed structures, and seeded mutation runs.
+
 Phase 1 is not complete. The remaining release blockers are:
 
 - define and test restartable handling for `RECOVER` with journal `s_start == 0`;
-- add fixtures for deleted tags, log and transaction-ID wraparound, and every
-  checksum-failure point;
+- accept e2fsprogs checksum-v2 descriptors containing multiple tags;
+- exercise the userland recovery fixtures through the kernel mount path;
 - finish safe, restartable classic-orphan and orphan-file recovery (mount now
   fails closed when orphan cleanup would be required);
 - run kernel mount and injected-power-loss tests in an IABSD VM.
 
 ## Phase 1: Harden journal recovery
 
-- [ ] Validate the journal superblock geometry:
+- [x] Validate the journal superblock geometry:
   - block size matches the filesystem block size;
   - `s_first`, `s_start`, and `s_maxlen` are internally consistent;
   - the journal fits within inode 8;
@@ -79,7 +83,11 @@ Phase 1 is not complete. The remaining release blockers are:
 - [x] Cover escaped data and a committed revoke-only transaction that
       suppresses an earlier logged home-block write.
 - [x] Replay a checksum-v3 transaction spanning multiple descriptor blocks.
-- [ ] Cover journal wraparound and transaction-ID wraparound.
+- [x] Replay generated journals on 1 KiB, 2 KiB, and 4 KiB filesystems.
+- [x] Cover journal wraparound and transaction-ID wraparound.
+- [x] Cover deleted tags and the exact descriptor-capacity boundary.
+- [x] Corrupt the journal superblock, descriptor, data, revoke, and commit
+      checksum regions independently.
 - [x] Confirm a checksum-invalid transaction is not replayed and the image is
       byte-for-byte unchanged.
 - [x] Confirm incomplete transactions are not replayed and the image is
