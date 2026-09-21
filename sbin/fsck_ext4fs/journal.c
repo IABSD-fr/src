@@ -28,6 +28,8 @@
 #include <errno.h>
 #include <unistd.h>
 
+#include <lib/libkern/crc32c.h>
+
 #include "fsck.h"
 #include "extern.h"
 #include "fsutil.h"
@@ -144,11 +146,11 @@ jbd2_extent_block_csum_verify(struct fsck_jbd2_ctx *ctx, void *buf)
 	provided = *tail;
 	*tail = 0;
 	ino_le = htole32(ctx->journal_ino);
-	crc = ext4fs_crc32c(ext4fs_csum_seed(&sblock), &ino_le,
+	crc = crc32c(ext4fs_csum_seed(&sblock), (const uint8_t *)&ino_le,
 	    sizeof(ino_le));
-	crc = ext4fs_crc32c(crc, &ctx->journal_gen,
+	crc = crc32c(crc, (const uint8_t *)&ctx->journal_gen,
 	    sizeof(ctx->journal_gen));
-	crc = ext4fs_crc32c(crc, buf, tail_offset);
+	crc = crc32c(crc, buf, tail_offset);
 	*tail = provided;
 	return (letoh32(provided) == ~crc);
 }
@@ -403,7 +405,7 @@ jbd2_has_csum_v2or3(struct fsck_jbd2_ctx *ctx)
 static u_int32_t
 jbd2_block_checksum(struct fsck_jbd2_ctx *ctx, const void *data, size_t len)
 {
-	return (~ext4fs_crc32c(ctx->checksum_seed, data, len));
+	return (~crc32c(ctx->checksum_seed, data, len));
 }
 
 static int
@@ -457,9 +459,9 @@ jbd2_data_block_csum_verify(struct fsck_jbd2_ctx *ctx, void *data,
 	if (!jbd2_has_csum_v2or3(ctx))
 		return (1);
 	sequence_be = htobe32(sequence);
-	crc = ext4fs_crc32c(ctx->checksum_seed, &sequence_be,
+	crc = crc32c(ctx->checksum_seed, (const uint8_t *)&sequence_be,
 	    sizeof(sequence_be));
-	crc = ~ext4fs_crc32c(crc, data, ctx->blocksize);
+	crc = ~crc32c(crc, data, ctx->blocksize);
 	if (ctx->features_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3)
 		return (crc == provided);
 	return ((u_int16_t)crc == (u_int16_t)provided);
@@ -959,7 +961,7 @@ jbd2_superblock_csum_verify(struct fsck_jbd2_ctx *ctx,
 		return (1);
 	provided = jsb->s_checksum;
 	jsb->s_checksum = 0;
-	calculated = ~ext4fs_crc32c(0, jsb, sizeof(*jsb));
+	calculated = ~crc32c(0, (const uint8_t *)jsb, sizeof(*jsb));
 	jsb->s_checksum = provided;
 	return (betoh32(provided) == calculated);
 }
@@ -973,7 +975,7 @@ jbd2_superblock_csum_set(struct fsck_jbd2_ctx *ctx,
 	if (!jbd2_has_csum_v2or3(ctx))
 		return;
 	jsb->s_checksum = 0;
-	checksum = ~ext4fs_crc32c(0, jsb, sizeof(*jsb));
+	checksum = ~crc32c(0, (const uint8_t *)jsb, sizeof(*jsb));
 	jsb->s_checksum = htobe32(checksum);
 }
 
@@ -1234,7 +1236,7 @@ fsck_journal_replay(int apply)
 		}
 	}
 	memcpy(ctx.uuid, jsb->s_uuid, sizeof(ctx.uuid));
-	ctx.checksum_seed = ext4fs_crc32c(0, jsb->s_uuid,
+	ctx.checksum_seed = crc32c(0, jsb->s_uuid,
 	    sizeof(jsb->s_uuid));
 	if (jbd2_has_csum_v2or3(&ctx) &&
 	    jsb->s_checksum_type != JBD2_CHECKSUM_CRC32C) {

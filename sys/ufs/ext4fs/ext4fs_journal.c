@@ -35,6 +35,8 @@
 #include <sys/proc.h>
 #include <sys/vnode.h>
 
+#include <lib/libkern/crc32c.h>
+
 #include <ufs/ufs/quota.h>
 #include <ufs/ufs/ufsmount.h>
 #include <ufs/ufs/inode.h>
@@ -165,10 +167,11 @@ jbd2_extent_block_csum_verify(struct jbd2_replay_ctx *ctx, void *buf)
 	provided = *tail;
 	*tail = 0;
 	ino_le = htole32(ctx->rc_journal_ino);
-	crc = ext4fs_crc32c(ext4fs_csum_seed(fs), &ino_le, sizeof(ino_le));
-	crc = ext4fs_crc32c(crc, &ctx->rc_journal_gen,
+	crc = crc32c(ext4fs_csum_seed(fs), (const uint8_t *)&ino_le,
+	    sizeof(ino_le));
+	crc = crc32c(crc, (const uint8_t *)&ctx->rc_journal_gen,
 	    sizeof(ctx->rc_journal_gen));
-	crc = ext4fs_crc32c(crc, buf, tail_offset);
+	crc = crc32c(crc, buf, tail_offset);
 	*tail = provided;
 	return (letoh32(provided) == ~crc);
 }
@@ -479,14 +482,14 @@ jbd2_has_csum_v2or3(struct jbd2_replay_ctx *ctx)
 }
 
 /*
- * ext4fs_crc32c() exposes the complemented CRC representation, whereas JBD2
+ * crc32c() exposes the complemented CRC representation, whereas JBD2
  * stores the raw crc32c(~0, ...) result.  Complement the final value when
  * comparing it with a JBD2 field.
  */
 static u_int32_t
 jbd2_block_checksum(struct jbd2_replay_ctx *ctx, const void *data, size_t len)
 {
-	return (~ext4fs_crc32c(ctx->rc_checksum_seed, data, len));
+	return (~crc32c(ctx->rc_checksum_seed, data, len));
 }
 
 static int
@@ -546,9 +549,9 @@ jbd2_data_block_csum_verify(struct jbd2_replay_ctx *ctx, void *data,
 		return (1);
 
 	sequence_be = htobe32(sequence);
-	crc = ext4fs_crc32c(ctx->rc_checksum_seed, &sequence_be,
+	crc = crc32c(ctx->rc_checksum_seed, (const uint8_t *)&sequence_be,
 	    sizeof(sequence_be));
-	crc = ~ext4fs_crc32c(crc, data, ctx->rc_blocksize);
+	crc = ~crc32c(crc, data, ctx->rc_blocksize);
 
 	if (ctx->rc_features_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3)
 		return (crc == provided);
@@ -1229,7 +1232,7 @@ jbd2_superblock_csum_verify(struct jbd2_replay_ctx *ctx,
 
 	provided = jsb->s_checksum;
 	jsb->s_checksum = 0;
-	calculated = ~ext4fs_crc32c(0, jsb, sizeof(*jsb));
+	calculated = ~crc32c(0, (const uint8_t *)jsb, sizeof(*jsb));
 	jsb->s_checksum = provided;
 	return (betoh32(provided) == calculated);
 }
@@ -1243,7 +1246,7 @@ jbd2_superblock_csum_set(struct jbd2_replay_ctx *ctx,
 	if (!jbd2_has_csum_v2or3(ctx))
 		return;
 	jsb->s_checksum = 0;
-	checksum = ~ext4fs_crc32c(0, jsb, sizeof(*jsb));
+	checksum = ~crc32c(0, (const uint8_t *)jsb, sizeof(*jsb));
 	jsb->s_checksum = htobe32(checksum);
 }
 
@@ -1475,7 +1478,7 @@ ext4fs_journal_replay(struct vnode *devvp, struct m_ext4fs *fs,
 		}
 	}
 	memcpy(ctx.rc_uuid, jsb->s_uuid, sizeof(ctx.rc_uuid));
-	ctx.rc_checksum_seed = ext4fs_crc32c(0, jsb->s_uuid,
+	ctx.rc_checksum_seed = crc32c(0, jsb->s_uuid,
 	    sizeof(jsb->s_uuid));
 	if (jbd2_has_csum_v2or3(&ctx) &&
 	    jsb->s_checksum_type != JBD2_CHECKSUM_CRC32C) {

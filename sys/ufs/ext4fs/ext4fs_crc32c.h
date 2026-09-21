@@ -18,19 +18,6 @@
 
 #include <sys/types.h>
 
-/*
- * CRC32C uses the Castagnoli polynomial: 0x1EDC6F41
- * This is different from the standard CRC32 (ISO 3309) polynomial.
- *
- * ext4 stores checksums as the bitwise inverse of the CRC32C value.
- */
-
-/* Compute CRC32C of a buffer, starting from an initial CRC value */
-u_int32_t ext4fs_crc32c(u_int32_t crc, const void *buf, size_t len);
-
-/* Compute CRC32C with initial value of ~0, then invert result (ext4 style) */
-u_int32_t ext4fs_crc32c_le(u_int32_t crc, const void *buf, size_t len);
-
 struct m_ext4fs;
 
 /* Compute block or inode bitmap checksum (group number + bitmap data) */
