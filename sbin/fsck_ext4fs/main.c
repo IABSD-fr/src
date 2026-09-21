@@ -161,7 +161,7 @@ main(int argc, char *argv[])
 	if (preen)
 		(void)signal(SIGQUIT, catchquit);
 
-	(void)checkfilesys(blockcheck(*argv), 0, 0L, 0);
+	ret = checkfilesys(blockcheck(*argv), 0, 0L, 0);
 
 	if (returntosingle)
 		ret = 2;
@@ -199,6 +199,7 @@ checkfilesys(char *filesys, char *mntpt, long auxdata, int child)
 	case 0:
 		if (preen)
 			pfatal("CAN'T CHECK FILE SYSTEM.");
+		return (8);
 	case -1:
 		return (0);
 	}
