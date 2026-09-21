@@ -231,7 +231,7 @@ ext4fs_mountfs(struct vnode *devvp, struct mount *mp, struct proc *p)
 	struct ext4fs *sble;
 	struct m_ext4fs *mfs;
 	dev_t dev;
-	int error, ronly;
+	int devopen, error, openflags, recovered, ronly;
 	struct ucred *cred;
 
 	dev = devvp->v_rdev;
@@ -253,12 +253,15 @@ ext4fs_mountfs(struct vnode *devvp, struct mount *mp, struct proc *p)
 		return (error);
 
 	ronly = (mp->mnt_flag & MNT_RDONLY) != 0;
-	error = VOP_OPEN(devvp, ronly ? FREAD : FREAD|FWRITE, FSCRED, p);
+	openflags = ronly ? FREAD : FREAD | FWRITE;
+	error = VOP_OPEN(devvp, openflags, FSCRED, p);
 	if (error)
 		return (error);
+	devopen = 1;
 
 	bp = NULL;
 	ump = NULL;
+	recovered = 0;
 
 	/*
 	 * Read the superblock from disk.
@@ -282,6 +285,7 @@ ext4fs_mountfs(struct vnode *devvp, struct mount *mp, struct proc *p)
 	 * and load group descriptors.
 	 */
 	ext4fs_sbload(sble, mfs);
+	mfs->m_read_only = ronly;
 	if ((error = ext4fs_sbfill(devvp, mfs)) != 0)
 		goto out;
 	brelse(bp);
@@ -294,46 +298,48 @@ ext4fs_mountfs(struct vnode *devvp, struct mount *mp, struct proc *p)
 	 */
 	if ((mfs->m_feature_compat & EXT4FS_FEATURE_COMPAT_HAS_JOURNAL) &&
 	    (mfs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_RECOVER)) {
-		int reopen_ro = 0;
-
 		if (ronly) {
 			/* Reopen device r/w for replay */
 			vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
-			VOP_CLOSE(devvp, FREAD, cred, p);
+			error = VOP_CLOSE(devvp, openflags, cred, p);
 			VOP_UNLOCK(devvp);
+			devopen = 0;
+			if (error)
+				goto out;
 			error = VOP_OPEN(devvp, FREAD | FWRITE, FSCRED, p);
 			if (error) {
 				printf("ext4fs: can't reopen device r/w "
 				    "for journal replay\n");
 				goto out;
 			}
-			reopen_ro = 1;
+			openflags = FREAD | FWRITE;
+			devopen = 1;
 		}
 
-		error = ext4fs_journal_replay(devvp, mfs);
+		error = ext4fs_journal_replay(devvp, mfs, p);
 		if (error) {
 			printf("ext4fs: journal replay failed: %d\n", error);
 			printf("ext4fs: use Linux e2fsck to repair\n");
-			/* Leave RECOVER set, fail the mount */
-			if (reopen_ro) {
-				vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
-				VOP_CLOSE(devvp, FREAD | FWRITE, cred, p);
-				VOP_UNLOCK(devvp);
-				VOP_OPEN(devvp, FREAD, FSCRED, p);
-			}
+			/* Leave RECOVER set and close the mode actually held. */
 			goto out;
 		}
+		recovered = 1;
 
 		/* Reopen device r/o if it was a r/o mount */
-		if (reopen_ro) {
+		if (ronly) {
 			vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
-			VOP_CLOSE(devvp, FREAD | FWRITE, cred, p);
+			error = VOP_CLOSE(devvp, openflags, cred, p);
 			VOP_UNLOCK(devvp);
+			devopen = 0;
+			if (error)
+				goto out;
 			error = VOP_OPEN(devvp, FREAD, FSCRED, p);
 			if (error) {
 				printf("ext4fs: can't reopen device r/o\n");
 				goto out;
 			}
+			openflags = FREAD;
+			devopen = 1;
 		}
 
 		/*
@@ -352,6 +358,9 @@ ext4fs_mountfs(struct vnode *devvp, struct mount *mp, struct proc *p)
 		    EXT4FS_SUPER_BLOCK_SIZE, &bp);
 		if (error)
 			goto out;
+		error = ext4fs_sbcheck((struct ext4fs *)bp->b_data, ronly);
+		if (error)
+			goto out;
 		ext4fs_sbload((struct ext4fs *)bp->b_data, mfs);
 		brelse(bp);
 		bp = NULL;
@@ -366,7 +375,9 @@ ext4fs_mountfs(struct vnode *devvp, struct mount *mp, struct proc *p)
 	ump->um_fstype = UM_EXT4FS;
 
 	if (ronly == 0) {
-		if (mfs->m_state == EXT4FS_STATE_VALID)
+		if (recovered)
+			mfs->m_state &= ~EXT4FS_STATE_VALID;
+		else if (mfs->m_state == EXT4FS_STATE_VALID)
 			mfs->m_state = 0;
 		else
 			mfs->m_state = EXT4FS_STATE_ERROR;
@@ -389,8 +400,12 @@ ext4fs_mountfs(struct vnode *devvp, struct mount *mp, struct proc *p)
 	devvp->v_specmountpoint = mp;
 
 	if (ronly == 0) {
-		ext4fs_orphan_cleanup(mp);
-		ext4fs_sbwrite(mp);
+		error = ext4fs_orphan_cleanup(mp);
+		if (error)
+			goto out;
+		error = ext4fs_sbwrite(mp);
+		if (error)
+			goto out;
 	}
 
 	return (0);
@@ -399,9 +414,11 @@ out:
 		devvp->v_specmountpoint = NULL;
 	if (bp)
 		brelse(bp);
-	vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
-	(void)VOP_CLOSE(devvp, ronly ? FREAD : FREAD|FWRITE, cred, p);
-	VOP_UNLOCK(devvp);
+	if (devopen) {
+		vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
+		(void)VOP_CLOSE(devvp, openflags, cred, p);
+		VOP_UNLOCK(devvp);
+	}
 	if (ump) {
 		if (mfs && mfs->m_gd != NULL) {
 			size_t gd_size = mfs->m_block_group_count *

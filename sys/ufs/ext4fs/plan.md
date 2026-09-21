@@ -9,16 +9,37 @@ concurrency can be added after recovery and crash consistency are proven.
 
 ## Current state
 
-The tree already contains mount-time JBD2 replay in
-`sys/ufs/ext4fs/ext4fs_journal.c`. It implements a basic three-pass scan,
-revoke, and replay flow. Runtime filesystem operations do not write JBD2
-transactions, however; metadata buffers still reach their home locations
-directly through `bwrite()`, `bdwrite()`, and `bawrite()`.
+The tree contains mount-time and `fsck_ext4fs` JBD2 recovery using a bounded,
+three-pass scan, revoke, and replay flow. Runtime filesystem operations do not
+write JBD2 transactions, however; metadata buffers still reach their home
+locations directly through `bwrite()`, `bdwrite()`, and `bawrite()`.
 
-The existing replay implementation also needs hardening before it is safe to
-use as the recovery side of a journal writer. In particular, it assumes a
-mostly linear `descriptor -> data -> commit` transaction and does not validate
-all modern JBD2 checksums and features.
+Recovery hardening is in progress and must be completed before this reader is
+used as the recovery side of a journal writer.
+
+### Phase 1 implementation status (2026-09-21)
+
+The kernel and `fsck_ext4fs` recovery implementations now compile from the
+same documented JBD2 format definitions. Recovery uses a validation pass before
+the first home-block write, validates the ext4 superblock, group descriptors,
+journal inode, external journal extent nodes, journal geometry and supported
+feature masks, and propagates read, write, and durability-flush failures.
+Journal-target and revoke membership use bounded hash tables, and physically
+aliased journal extents are rejected.
+
+Disposable images generated with e2fsprogs have been replayed successfully for
+no-checksum, checksum-v2, and checksum-v3 journals. The resulting home block
+matched the journal payload and `e2fsck -fn` accepted each recovered image.
+Read-only validation rejected replay without changing the image hash.
+
+Phase 1 is not complete. The remaining release blockers are:
+
+- define and test restartable handling for `RECOVER` with journal `s_start == 0`;
+- add fixtures for deleted tags, log and transaction-ID wraparound, and every
+  checksum-failure point;
+- finish safe, restartable classic-orphan and orphan-file recovery (mount now
+  fails closed when orphan cleanup would be required);
+- run kernel mount and injected-power-loss tests in an IABSD VM.
 
 ## Phase 1: Harden journal recovery
 
@@ -27,36 +48,44 @@ all modern JBD2 checksums and features.
   - `s_first`, `s_start`, and `s_maxlen` are internally consistent;
   - the journal fits within inode 8;
   - allocation-size calculations cannot overflow.
-- [ ] Compare the journal UUID with `sb_journal_uuid`.
-- [ ] Define supported JBD2 feature masks and reject unknown incompatible
+- [x] Compare the journal UUID with `sb_journal_uuid`.
+- [x] Define supported JBD2 feature masks and reject unknown incompatible
       features, including fast commits until they are implemented.
-- [ ] Verify the journal superblock checksum.
-- [ ] Verify descriptor, revoke, commit, and data-block checksums for checksum
+- [x] Verify the journal superblock checksum.
+- [x] Verify descriptor, revoke, commit, and data-block checksums for checksum
       v2 and v3 journals.
-- [ ] Support transactions containing multiple descriptor and revoke blocks
+- [x] Support transactions containing multiple descriptor and revoke blocks
       before the commit block.
-- [ ] Bound every pass by the journal length so malformed logs cannot loop
+- [x] Bound every pass by the journal length so malformed logs cannot loop
       forever.
-- [ ] Use wrap-safe transaction-ID comparisons.
-- [ ] Validate every replay target against the filesystem block count and
+- [x] Use wrap-safe transaction-ID comparisons.
+- [x] Validate every replay target against the filesystem block count and
       reject targets inside the journal itself where appropriate.
-- [ ] Handle journal inode extent trees up to `EXT4FS_EXTENT_DEPTH_MAX`, or
+- [x] Handle journal inode extent trees up to `EXT4FS_EXTENT_DEPTH_MAX`, or
       reject unsupported depths explicitly without modifying the filesystem.
-- [ ] Treat malformed tags, missing `LAST_TAG`, invalid UUID fields, invalid
-      revoke lengths, and incomplete transactions as errors.
-- [ ] Flush replayed home blocks before marking the journal clean.
-- [ ] Clear `EXT4FS_FEATURE_INCOMPAT_RECOVER` only after replay and all required
+- [x] Treat malformed tags, missing `LAST_TAG` in a non-full descriptor,
+      invalid flag combinations, invalid revoke lengths, and incomplete
+      transactions as errors.
+- [x] Flush replayed home blocks before marking the journal clean.
+- [x] Clear `EXT4FS_FEATURE_INCOMPAT_RECOVER` only after replay and all required
       flushes have succeeded.
-- [ ] Apply the same recovery rules to `fsck_ext4fs`, preferably through shared
+- [x] Apply the same recovery rules to `fsck_ext4fs`, preferably through shared
       format/parsing helpers where kernel/userland boundaries permit it.
 
 ### Phase 1 tests
 
-- [ ] Replay Linux-generated journals using no checksum, checksum v2, and
+- [x] Replay e2fsprogs-generated journals using no checksum, checksum v2, and
       checksum v3 formats.
-- [ ] Cover multiple descriptor blocks, revoke-only transactions, journal
-      wraparound, escaped data, and transaction-ID wraparound.
-- [ ] Confirm incomplete or checksum-invalid transactions are not replayed.
+- [x] Cover escaped data and a committed revoke-only transaction that
+      suppresses an earlier logged home-block write.
+- [x] Replay a checksum-v3 transaction spanning multiple descriptor blocks.
+- [ ] Cover journal wraparound and transaction-ID wraparound.
+- [x] Confirm a checksum-invalid transaction is not replayed and the image is
+      byte-for-byte unchanged.
+- [x] Confirm incomplete transactions are not replayed and the image is
+      byte-for-byte unchanged.
+- [x] Confirm a bad payload in transaction 2 prevents transaction 1 from being
+      applied, proving the validation pass precedes all home-block writes.
 - [ ] Fuzz journal headers, tag counts, revoke lengths, and geometry fields.
 - [ ] Verify corrupted journals fail the mount without clearing `RECOVER`.
 
@@ -205,10 +234,7 @@ Do not include these in the first working milestone:
 
 ## References
 
-- Linux ext4 JBD2 format documentation:
+- Published ext4 JBD2 on-disk format documentation:
   <https://cdn.kernel.org/doc/html/latest/filesystems/ext4/journal.html>
-- Linux JBD2 recovery implementation:
-  <https://github.com/torvalds/linux/blob/master/fs/jbd2/recovery.c>
-- Linux JBD2 on-disk definitions:
-  <https://github.com/torvalds/linux/blob/master/include/linux/jbd2.h>
-
+- IABSD's existing ext4fs implementation and locally generated filesystem
+  images. Linux source code is intentionally not used as implementation input.

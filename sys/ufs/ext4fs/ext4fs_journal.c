@@ -28,8 +28,11 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/buf.h>
+#include <sys/dkio.h>
+#include <sys/fcntl.h>
 #include <sys/malloc.h>
 #include <sys/mount.h>
+#include <sys/proc.h>
 #include <sys/vnode.h>
 
 #include <ufs/ufs/quota.h>
@@ -40,8 +43,10 @@
 #include <ufs/ext4fs/ext4fs.h>
 #include <ufs/ext4fs/ext4fs_journal.h>
 
+int ext4fs_sbcheck(struct ext4fs *, int);
+
 /*
- * Read journal inode (inode 8) directly from the inode table.
+ * Read the internal journal inode directly from the inode table.
  * Returns a pointer into the buffer; caller must brelse(*bpp).
  */
 static int
@@ -50,23 +55,42 @@ jbd2_read_journal_inode(struct jbd2_replay_ctx *ctx, struct buf **bpp,
 {
 	struct m_ext4fs *fs = ctx->rc_fs;
 	struct ext4fs_block_group_descriptor *gd;
-	u_int32_t ino = EXT4FS_INODE_JOURNAL;
+	u_int32_t ino;
 	u_int32_t group, index;
-	u_int64_t itb;
+	u_int64_t inode_offset, itb;
 	u_int64_t blk;
 	u_int32_t off;
 	int error;
 
+	ino = fs->m_journal_inode_number;
+	if (ino == 0 || ino > fs->m_inodes_count ||
+	    fs->m_inodes_per_group == 0) {
+		printf("ext4fs: invalid journal inode %u\n", ino);
+		return (EINVAL);
+	}
+
 	group = (ino - 1) / fs->m_inodes_per_group;
 	index = (ino - 1) % fs->m_inodes_per_group;
+	if (group >= fs->m_block_group_count ||
+	    fs->m_inode_size < sizeof(struct ext4fs_dinode) ||
+	    ((fs->m_feature_ro_compat &
+	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM) &&
+	    fs->m_inode_size < sizeof(struct ext4fs_dinode_256)))
+		return (EINVAL);
 	gd = &fs->m_gd[group];
 
 	itb = letoh32(gd->bgd_inode_table_block_lo);
 	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
 		itb |= (u_int64_t)letoh32(gd->bgd_inode_table_block_hi) << 32;
 
-	blk = itb + (index * fs->m_inode_size) / fs->m_block_size;
-	off = (index * fs->m_inode_size) % fs->m_block_size;
+	inode_offset = (u_int64_t)index * fs->m_inode_size;
+	if (itb >= fs->m_blocks_count ||
+	    inode_offset / fs->m_block_size >= fs->m_blocks_count - itb)
+		return (EINVAL);
+	blk = itb + inode_offset / fs->m_block_size;
+	off = inode_offset % fs->m_block_size;
+	if (off + fs->m_inode_size > fs->m_block_size)
+		return (EINVAL);
 
 	error = bread(ctx->rc_devvp, (daddr_t)EXT4FS_FSBTODB(fs, blk),
 	    fs->m_block_size, bpp);
@@ -78,29 +102,179 @@ jbd2_read_journal_inode(struct jbd2_replay_ctx *ctx, struct buf **bpp,
 	}
 
 	*dpp = (struct ext4fs_dinode *)((char *)(*bpp)->b_data + off);
+	if (ext4fs_inode_csum_verify(fs,
+	    (struct ext4fs_dinode_256 *)*dpp, ino) != 0) {
+		printf("ext4fs: journal inode checksum is invalid\n");
+		brelse(*bpp);
+		*bpp = NULL;
+		*dpp = NULL;
+		return (EINVAL);
+	}
+	if ((letoh16((*dpp)->i_mode) & S_IFMT) != S_IFREG) {
+		printf("ext4fs: journal inode is not a regular file\n");
+		brelse(*bpp);
+		*bpp = NULL;
+		*dpp = NULL;
+		return (EINVAL);
+	}
 	return (0);
 }
 
-/*
- * Fill blockmap from an extent tree rooted at an extent header.
- * Handles depth 0 (inline extents) and depth 1 (one level of index).
- */
+/* Validate an extent header before following any of its entries. */
+static int
+jbd2_extent_header_check(struct ext4fs_extent_header *eh, size_t bytes,
+    int expected_depth)
+{
+	u_int16_t depth, entries, max;
+	size_t capacity;
+
+	if (bytes < sizeof(*eh))
+		return (EINVAL);
+	if (letoh16(eh->eh_magic) != EXT4FS_EXTENT_HEADER_MAGIC)
+		return (EINVAL);
+
+	depth = letoh16(eh->eh_depth);
+	entries = letoh16(eh->eh_entries);
+	max = letoh16(eh->eh_max);
+	capacity = (bytes - sizeof(*eh)) / sizeof(struct ext4fs_extent);
+
+	if (depth > EXT4FS_EXTENT_DEPTH_MAX ||
+	    (expected_depth >= 0 && depth != expected_depth) ||
+	    max == 0 || max > capacity || entries > max)
+		return (EINVAL);
+
+	return (0);
+}
+
+static int
+jbd2_extent_block_csum_verify(struct jbd2_replay_ctx *ctx, void *buf)
+{
+	struct m_ext4fs *fs = ctx->rc_fs;
+	struct ext4fs_extent_header *eh = buf;
+	u_int32_t crc, ino_le, provided, *tail;
+	size_t tail_offset;
+
+	if (!(fs->m_feature_ro_compat &
+	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
+		return (1);
+	tail_offset = sizeof(*eh) +
+	    (size_t)letoh16(eh->eh_max) * sizeof(struct ext4fs_extent);
+	if (tail_offset > fs->m_block_size - sizeof(*tail))
+		return (0);
+	tail = (u_int32_t *)((char *)buf + tail_offset);
+	provided = *tail;
+	*tail = 0;
+	ino_le = htole32(ctx->rc_journal_ino);
+	crc = ext4fs_crc32c(ext4fs_csum_seed(fs), &ino_le, sizeof(ino_le));
+	crc = ext4fs_crc32c(crc, &ctx->rc_journal_gen,
+	    sizeof(ctx->rc_journal_gen));
+	crc = ext4fs_crc32c(crc, buf, tail_offset);
+	*tail = provided;
+	return (letoh32(provided) == ~crc);
+}
+
+/* Map one logical journal block through an extent tree of arbitrary depth. */
+static int
+jbd2_extent_lookup(struct jbd2_replay_ctx *ctx,
+    struct ext4fs_extent_header *eh, size_t bytes, int expected_depth,
+    u_int32_t logical, u_int64_t *physical)
+{
+	struct m_ext4fs *fs = ctx->rc_fs;
+	struct ext4fs_extent *ext;
+	struct ext4fs_extent_idx *idx;
+	struct buf *bp = NULL;
+	u_int16_t depth, entries, i;
+	int chosen, error;
+
+	error = jbd2_extent_header_check(eh, bytes, expected_depth);
+	if (error)
+		return (error);
+
+	depth = letoh16(eh->eh_depth);
+	entries = letoh16(eh->eh_entries);
+	if (entries == 0)
+		return (ENOENT);
+
+	if (depth == 0) {
+		ext = (struct ext4fs_extent *)(eh + 1);
+		for (i = 0; i < entries; i++) {
+			u_int16_t rawlen = letoh16(ext[i].e_len);
+			u_int32_t lblk = letoh32(ext[i].e_block);
+			u_int32_t len;
+			u_int64_t pblock;
+
+			/* Values above 0x8000 describe unwritten extents. */
+			if (rawlen == 0 || rawlen > 0x8000)
+				return (EINVAL);
+			len = rawlen;
+			pblock = (u_int64_t)letoh16(ext[i].e_start_hi) << 32 |
+			    letoh32(ext[i].e_start_lo);
+			if (pblock == 0 || pblock >= fs->m_blocks_count ||
+			    len > fs->m_blocks_count - pblock)
+				return (EINVAL);
+			if (logical >= lblk && logical - lblk < len) {
+				*physical = pblock + logical - lblk;
+				return (0);
+			}
+		}
+		return (ENOENT);
+	}
+
+	idx = (struct ext4fs_extent_idx *)(eh + 1);
+	chosen = -1;
+	for (i = 0; i < entries; i++) {
+		u_int32_t lblk = letoh32(idx[i].ei_block);
+
+		if (i > 0 && lblk <= letoh32(idx[i - 1].ei_block))
+			return (EINVAL);
+		if (lblk > logical)
+			break;
+		chosen = i;
+	}
+	if (chosen < 0)
+		return (ENOENT);
+
+	{
+		u_int64_t child;
+
+		child = (u_int64_t)letoh16(idx[chosen].ei_leaf_hi) << 32 |
+		    letoh32(idx[chosen].ei_leaf_lo);
+		if (child == 0 || child >= fs->m_blocks_count)
+			return (EINVAL);
+		error = bread(ctx->rc_devvp,
+		    (daddr_t)EXT4FS_FSBTODB(fs, child), fs->m_block_size, &bp);
+		if (error) {
+			if (bp != NULL)
+				brelse(bp);
+			return (error);
+		}
+		if (!jbd2_extent_block_csum_verify(ctx, bp->b_data)) {
+			brelse(bp);
+			return (EINVAL);
+		}
+		error = jbd2_extent_lookup(ctx,
+		    (struct ext4fs_extent_header *)bp->b_data,
+		    fs->m_block_size, depth - 1, logical, physical);
+		brelse(bp);
+	}
+
+	return (error);
+}
+
+/* Fill the logical-to-physical journal block map recursively. */
 static int
 jbd2_fill_blockmap_from_eh(struct jbd2_replay_ctx *ctx,
-    struct ext4fs_extent_header *eh)
+    struct ext4fs_extent_header *eh, size_t bytes, int expected_depth)
 {
 	struct m_ext4fs *fs = ctx->rc_fs;
 	struct ext4fs_extent *ext;
 	struct ext4fs_extent_idx *idx;
 	u_int16_t depth, entries, i;
-	u_int32_t jblock, maxblocks, len;
-	u_int64_t pblock;
+	int error;
 
-	maxblocks = ctx->rc_blockmap_count;
-
-	if (letoh16(eh->eh_magic) != EXT4FS_EXTENT_HEADER_MAGIC) {
-		printf("ext4fs: journal inode has bad extent magic 0x%x\n",
-		    letoh16(eh->eh_magic));
+	error = jbd2_extent_header_check(eh, bytes, expected_depth);
+	if (error) {
+		printf("ext4fs: invalid journal extent tree\n");
 		return (EINVAL);
 	}
 
@@ -110,76 +284,69 @@ jbd2_fill_blockmap_from_eh(struct jbd2_replay_ctx *ctx,
 	if (depth == 0) {
 		ext = (struct ext4fs_extent *)(eh + 1);
 		for (i = 0; i < entries; i++) {
+			u_int16_t rawlen = letoh16(ext[i].e_len);
 			u_int32_t lblk = letoh32(ext[i].e_block);
-			len = letoh16(ext[i].e_len);
+			u_int32_t jblock, len;
+			u_int64_t pblock;
+
+			if (i > 0 && lblk <= letoh32(ext[i - 1].e_block))
+				return (EINVAL);
+			if (rawlen == 0 || rawlen > 0x8000)
+				return (EINVAL);
+			len = rawlen;
 			pblock = (u_int64_t)letoh16(ext[i].e_start_hi) << 32 |
 			    letoh32(ext[i].e_start_lo);
+			if (pblock == 0 || pblock >= fs->m_blocks_count ||
+			    len > fs->m_blocks_count - pblock)
+				return (EINVAL);
 
 			for (jblock = 0; jblock < len; jblock++) {
 				u_int32_t j = lblk + jblock;
-				if (j < maxblocks)
+				if (j < lblk)
+					return (EINVAL);
+				if (j < ctx->rc_blockmap_count) {
+					if (ctx->rc_blockmap[j].jb_fsblock != 0)
+						return (EINVAL);
 					ctx->rc_blockmap[j].jb_fsblock =
 					    pblock + jblock;
+				}
 			}
 		}
 	} else {
 		idx = (struct ext4fs_extent_idx *)(eh + 1);
 		for (i = 0; i < entries; i++) {
-			struct buf *bp;
-			struct ext4fs_extent_header *leh;
-			struct ext4fs_extent *lext;
-			u_int16_t lentries, j;
-			u_int64_t leaf_block;
-			int error;
+			struct buf *bp = NULL;
+			u_int64_t child;
 
-			leaf_block =
+			if (i > 0 && letoh32(idx[i].ei_block) <=
+			    letoh32(idx[i - 1].ei_block))
+				return (EINVAL);
+			child =
 			    (u_int64_t)letoh16(idx[i].ei_leaf_hi) << 32 |
 			    letoh32(idx[i].ei_leaf_lo);
+			if (child == 0 || child >= fs->m_blocks_count)
+				return (EINVAL);
 
 			error = bread(ctx->rc_devvp,
-			    (daddr_t)EXT4FS_FSBTODB(fs, leaf_block),
+			    (daddr_t)EXT4FS_FSBTODB(fs, child),
 			    fs->m_block_size, &bp);
 			if (error) {
-				brelse(bp);
+				if (bp != NULL)
+					brelse(bp);
 				printf("ext4fs: journal blockmap: "
 				    "can't read index block\n");
 				return (error);
 			}
-
-			leh = (struct ext4fs_extent_header *)bp->b_data;
-			if (letoh16(leh->eh_magic) !=
-			    EXT4FS_EXTENT_HEADER_MAGIC) {
+			if (!jbd2_extent_block_csum_verify(ctx, bp->b_data)) {
 				brelse(bp);
-				printf("ext4fs: journal blockmap: "
-				    "bad leaf magic\n");
 				return (EINVAL);
 			}
-			if (letoh16(leh->eh_depth) != 0) {
-				brelse(bp);
-				printf("ext4fs: journal blockmap: "
-				    "depth > 1 not supported\n");
-				return (EINVAL);
-			}
-
-			lentries = letoh16(leh->eh_entries);
-			lext = (struct ext4fs_extent *)(leh + 1);
-
-			for (j = 0; j < lentries; j++) {
-				u_int32_t lblk = letoh32(lext[j].e_block);
-				len = letoh16(lext[j].e_len);
-				pblock =
-				    (u_int64_t)letoh16(lext[j].e_start_hi)
-				    << 32 | letoh32(lext[j].e_start_lo);
-
-				for (jblock = 0; jblock < len; jblock++) {
-					u_int32_t k = lblk + jblock;
-					if (k < maxblocks)
-						ctx->rc_blockmap[k].
-						    jb_fsblock =
-						    pblock + jblock;
-				}
-			}
+			error = jbd2_fill_blockmap_from_eh(ctx,
+			    (struct ext4fs_extent_header *)bp->b_data,
+			    fs->m_block_size, depth - 1);
 			brelse(bp);
+			if (error)
+				return (error);
 		}
 	}
 
@@ -192,7 +359,8 @@ jbd2_fill_blockmap_from_eh(struct jbd2_replay_ctx *ctx,
 static int
 jbd2_build_blockmap(struct jbd2_replay_ctx *ctx)
 {
-	u_int32_t maxblocks;
+	u_int32_t hash, i, mask, maxblocks, slots;
+	u_int64_t fsblock;
 	int error;
 
 	maxblocks = ctx->rc_maxlen;
@@ -200,9 +368,42 @@ jbd2_build_blockmap(struct jbd2_replay_ctx *ctx)
 	    sizeof(struct jbd2_blockmap_entry), M_TEMP, M_WAITOK | M_ZERO);
 	ctx->rc_blockmap_count = maxblocks;
 
-	error = jbd2_fill_blockmap_from_eh(ctx, ctx->rc_journal_eh);
+	error = jbd2_fill_blockmap_from_eh(ctx, ctx->rc_journal_eh,
+	    sizeof(((struct ext4fs_dinode *)0)->i_block), -1);
+	if (error)
+		return (error);
 
-	return (error);
+	for (i = 0; i < maxblocks; i++) {
+		if (ctx->rc_blockmap[i].jb_fsblock == 0) {
+			printf("ext4fs: journal logical block %u is not mapped\n", i);
+			return (EINVAL);
+		}
+	}
+
+	/* Build an O(1) membership set and reject physical extent aliases. */
+	slots = 1;
+	while (slots < maxblocks * 2)
+		slots <<= 1;
+	ctx->rc_blockset = mallocarray(slots, sizeof(*ctx->rc_blockset),
+	    M_TEMP, M_WAITOK | M_ZERO);
+	ctx->rc_blockset_mask = mask = slots - 1;
+	for (i = 0; i < maxblocks; i++) {
+		fsblock = ctx->rc_blockmap[i].jb_fsblock;
+		hash = ((u_int32_t)fsblock ^ (u_int32_t)(fsblock >> 32)) *
+		    2654435761U;
+		hash &= mask;
+		while (ctx->rc_blockset[hash] != 0) {
+			if (ctx->rc_blockset[hash] == fsblock) {
+				printf("ext4fs: journal extents alias block %llu\n",
+				    (unsigned long long)fsblock);
+				return (EINVAL);
+			}
+			hash = (hash + 1) & mask;
+		}
+		ctx->rc_blockset[hash] = fsblock;
+	}
+
+	return (0);
 }
 
 /*
@@ -214,6 +415,9 @@ jbd2_read_block(struct jbd2_replay_ctx *ctx, u_int32_t jblock,
 {
 	struct m_ext4fs *fs = ctx->rc_fs;
 	u_int64_t fsblock;
+	int error;
+
+	*bpp = NULL;
 
 	if (jblock >= ctx->rc_blockmap_count) {
 		printf("ext4fs: journal block %u out of range (%u)\n",
@@ -227,8 +431,13 @@ jbd2_read_block(struct jbd2_replay_ctx *ctx, u_int32_t jblock,
 		return (EIO);
 	}
 
-	return bread(ctx->rc_devvp, (daddr_t)EXT4FS_FSBTODB(fs, fsblock),
-	    fs->m_block_size, bpp);
+	error = bread(ctx->rc_devvp,
+	    (daddr_t)EXT4FS_FSBTODB(fs, fsblock), fs->m_block_size, bpp);
+	if (error && *bpp != NULL) {
+		brelse(*bpp);
+		*bpp = NULL;
+	}
+	return (error);
 }
 
 /*
@@ -243,6 +452,119 @@ jbd2_next_block(struct jbd2_replay_ctx *ctx, u_int32_t block)
 	return block;
 }
 
+static int
+jbd2_is_journal_block(struct jbd2_replay_ctx *ctx, u_int64_t fsblock)
+{
+	u_int32_t hash;
+
+	if (ctx->rc_blockset == NULL)
+		return (0);
+	hash = ((u_int32_t)fsblock ^ (u_int32_t)(fsblock >> 32)) *
+	    2654435761U;
+	hash &= ctx->rc_blockset_mask;
+	while (ctx->rc_blockset[hash] != 0) {
+		if (ctx->rc_blockset[hash] == fsblock)
+			return (1);
+		hash = (hash + 1) & ctx->rc_blockset_mask;
+	}
+	return (0);
+}
+
+static int
+jbd2_has_csum_v2or3(struct jbd2_replay_ctx *ctx)
+{
+	return ((ctx->rc_features_incompat &
+	    (JBD2_FEATURE_INCOMPAT_CSUM_V2 |
+	    JBD2_FEATURE_INCOMPAT_CSUM_V3)) != 0);
+}
+
+/*
+ * ext4fs_crc32c() exposes the complemented CRC representation, whereas JBD2
+ * stores the raw crc32c(~0, ...) result.  Complement the final value when
+ * comparing it with a JBD2 field.
+ */
+static u_int32_t
+jbd2_block_checksum(struct jbd2_replay_ctx *ctx, const void *data, size_t len)
+{
+	return (~ext4fs_crc32c(ctx->rc_checksum_seed, data, len));
+}
+
+static int
+jbd2_metadata_block_csum_verify(struct jbd2_replay_ctx *ctx, void *data)
+{
+	struct jbd2_block_tail *tail;
+	u_int32_t provided, calculated;
+
+	if (!jbd2_has_csum_v2or3(ctx))
+		return (1);
+
+	tail = (struct jbd2_block_tail *)((char *)data +
+	    ctx->rc_blocksize - sizeof(*tail));
+	provided = tail->t_checksum;
+	tail->t_checksum = 0;
+	calculated = jbd2_block_checksum(ctx, data, ctx->rc_blocksize);
+	tail->t_checksum = provided;
+
+	return (betoh32(provided) == calculated);
+}
+
+static int
+jbd2_commit_block_csum_verify(struct jbd2_replay_ctx *ctx, void *data)
+{
+	struct jbd2_commit_header *commit;
+	u_int32_t provided, calculated;
+
+	if (!jbd2_has_csum_v2or3(ctx))
+		return (1);
+
+	commit = data;
+	/*
+	 * Current checksum-v2/v3 writers select CRC32C in the journal
+	 * superblock and may leave the legacy per-commit type/size pair zero.
+	 */
+	if (!((commit->h_checksum_type == 0 &&
+	    commit->h_checksum_size == 0) ||
+	    (commit->h_checksum_type == JBD2_CHECKSUM_CRC32C &&
+	    commit->h_checksum_size == JBD2_CHECKSUM_SIZE)))
+		return (0);
+	provided = commit->h_checksum[0];
+	commit->h_checksum[0] = 0;
+	calculated = jbd2_block_checksum(ctx, data, ctx->rc_blocksize);
+	commit->h_checksum[0] = provided;
+
+	return (betoh32(provided) == calculated);
+}
+
+static int
+jbd2_data_block_csum_verify(struct jbd2_replay_ctx *ctx, void *data,
+    u_int32_t sequence, u_int32_t provided)
+{
+	u_int32_t crc;
+	u_int32_t sequence_be;
+
+	if (!jbd2_has_csum_v2or3(ctx))
+		return (1);
+
+	sequence_be = htobe32(sequence);
+	crc = ext4fs_crc32c(ctx->rc_checksum_seed, &sequence_be,
+	    sizeof(sequence_be));
+	crc = ~ext4fs_crc32c(crc, data, ctx->rc_blocksize);
+
+	if (ctx->rc_features_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3)
+		return (crc == provided);
+	return ((u_int16_t)crc == (u_int16_t)provided);
+}
+
+static u_int32_t
+jbd2_descriptor_limit(struct jbd2_replay_ctx *ctx)
+{
+	u_int32_t limit = ctx->rc_blocksize;
+
+	if (jbd2_has_csum_v2or3(ctx))
+		limit -= sizeof(struct jbd2_block_tail);
+	return (limit);
+}
+
 /*
  * Parse one descriptor tag from a descriptor block.
  *
@@ -251,10 +573,12 @@ jbd2_next_block(struct jbd2_replay_ctx *ctx, u_int32_t block)
  */
 static int
 jbd2_parse_tag(struct jbd2_replay_ctx *ctx, char *buf, u_int32_t bufsize,
-    u_int32_t *offset, u_int64_t *target, u_int32_t *flags)
+    u_int32_t *offset, u_int64_t *target, u_int32_t *flags,
+    u_int32_t *checksum, int *uuid_seen)
 {
+	const u_int8_t zero_uuid[16] = { 0 };
 	int has_csum_v3, has_64bit;
-	u_int32_t tag_size;
+	u_int32_t known_flags, tag_size;
 
 	has_csum_v3 = ctx->rc_features_incompat &
 	    JBD2_FEATURE_INCOMPAT_CSUM_V3;
@@ -271,13 +595,14 @@ jbd2_parse_tag(struct jbd2_replay_ctx *ctx, char *buf, u_int32_t bufsize,
 		tag3 = (struct jbd2_block_tag3 *)(buf + *offset);
 		*target = betoh32(tag3->t_blocknr);
 		*flags = betoh32(tag3->t_flags);
+		*checksum = betoh32(tag3->t_checksum);
 		if (has_64bit)
 			*target |= (u_int64_t)betoh32(tag3->t_blocknr_high)
 			    << 32;
+		else if (tag3->t_blocknr_high != 0)
+			return (EINVAL);
 
 		*offset += tag_size;
-		if (!(*flags & JBD2_FLAG_SAME_UUID))
-			*offset += 16;	/* skip UUID */
 	} else {
 		struct jbd2_block_tag *tag;
 
@@ -288,6 +613,7 @@ jbd2_parse_tag(struct jbd2_replay_ctx *ctx, char *buf, u_int32_t bufsize,
 		tag = (struct jbd2_block_tag *)(buf + *offset);
 		*target = betoh32(tag->t_blocknr);
 		*flags = betoh16(tag->t_flags);
+		*checksum = betoh16(tag->t_checksum);
 
 		*offset += tag_size;
 		if (has_64bit) {
@@ -297,8 +623,36 @@ jbd2_parse_tag(struct jbd2_replay_ctx *ctx, char *buf, u_int32_t bufsize,
 			    << 32;
 			*offset += 4;
 		}
-		if (!(*flags & JBD2_FLAG_SAME_UUID))
-			*offset += 16;
+	}
+	/* Only the low 16 bits carry defined tag flags on disk. */
+	if (has_csum_v3)
+		*flags &= 0xffff;
+
+	known_flags = JBD2_FLAG_ESCAPE | JBD2_FLAG_SAME_UUID |
+	    JBD2_FLAG_DELETED | JBD2_FLAG_LAST_TAG;
+	if (*flags & ~known_flags)
+		return (EINVAL);
+	if (*target >= ctx->rc_fs->m_blocks_count)
+		return (EINVAL);
+	if (jbd2_is_journal_block(ctx, *target))
+		return (EINVAL);
+
+	if (*flags & JBD2_FLAG_SAME_UUID) {
+		if (!*uuid_seen)
+			return (EINVAL);
+	} else {
+		/*
+		 * The open-coded UUID can be omitted from the final tag even when
+		 * SAME_UUID is clear.  Consume it when present; the journal
+		 * superblock and data checksum still bind every accepted tag to the
+		 * filesystem UUID.
+		 */
+		if (*offset + sizeof(ctx->rc_uuid) <= bufsize &&
+		    (memcmp(buf + *offset, ctx->rc_uuid,
+		    sizeof(ctx->rc_uuid)) == 0 ||
+		    memcmp(buf + *offset, zero_uuid, sizeof(zero_uuid)) == 0))
+			*offset += sizeof(ctx->rc_uuid);
+		*uuid_seen = 1;
 	}
 
 	return (0);
@@ -307,48 +661,38 @@ jbd2_parse_tag(struct jbd2_replay_ctx *ctx, char *buf, u_int32_t bufsize,
 /*
  * Add a block to the revocation table.
  */
-static void
+static int
 jbd2_revoke_add(struct jbd2_replay_ctx *ctx, u_int64_t block,
     u_int32_t sequence)
 {
-	u_int32_t i;
+	u_int32_t hash, mask;
+	u_int64_t key;
 
-	/* Update existing entry if present */
-	for (i = 0; i < ctx->rc_revoke_count; i++) {
-		if (ctx->rc_revoke[i].re_block == block) {
-			if (sequence > ctx->rc_revoke[i].re_sequence ||
-			    (sequence < 0x10000 &&
-			     ctx->rc_revoke[i].re_sequence > 0xFFFF0000))
-				ctx->rc_revoke[i].re_sequence = sequence;
-			return;
+	if (ctx->rc_revoke == NULL) {
+		ctx->rc_revoke_alloc = JBD2_MAX_REVOKE_ENTRIES * 2;
+		ctx->rc_revoke = mallocarray(ctx->rc_revoke_alloc,
+		    sizeof(*ctx->rc_revoke), M_TEMP, M_WAITOK | M_ZERO);
+	}
+	key = block + 1;
+	mask = ctx->rc_revoke_alloc - 1;
+	hash = ((u_int32_t)block ^ (u_int32_t)(block >> 32)) *
+	    2654435761U;
+	hash &= mask;
+	while (ctx->rc_revoke[hash].re_block != 0) {
+		if (ctx->rc_revoke[hash].re_block == key) {
+			if ((int32_t)(sequence -
+			    ctx->rc_revoke[hash].re_sequence) >= 0)
+				ctx->rc_revoke[hash].re_sequence = sequence;
+			return (0);
 		}
+		hash = (hash + 1) & mask;
 	}
-
-	/* Grow table if needed */
-	if (ctx->rc_revoke_count >= ctx->rc_revoke_alloc) {
-		struct jbd2_revoke_entry *newrev;
-		u_int32_t newalloc;
-
-		newalloc = ctx->rc_revoke_alloc ? ctx->rc_revoke_alloc * 2
-		    : 64;
-		newrev = mallocarray(newalloc,
-		    sizeof(struct jbd2_revoke_entry), M_TEMP,
-		    M_WAITOK | M_ZERO);
-		if (ctx->rc_revoke_count > 0)
-			memcpy(newrev, ctx->rc_revoke,
-			    ctx->rc_revoke_count *
-			    sizeof(struct jbd2_revoke_entry));
-		if (ctx->rc_revoke != NULL)
-			free(ctx->rc_revoke, M_TEMP,
-			    ctx->rc_revoke_alloc *
-			    sizeof(struct jbd2_revoke_entry));
-		ctx->rc_revoke = newrev;
-		ctx->rc_revoke_alloc = newalloc;
-	}
-
-	ctx->rc_revoke[ctx->rc_revoke_count].re_block = block;
-	ctx->rc_revoke[ctx->rc_revoke_count].re_sequence = sequence;
+	if (ctx->rc_revoke_count >= JBD2_MAX_REVOKE_ENTRIES)
+		return (EFBIG);
+	ctx->rc_revoke[hash].re_block = key;
+	ctx->rc_revoke[hash].re_sequence = sequence;
 	ctx->rc_revoke_count++;
+	return (0);
 }
 
 /*
@@ -358,34 +702,48 @@ static int
 jbd2_revoke_check(struct jbd2_replay_ctx *ctx, u_int64_t block,
     u_int32_t sequence)
 {
-	u_int32_t i;
+	u_int32_t hash, mask;
+	u_int64_t key;
 
-	for (i = 0; i < ctx->rc_revoke_count; i++) {
-		if (ctx->rc_revoke[i].re_block == block &&
-		    (ctx->rc_revoke[i].re_sequence >= sequence ||
-		     (ctx->rc_revoke[i].re_sequence < 0x10000 &&
-		      sequence > 0xFFFF0000)))
-			return (1);
+	if (ctx->rc_revoke == NULL)
+		return (0);
+	key = block + 1;
+	mask = ctx->rc_revoke_alloc - 1;
+	hash = ((u_int32_t)block ^ (u_int32_t)(block >> 32)) *
+	    2654435761U;
+	hash &= mask;
+	while (ctx->rc_revoke[hash].re_block != 0) {
+		if (ctx->rc_revoke[hash].re_block == key)
+			return ((int32_t)(ctx->rc_revoke[hash].re_sequence -
+			    sequence) >= 0);
+		hash = (hash + 1) & mask;
 	}
 	return (0);
 }
 
-/*
- * Check if a block looks like a valid journal header.
- */
 static int
-jbd2_check_header(struct buf *bp, u_int32_t expected_seq, u_int32_t type)
+jbd2_revoke_block_check(struct jbd2_replay_ctx *ctx, struct buf *bp,
+    u_int32_t *count)
 {
-	struct jbd2_header *hdr;
+	struct jbd2_revoke_header *rh;
+	u_int32_t bytes, limit, record_size;
 
-	hdr = (struct jbd2_header *)bp->b_data;
-	if (betoh32(hdr->h_magic) != JBD2_MAGIC)
-		return (0);
-	if (betoh32(hdr->h_sequence) != expected_seq)
-		return (0);
-	if (type != 0 && betoh32(hdr->h_blocktype) != type)
-		return (0);
-	return (1);
+	if (!(ctx->rc_features_incompat & JBD2_FEATURE_INCOMPAT_REVOKE))
+		return (EINVAL);
+	if (!jbd2_metadata_block_csum_verify(ctx, bp->b_data))
+		return (EINVAL);
+
+	rh = (struct jbd2_revoke_header *)bp->b_data;
+	bytes = betoh32(rh->r_count);
+	limit = jbd2_descriptor_limit(ctx);
+	record_size = (ctx->rc_features_incompat &
+	    JBD2_FEATURE_INCOMPAT_64BIT) ? 8 : 4;
+
+	if (bytes < sizeof(*rh) || bytes > limit ||
+	    (bytes - sizeof(*rh)) % record_size != 0)
+		return (EINVAL);
+	*count = (bytes - sizeof(*rh)) / record_size;
+	return (0);
 }
 
 /*
@@ -396,25 +754,30 @@ jbd2_count_tags(struct jbd2_replay_ctx *ctx, struct buf *bp,
     u_int32_t *count)
 {
 	char *buf;
-	u_int32_t offset, bufsize, flags;
+	u_int32_t checksum, offset, bufsize, flags;
 	u_int64_t target;
-	int error;
+	int error, seen, uuid_seen;
 
 	buf = (char *)bp->b_data;
-	bufsize = ctx->rc_blocksize;
+	bufsize = jbd2_descriptor_limit(ctx);
 	offset = sizeof(struct jbd2_header);
 	*count = 0;
+	seen = 0;
+	uuid_seen = 0;
 
 	while (offset < bufsize) {
 		error = jbd2_parse_tag(ctx, buf, bufsize, &offset,
-		    &target, &flags);
+		    &target, &flags, &checksum, &uuid_seen);
 		if (error)
-			break;
-		(*count)++;
+			return (error);
+		seen = 1;
+		if (!(flags & JBD2_FLAG_DELETED))
+			(*count)++;
 		if (flags & JBD2_FLAG_LAST_TAG)
-			break;
+			return (0);
 	}
-	return (0);
+	/* A descriptor that exactly fills the tag area needs no LAST_TAG. */
+	return (seen && offset == bufsize ? 0 : EINVAL);
 }
 
 /*
@@ -427,99 +790,104 @@ jbd2_count_tags(struct jbd2_replay_ctx *ctx, struct buf *bp,
 static int
 jbd2_pass_scan(struct jbd2_replay_ctx *ctx)
 {
-	u_int32_t block, seq, next_seq;
-	u_int32_t tag_count;
+	u_int32_t block, consumed, loglen, revoke_count, seq, tag_count;
 	struct buf *bp;
 	struct jbd2_header *hdr;
-	int error;
+	int error, in_transaction;
 
 	block = ctx->rc_start;
 	seq = ctx->rc_sequence;
 	ctx->rc_end_sequence = seq;
+	consumed = 0;
+	in_transaction = 0;
+	loglen = ctx->rc_maxlen - ctx->rc_first;
 
 	printf("ext4fs: journal scan: start block %u sequence %u\n",
 	    block, seq);
 
-	while (1) {
+	while (consumed < loglen) {
 		error = jbd2_read_block(ctx, block, &bp);
 		if (error) {
 			printf("ext4fs: journal scan: read error at "
 			    "block %u\n", block);
-			break;
+			return (error);
 		}
+		consumed++;
 
 		hdr = (struct jbd2_header *)bp->b_data;
 		if (betoh32(hdr->h_magic) != JBD2_MAGIC) {
 			brelse(bp);
+			if (in_transaction)
+				return (EINVAL);
 			break;
 		}
 		if (betoh32(hdr->h_sequence) != seq) {
 			brelse(bp);
+			if (in_transaction)
+				return (EINVAL);
 			break;
 		}
 
 		switch (betoh32(hdr->h_blocktype)) {
 		case JBD2_DESCRIPTOR_BLOCK:
-			/* Count tags to know how many data blocks follow */
+			in_transaction = 1;
+			if (!jbd2_metadata_block_csum_verify(ctx,
+			    bp->b_data)) {
+				brelse(bp);
+				printf("ext4fs: bad journal descriptor checksum\n");
+				return (EINVAL);
+			}
 			error = jbd2_count_tags(ctx, bp, &tag_count);
 			brelse(bp);
 			if (error)
-				goto done;
+				return (error);
+			if (tag_count > loglen - consumed)
+				return (EINVAL);
 
-			/* Skip over data blocks */
 			{
 				u_int32_t i;
 				for (i = 0; i < tag_count; i++)
 					block = jbd2_next_block(ctx, block);
 			}
-
-			/* Next block should be commit */
-			block = jbd2_next_block(ctx, block);
-			error = jbd2_read_block(ctx, block, &bp);
-			if (error) {
-				printf("ext4fs: journal scan: missing commit "
-				    "for seq %u\n", seq);
-				goto done;
-			}
-
-			if (!jbd2_check_header(bp, seq,
-			    JBD2_COMMIT_BLOCK)) {
-				brelse(bp);
-				printf("ext4fs: journal scan: bad commit "
-				    "for seq %u\n", seq);
-				goto done;
-			}
-			brelse(bp);
-
-			/* Valid transaction */
-			next_seq = seq + 1;
-			ctx->rc_end_sequence = next_seq;
-			seq = next_seq;
+			consumed += tag_count;
 			block = jbd2_next_block(ctx, block);
 			break;
 
 		case JBD2_REVOKE_BLOCK:
-			/*
-			 * A revoke block by itself is part of a transaction.
-			 * There may be multiple revoke blocks before the
-			 * commit.
-			 */
+			in_transaction = 1;
+			error = jbd2_revoke_block_check(ctx, bp,
+			    &revoke_count);
 			brelse(bp);
+			if (error)
+				return (error);
 			block = jbd2_next_block(ctx, block);
 			break;
 
 		case JBD2_COMMIT_BLOCK:
-			/* Unexpected standalone commit — end of journal */
+			if (!in_transaction) {
+				brelse(bp);
+				return (EINVAL);
+			}
+			if (!jbd2_commit_block_csum_verify(ctx, bp->b_data)) {
+				brelse(bp);
+				printf("ext4fs: bad journal commit checksum\n");
+				return (EINVAL);
+			}
 			brelse(bp);
-			goto done;
+			seq++;
+			in_transaction = 0;
+			ctx->rc_end_sequence = seq;
+			block = jbd2_next_block(ctx, block);
+			break;
 
 		default:
 			brelse(bp);
-			goto done;
+			return (EINVAL);
 		}
 	}
+	if (in_transaction)
+		return (EINVAL);
 
-done:
 	printf("ext4fs: journal scan: end sequence %u (%u transactions)\n",
 	    ctx->rc_end_sequence,
 	    ctx->rc_end_sequence - ctx->rc_sequence);
@@ -534,11 +902,9 @@ done:
 static int
 jbd2_pass_revoke(struct jbd2_replay_ctx *ctx)
 {
-	u_int32_t block, seq;
-	u_int32_t tag_count;
+	u_int32_t block, consumed, loglen, revoke_count, seq, tag_count;
 	struct buf *bp;
 	struct jbd2_header *hdr;
-	struct jbd2_revoke_header *rh;
 	int has_64bit;
 	int error;
 
@@ -547,67 +913,88 @@ jbd2_pass_revoke(struct jbd2_replay_ctx *ctx)
 
 	block = ctx->rc_start;
 	seq = ctx->rc_sequence;
+	consumed = 0;
+	loglen = ctx->rc_maxlen - ctx->rc_first;
 
-	while (seq < ctx->rc_end_sequence) {
+	while (seq != ctx->rc_end_sequence && consumed < loglen) {
 		error = jbd2_read_block(ctx, block, &bp);
 		if (error)
 			return (error);
+		consumed++;
 
 		hdr = (struct jbd2_header *)bp->b_data;
 		if (betoh32(hdr->h_magic) != JBD2_MAGIC ||
 		    betoh32(hdr->h_sequence) != seq) {
 			brelse(bp);
-			break;
+			return (EINVAL);
 		}
 
 		switch (betoh32(hdr->h_blocktype)) {
 		case JBD2_DESCRIPTOR_BLOCK:
+			if (!jbd2_metadata_block_csum_verify(ctx,
+			    bp->b_data)) {
+				brelse(bp);
+				return (EINVAL);
+			}
 			error = jbd2_count_tags(ctx, bp, &tag_count);
 			brelse(bp);
 			if (error)
 				return (error);
+			if (tag_count > loglen - consumed)
+				return (EINVAL);
 			{
 				u_int32_t i;
 				for (i = 0; i < tag_count; i++)
 					block = jbd2_next_block(ctx, block);
 			}
-			/* Skip commit block */
+			consumed += tag_count;
 			block = jbd2_next_block(ctx, block);
-			block = jbd2_next_block(ctx, block);
-			seq++;
 			break;
 
 		case JBD2_REVOKE_BLOCK:
-			rh = (struct jbd2_revoke_header *)bp->b_data;
+			error = jbd2_revoke_block_check(ctx, bp,
+			    &revoke_count);
+			if (error) {
+				brelse(bp);
+				return (error);
+			}
 			{
-				u_int32_t rcount, off;
-				rcount = betoh32(rh->r_count);
+				u_int32_t i, off;
+
 				off = sizeof(struct jbd2_revoke_header);
-				while (off < rcount) {
+				for (i = 0; i < revoke_count; i++) {
 					u_int64_t revblk;
 					if (has_64bit) {
-						if (off + 8 > rcount)
-							break;
-						revblk =
-						    (u_int64_t)betoh32(
-						    *(u_int32_t *)
-						    ((char *)bp->b_data +
-						    off)) << 32 |
-						    betoh32(
-						    *(u_int32_t *)
-						    ((char *)bp->b_data +
-						    off + 4));
+						u_int32_t high, low;
+
+						memcpy(&high,
+						    (char *)bp->b_data + off, 4);
+						memcpy(&low,
+						    (char *)bp->b_data + off + 4, 4);
+						revblk = (u_int64_t)betoh32(high)
+						    << 32 | betoh32(low);
 						off += 8;
 					} else {
-						if (off + 4 > rcount)
-							break;
-						revblk = betoh32(
-						    *(u_int32_t *)
-						    ((char *)bp->b_data +
-						    off));
+						u_int32_t value;
+
+						memcpy(&value,
+						    (char *)bp->b_data + off, 4);
+						revblk = betoh32(value);
 						off += 4;
 					}
-					jbd2_revoke_add(ctx, revblk, seq);
+					if (revblk >= ctx->rc_fs->m_blocks_count) {
+						brelse(bp);
+						return (EINVAL);
+					}
+					if (jbd2_is_journal_block(ctx, revblk)) {
+						brelse(bp);
+						return (EINVAL);
+					}
+					error = jbd2_revoke_add(ctx, revblk, seq);
+					if (error) {
+						brelse(bp);
+						return (error);
+					}
 				}
 			}
 			brelse(bp);
@@ -615,6 +1002,10 @@ jbd2_pass_revoke(struct jbd2_replay_ctx *ctx)
 			break;
 
 		case JBD2_COMMIT_BLOCK:
+			if (!jbd2_commit_block_csum_verify(ctx, bp->b_data)) {
+				brelse(bp);
+				return (EINVAL);
+			}
 			brelse(bp);
 			block = jbd2_next_block(ctx, block);
 			seq++;
@@ -622,10 +1013,11 @@ jbd2_pass_revoke(struct jbd2_replay_ctx *ctx)
 
 		default:
 			brelse(bp);
-			block = jbd2_next_block(ctx, block);
-			break;
+			return (EINVAL);
 		}
 	}
+	if (seq != ctx->rc_end_sequence)
+		return (EINVAL);
 
 	if (ctx->rc_revoke_count > 0)
 		printf("ext4fs: journal revoke: %u blocks revoked\n",
@@ -641,48 +1033,77 @@ jbd2_pass_revoke(struct jbd2_replay_ctx *ctx)
  * that have not been revoked.
  */
 static int
-jbd2_pass_replay(struct jbd2_replay_ctx *ctx)
+jbd2_pass_replay(struct jbd2_replay_ctx *ctx, int apply)
 {
 	struct m_ext4fs *fs = ctx->rc_fs;
-	u_int32_t block, seq;
+	u_int32_t block, consumed, loglen, revoke_count, seq, tag_count;
 	u_int32_t replayed = 0;
 	struct buf *bp, *dbp, *wbp;
 	struct jbd2_header *hdr;
 	char *buf;
-	u_int32_t offset, bufsize, flags;
+	u_int32_t checksum, offset, bufsize, flags;
 	u_int64_t target;
-	int error;
+	int error, uuid_seen;
 
 	block = ctx->rc_start;
 	seq = ctx->rc_sequence;
+	consumed = 0;
+	loglen = ctx->rc_maxlen - ctx->rc_first;
 
-	while (seq < ctx->rc_end_sequence) {
+	while (seq != ctx->rc_end_sequence && consumed < loglen) {
 		error = jbd2_read_block(ctx, block, &bp);
 		if (error)
 			return (error);
+		consumed++;
 
 		hdr = (struct jbd2_header *)bp->b_data;
 		if (betoh32(hdr->h_magic) != JBD2_MAGIC ||
 		    betoh32(hdr->h_sequence) != seq) {
 			brelse(bp);
-			break;
+			return (EINVAL);
 		}
 
 		switch (betoh32(hdr->h_blocktype)) {
 		case JBD2_DESCRIPTOR_BLOCK:
+			if (!jbd2_metadata_block_csum_verify(ctx,
+			    bp->b_data)) {
+				brelse(bp);
+				return (EINVAL);
+			}
+			error = jbd2_count_tags(ctx, bp, &tag_count);
+			if (error) {
+				brelse(bp);
+				return (error);
+			}
+			if (tag_count > loglen - consumed) {
+				brelse(bp);
+				return (EINVAL);
+			}
 			buf = (char *)bp->b_data;
-			bufsize = ctx->rc_blocksize;
+			bufsize = jbd2_descriptor_limit(ctx);
 			offset = sizeof(struct jbd2_header);
+			uuid_seen = 0;
 
 			/* Iterate over tags, each followed by a data block */
 			while (offset < bufsize) {
 				error = jbd2_parse_tag(ctx, buf, bufsize,
-				    &offset, &target, &flags);
-				if (error)
-					break;
+				    &offset, &target, &flags, &checksum,
+				    &uuid_seen);
+				if (error) {
+					brelse(bp);
+					return (error);
+				}
+
+				/* Deleted tags have no corresponding data block. */
+				if (flags & JBD2_FLAG_DELETED) {
+					if (flags & JBD2_FLAG_LAST_TAG)
+						break;
+					continue;
+				}
 
 				/* Advance to data block */
 				block = jbd2_next_block(ctx, block);
+				consumed++;
 
 				/* Skip if revoked */
 				if (jbd2_revoke_check(ctx, target, seq)) {
@@ -696,23 +1117,38 @@ jbd2_pass_replay(struct jbd2_replay_ctx *ctx)
 				if (error) {
 					printf("ext4fs: journal replay: "
 					    "read error block %u\n", block);
+					brelse(bp);
+					return (error);
+				}
+				if (!jbd2_data_block_csum_verify(ctx,
+				    dbp->b_data, seq, checksum)) {
+					printf("ext4fs: journal replay: bad data "
+					    "checksum at block %u\n", block);
+					brelse(dbp);
+					brelse(bp);
+					return (EINVAL);
+				}
+				if (!apply) {
+					brelse(dbp);
 					if (flags & JBD2_FLAG_LAST_TAG)
 						break;
 					continue;
 				}
 
 				/* Read the target filesystem block */
+				wbp = NULL;
 				error = bread(ctx->rc_devvp,
 				    (daddr_t)EXT4FS_FSBTODB(fs, target),
 				    fs->m_block_size, &wbp);
 				if (error) {
+					if (wbp != NULL)
+						brelse(wbp);
 					brelse(dbp);
 					printf("ext4fs: journal replay: "
 					    "can't read target %llu\n",
 					    (unsigned long long)target);
-					if (flags & JBD2_FLAG_LAST_TAG)
-						break;
-					continue;
+					brelse(bp);
+					return (error);
 				}
 
 				/* Copy data */
@@ -732,6 +1168,8 @@ jbd2_pass_replay(struct jbd2_replay_ctx *ctx)
 					printf("ext4fs: journal replay: "
 					    "write error target %llu\n",
 					    (unsigned long long)target);
+					brelse(bp);
+					return (error);
 				} else {
 					replayed++;
 				}
@@ -741,20 +1179,23 @@ jbd2_pass_replay(struct jbd2_replay_ctx *ctx)
 			}
 
 			brelse(bp);
-
-			/* Skip to commit block and past it */
 			block = jbd2_next_block(ctx, block);
-			/* Skip the commit block */
-			block = jbd2_next_block(ctx, block);
-			seq++;
 			break;
 
 		case JBD2_REVOKE_BLOCK:
+			error = jbd2_revoke_block_check(ctx, bp,
+			    &revoke_count);
 			brelse(bp);
+			if (error)
+				return (error);
 			block = jbd2_next_block(ctx, block);
 			break;
 
 		case JBD2_COMMIT_BLOCK:
+			if (!jbd2_commit_block_csum_verify(ctx, bp->b_data)) {
+				brelse(bp);
+				return (EINVAL);
+			}
 			brelse(bp);
 			block = jbd2_next_block(ctx, block);
 			seq++;
@@ -762,93 +1203,154 @@ jbd2_pass_replay(struct jbd2_replay_ctx *ctx)
 
 		default:
 			brelse(bp);
-			block = jbd2_next_block(ctx, block);
-			break;
+			return (EINVAL);
 		}
 	}
+	if (seq != ctx->rc_end_sequence)
+		return (EINVAL);
 
-	ctx->rc_replay_count = replayed;
-	printf("ext4fs: journal replay: %u blocks replayed\n", replayed);
+	if (apply) {
+		ctx->rc_replay_count = replayed;
+		printf("ext4fs: journal replay: %u blocks replayed\n",
+		    replayed);
+	}
 
 	return (0);
+}
+
+static int
+jbd2_superblock_csum_verify(struct jbd2_replay_ctx *ctx,
+    struct jbd2_superblock *jsb)
+{
+	u_int32_t provided, calculated;
+
+	if (!jbd2_has_csum_v2or3(ctx))
+		return (1);
+
+	provided = jsb->s_checksum;
+	jsb->s_checksum = 0;
+	calculated = ~ext4fs_crc32c(0, jsb, sizeof(*jsb));
+	jsb->s_checksum = provided;
+	return (betoh32(provided) == calculated);
+}
+
+static void
+jbd2_superblock_csum_set(struct jbd2_replay_ctx *ctx,
+    struct jbd2_superblock *jsb)
+{
+	u_int32_t checksum;
+
+	if (!jbd2_has_csum_v2or3(ctx))
+		return;
+	jsb->s_checksum = 0;
+	checksum = ~ext4fs_crc32c(0, jsb, sizeof(*jsb));
+	jsb->s_checksum = htobe32(checksum);
+}
+
+static int
+jbd2_recovered_super_check(struct jbd2_replay_ctx *ctx)
+{
+	struct m_ext4fs *fs = ctx->rc_fs;
+	struct ext4fs *sble;
+	struct buf *bp;
+	int error;
+
+	bp = NULL;
+	error = bread(ctx->rc_devvp,
+	    (daddr_t)(EXT4FS_SUPER_BLOCK_OFFSET / DEV_BSIZE),
+	    EXT4FS_SUPER_BLOCK_SIZE, &bp);
+	if (error) {
+		if (bp != NULL)
+			brelse(bp);
+		return (error);
+	}
+	sble = (struct ext4fs *)bp->b_data;
+	error = ext4fs_sbcheck(sble, fs->m_read_only);
+	if (error == 0 && memcmp(sble->sb_uuid, fs->m_sble.sb_uuid,
+	    sizeof(sble->sb_uuid)) != 0)
+		error = EINVAL;
+	brelse(bp);
+	return (error);
+}
+
+static int
+jbd2_flush_device(struct vnode *devvp, struct proc *p)
+{
+	int error, force;
+
+	if (p == NULL)
+		p = curproc;
+	vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
+	error = VOP_FSYNC(devvp, FSCRED, MNT_WAIT, p);
+	VOP_UNLOCK(devvp);
+	if (error)
+		return (error);
+
+	/*
+	 * VOP_FSYNC on a block device drains the buffer cache, but it does
+	 * not order those writes past a drive's volatile write cache.  Request a
+	 * cache synchronization when the device supports it; virtual devices may
+	 * expose VOP_FSYNC as their only durability primitive.
+	 */
+	force = 1;
+	error = VOP_IOCTL(devvp, DIOCCACHESYNC, &force, FWRITE, FSCRED, p);
+	/* File-backed and virtual block devices may provide only VOP_FSYNC. */
+	if (error == ENOTTY || error == EOPNOTSUPP)
+		return (0);
+	return (error);
 }
 
 /*
  * Main entry point: replay the ext4 journal.
  *
  * Called during mount when the RECOVER incompat flag is set.
- * Reads inode 8 directly from the inode table to locate the journal,
+ * Reads the internal journal inode directly from the inode table,
  * runs the three-pass replay, then clears the journal.
  */
 int
-ext4fs_journal_replay(struct vnode *devvp, struct m_ext4fs *fs)
+ext4fs_journal_replay(struct vnode *devvp, struct m_ext4fs *fs,
+    struct proc *p)
 {
 	struct jbd2_replay_ctx ctx;
 	struct jbd2_superblock *jsb;
 	struct ext4fs_dinode *jdi;
 	struct buf *bp, *ibp;
-	u_int64_t jblock0;
+	u_int64_t jblock0, journal_bytes, journal_blocks;
+	u_int32_t btype, unsupported;
 	int error;
 
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.rc_devvp = devvp;
 	ctx.rc_fs = fs;
+	bp = NULL;
+	ibp = NULL;
 
-	/*
-	 * Read journal inode (inode 8) from the inode table.
-	 */
 	error = jbd2_read_journal_inode(&ctx, &ibp, &jdi);
 	if (error)
-		return (error);
+		goto out;
 
 	ctx.rc_journal_eh = &jdi->i_extent_header;
-
-	/* Find block 0 from the first extent */
-	if (letoh16(jdi->i_extent_header.eh_magic) !=
-	    EXT4FS_EXTENT_HEADER_MAGIC ||
-	    letoh16(jdi->i_extent_header.eh_entries) == 0) {
-		printf("ext4fs: journal inode has no extents\n");
-		brelse(ibp);
-		return (EINVAL);
+	ctx.rc_journal_ino = fs->m_journal_inode_number;
+	ctx.rc_journal_gen = jdi->i_nfs_generation;
+	if (!(letoh32(jdi->i_flags) & EXTFS_INODE_FLAG_EXTENTS)) {
+		printf("ext4fs: journal inode does not use extents\n");
+		error = EINVAL;
+		goto out;
+	}
+	journal_bytes = letoh32(jdi->i_size_lo) |
+	    (u_int64_t)letoh32(jdi->i_size_hi) << 32;
+	if (journal_bytes < fs->m_block_size) {
+		printf("ext4fs: journal inode is too small\n");
+		error = EINVAL;
+		goto out;
 	}
 
-	if (letoh16(jdi->i_extent_header.eh_depth) == 0) {
-		struct ext4fs_extent *ext = jdi->i_extent;
-		jblock0 = (u_int64_t)letoh16(ext->e_start_hi) << 32 |
-		    letoh32(ext->e_start_lo);
-	} else {
-		/*
-		 * Depth > 0: need to read the first index block to
-		 * find the first leaf extent.
-		 */
-		struct ext4fs_extent_idx *idx = jdi->i_extent_idx;
-		struct ext4fs_extent_header *leh;
-		struct ext4fs_extent *lext;
-		struct buf *lbp;
-		u_int64_t leaf_block;
-
-		leaf_block =
-		    (u_int64_t)letoh16(idx->ei_leaf_hi) << 32 |
-		    letoh32(idx->ei_leaf_lo);
-		error = bread(devvp,
-		    (daddr_t)EXT4FS_FSBTODB(fs, leaf_block),
-		    fs->m_block_size, &lbp);
-		if (error) {
-			brelse(lbp);
-			brelse(ibp);
-			return (error);
-		}
-		leh = (struct ext4fs_extent_header *)lbp->b_data;
-		lext = (struct ext4fs_extent *)(leh + 1);
-		jblock0 = (u_int64_t)letoh16(lext->e_start_hi) << 32 |
-		    letoh32(lext->e_start_lo);
-		brelse(lbp);
-	}
-
-	if (jblock0 == 0) {
+	error = jbd2_extent_lookup(&ctx, ctx.rc_journal_eh,
+	    sizeof(jdi->i_block), -1, 0, &jblock0);
+	if (error || jblock0 == 0) {
 		printf("ext4fs: can't locate journal block 0\n");
-		brelse(ibp);
-		return (EINVAL);
+		error = error ? error : EINVAL;
+		goto out;
 	}
 
 	/* Read journal superblock (journal block 0) */
@@ -856,8 +1358,7 @@ ext4fs_journal_replay(struct vnode *devvp, struct m_ext4fs *fs)
 	    fs->m_block_size, &bp);
 	if (error) {
 		printf("ext4fs: can't read journal superblock\n");
-		brelse(ibp);
-		return (error);
+		goto out;
 	}
 
 	jsb = (struct jbd2_superblock *)bp->b_data;
@@ -866,20 +1367,21 @@ ext4fs_journal_replay(struct vnode *devvp, struct m_ext4fs *fs)
 	if (betoh32(jsb->s_header.h_magic) != JBD2_MAGIC) {
 		printf("ext4fs: bad journal magic 0x%x\n",
 		    betoh32(jsb->s_header.h_magic));
-		brelse(bp);
-		brelse(ibp);
-		return (EINVAL);
+		error = EINVAL;
+		goto out;
 	}
-	{
-		u_int32_t btype = betoh32(jsb->s_header.h_blocktype);
-		if (btype != JBD2_SUPERBLOCK_V1 &&
-		    btype != JBD2_SUPERBLOCK_V2) {
-			printf("ext4fs: bad journal superblock version %u\n",
-			    btype);
-			brelse(bp);
-			brelse(ibp);
-			return (EINVAL);
-		}
+	btype = betoh32(jsb->s_header.h_blocktype);
+	if (btype != JBD2_SUPERBLOCK_V2) {
+		printf("ext4fs: unsupported journal superblock version %u\n",
+		    btype);
+		error = EINVAL;
+		goto out;
+	}
+	if (betoh32(jsb->s_errno) != 0) {
+		printf("ext4fs: journal records error %u\n",
+		    betoh32(jsb->s_errno));
+		error = EIO;
+		goto out;
 	}
 
 	ctx.rc_blocksize = betoh32(jsb->s_blocksize);
@@ -888,33 +1390,121 @@ ext4fs_journal_replay(struct vnode *devvp, struct m_ext4fs *fs)
 	ctx.rc_sequence = betoh32(jsb->s_sequence);
 	ctx.rc_start = betoh32(jsb->s_start);
 
-	if (betoh32(jsb->s_header.h_blocktype) == JBD2_SUPERBLOCK_V2)
+	if (btype == JBD2_SUPERBLOCK_V2) {
+		ctx.rc_features_compat = betoh32(jsb->s_feature_compat);
 		ctx.rc_features_incompat = betoh32(jsb->s_feature_incompat);
-	else
+		ctx.rc_features_ro_compat = betoh32(jsb->s_feature_ro_compat);
+		if (betoh32(jsb->s_nr_users) != 1) {
+			printf("ext4fs: shared journal is not supported\n");
+			error = EINVAL;
+			goto out;
+		}
+	} else {
+		ctx.rc_features_compat = 0;
 		ctx.rc_features_incompat = 0;
-
-	brelse(bp);
+		ctx.rc_features_ro_compat = 0;
+	}
 
 	if (ctx.rc_blocksize != fs->m_block_size) {
 		printf("ext4fs: journal blocksize %u != fs blocksize %llu\n",
 		    ctx.rc_blocksize, (unsigned long long)fs->m_block_size);
-		brelse(ibp);
-		return (EINVAL);
+		error = EINVAL;
+		goto out;
 	}
-
-	if (ctx.rc_start == 0) {
-		printf("ext4fs: journal is clean, no replay needed\n");
-		brelse(ibp);
-		error = 0;
+	if (journal_bytes % ctx.rc_blocksize != 0) {
+		printf("ext4fs: journal inode size is not block aligned\n");
+		error = EINVAL;
+		goto out;
+	}
+	journal_blocks = journal_bytes / ctx.rc_blocksize;
+	if (ctx.rc_first == 0 || ctx.rc_first >= ctx.rc_maxlen ||
+	    ctx.rc_maxlen > journal_blocks ||
+	    ctx.rc_maxlen > JBD2_MAX_BLOCKMAP_ENTRIES ||
+	    (ctx.rc_start != 0 && (ctx.rc_start < ctx.rc_first ||
+	    ctx.rc_start >= ctx.rc_maxlen))) {
+		printf("ext4fs: invalid journal geometry: first=%u start=%u "
+		    "maxlen=%u inode-blocks=%llu\n", ctx.rc_first,
+		    ctx.rc_start, ctx.rc_maxlen,
+		    (unsigned long long)journal_blocks);
+		error = EINVAL;
 		goto out;
 	}
 
-	/* Build full blockmap from inode 8's extent tree */
+	unsupported = ctx.rc_features_compat &
+	    ~JBD2_FEATURE_COMPAT_SUPPORTED;
+	if (unsupported != 0) {
+		printf("ext4fs: unsupported journal compat features 0x%x\n",
+		    unsupported);
+		error = EINVAL;
+		goto out;
+	}
+	unsupported = ctx.rc_features_incompat &
+	    ~JBD2_FEATURE_INCOMPAT_SUPPORTED;
+	if (unsupported != 0) {
+		printf("ext4fs: unsupported journal incompat features 0x%x\n",
+		    unsupported);
+		error = EINVAL;
+		goto out;
+	}
+	unsupported = ctx.rc_features_ro_compat &
+	    ~JBD2_FEATURE_RO_COMPAT_SUPPORTED;
+	if (unsupported != 0) {
+		printf("ext4fs: unsupported journal ro-compat features 0x%x\n",
+		    unsupported);
+		error = EINVAL;
+		goto out;
+	}
+	if ((ctx.rc_features_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V2) &&
+	    (ctx.rc_features_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3)) {
+		printf("ext4fs: journal enables both checksum v2 and v3\n");
+		error = EINVAL;
+		goto out;
+	}
+	if (btype == JBD2_SUPERBLOCK_V2) {
+		const u_int8_t zero_uuid[16] = { 0 };
+		const u_int8_t *expected_uuid;
+
+		expected_uuid = fs->m_sble.sb_journal_uuid;
+		if (memcmp(expected_uuid, zero_uuid, sizeof(zero_uuid)) == 0)
+			expected_uuid = fs->m_sble.sb_uuid;
+		if (memcmp(jsb->s_uuid, expected_uuid,
+		    sizeof(jsb->s_uuid)) != 0) {
+			printf("ext4fs: journal UUID does not match filesystem\n");
+			error = EINVAL;
+			goto out;
+		}
+	}
+	memcpy(ctx.rc_uuid, jsb->s_uuid, sizeof(ctx.rc_uuid));
+	ctx.rc_checksum_seed = ext4fs_crc32c(0, jsb->s_uuid,
+	    sizeof(jsb->s_uuid));
+	if (jbd2_has_csum_v2or3(&ctx) &&
+	    jsb->s_checksum_type != JBD2_CHECKSUM_CRC32C) {
+		printf("ext4fs: unsupported journal checksum type %u\n",
+		    jsb->s_checksum_type);
+		error = EINVAL;
+		goto out;
+	}
+	if (!jbd2_superblock_csum_verify(&ctx, jsb)) {
+		printf("ext4fs: invalid journal superblock checksum\n");
+		error = EINVAL;
+		goto out;
+	}
+
+	brelse(bp);
+	bp = NULL;
+
+	/* Build the complete logical-to-physical map while the inode is pinned. */
 	error = jbd2_build_blockmap(&ctx);
 	brelse(ibp);
+	ibp = NULL;
 	ctx.rc_journal_eh = NULL;
 	if (error)
 		goto out;
+	if (ctx.rc_start == 0) {
+		printf("ext4fs: RECOVER is set but journal start is zero\n");
+		error = EINVAL;
+		goto out;
+	}
 
 	printf("ext4fs: replaying journal (sequence %u, start block %u, "
 	    "%u journal blocks)\n",
@@ -935,10 +1525,27 @@ ext4fs_journal_replay(struct vnode *devvp, struct m_ext4fs *fs)
 	if (error)
 		goto out;
 
-	/* Pass 3: REPLAY */
-	error = jbd2_pass_replay(&ctx);
+	/* Validate every payload before allowing the first home-block write. */
+	error = jbd2_pass_replay(&ctx, 0);
 	if (error)
 		goto out;
+
+	/* Pass 3: REPLAY */
+	error = jbd2_pass_replay(&ctx, 1);
+	if (error)
+		goto out;
+
+	/* Home blocks must be durable before the journal is invalidated. */
+	error = jbd2_flush_device(devvp, p);
+	if (error) {
+		printf("ext4fs: can't flush replayed journal blocks\n");
+		goto out;
+	}
+	error = jbd2_recovered_super_check(&ctx);
+	if (error) {
+		printf("ext4fs: replay produced an invalid superblock\n");
+		goto out;
+	}
 
 clear:
 	/*
@@ -955,49 +1562,78 @@ clear:
 	jsb->s_start = htobe32(0);
 	/* Advance sequence past what we replayed */
 	jsb->s_sequence = htobe32(ctx.rc_end_sequence);
+	jbd2_superblock_csum_set(&ctx, jsb);
 	error = bwrite(bp);
+	bp = NULL;
 	if (error) {
 		printf("ext4fs: can't write journal superblock\n");
 		goto out;
 	}
+	error = jbd2_flush_device(devvp, p);
+	if (error) {
+		printf("ext4fs: can't flush clean journal superblock\n");
+		goto out;
+	}
 
 	/*
-	 * Clear RECOVER flag and set STATE_VALID in ext4 superblock.
+	 * Re-read the post-replay superblock before changing RECOVER.  The
+	 * transaction may itself have contained a newer superblock image;
+	 * copying fs->m_sble here would undo that recovered metadata.
 	 */
 	{
+		struct ext4fs *sble;
 		u_int32_t incompat;
+		u_int16_t state;
 
-		incompat = letoh32(fs->m_sble.sb_feature_incompat);
-		incompat &= ~EXT4FS_FEATURE_INCOMPAT_RECOVER;
-		fs->m_sble.sb_feature_incompat = htole32(incompat);
-		fs->m_feature_incompat = incompat;
-
-		fs->m_sble.sb_state = htole16(EXT4FS_STATE_VALID);
-		fs->m_state = EXT4FS_STATE_VALID;
-
-		/* Recompute superblock checksum */
-		fs->m_sble.sb_checksum =
-		    htole32(ext4fs_sb_csum(&fs->m_sble));
-
-		/* Write superblock to disk */
 		error = bread(devvp,
 		    (daddr_t)(EXT4FS_SUPER_BLOCK_OFFSET / DEV_BSIZE),
 		    EXT4FS_SUPER_BLOCK_SIZE, &bp);
 		if (error) {
-			printf("ext4fs: can't read superblock for update\n");
+			printf("ext4fs: can't read recovered superblock\n");
 			goto out;
 		}
-		memcpy(bp->b_data, &fs->m_sble, sizeof(struct ext4fs));
+		sble = (struct ext4fs *)bp->b_data;
+		if (ext4fs_sbcheck(sble, fs->m_read_only) != 0 ||
+		    memcmp(sble->sb_uuid, fs->m_sble.sb_uuid,
+		    sizeof(sble->sb_uuid)) != 0) {
+			printf("ext4fs: recovered superblock is invalid\n");
+			error = EINVAL;
+			goto out;
+		}
+
+		incompat = letoh32(sble->sb_feature_incompat);
+		incompat &= ~EXT4FS_FEATURE_INCOMPAT_RECOVER;
+		sble->sb_feature_incompat = htole32(incompat);
+		/* Mountfs marks a writable mount dirty only after setup succeeds. */
+		state = letoh16(sble->sb_state);
+		state |= EXT4FS_STATE_VALID;
+		sble->sb_state = htole16(state);
+
+		/* Recompute superblock checksum */
+		sble->sb_checksum = htole32(ext4fs_sb_csum(sble));
 		error = bwrite(bp);
+		bp = NULL;
 		if (error) {
 			printf("ext4fs: can't write superblock\n");
 			goto out;
 		}
 	}
+	error = jbd2_flush_device(devvp, p);
+	if (error) {
+		printf("ext4fs: can't flush recovered filesystem state\n");
+		goto out;
+	}
 
 	printf("ext4fs: journal replay complete\n");
 
 out:
+	if (bp != NULL)
+		brelse(bp);
+	if (ibp != NULL)
+		brelse(ibp);
+	if (ctx.rc_blockset != NULL)
+		free(ctx.rc_blockset, M_TEMP,
+		    (ctx.rc_blockset_mask + 1) * sizeof(*ctx.rc_blockset));
 	if (ctx.rc_blockmap != NULL)
 		free(ctx.rc_blockmap, M_TEMP,
 		    ctx.rc_blockmap_count *
@@ -1046,10 +1682,17 @@ ext4fs_process_orphan(struct mount *mp, u_int32_t ino, int *count)
 		printf("ext4fs: orphan inode %u: truncating (nlink=%u)\n",
 		    ino, nlink);
 		error = ext4fs_truncate(ip, size, 0, NOCRED);
-		if (error)
+		if (error) {
 			printf("ext4fs: orphan inode %u: "
 			    "truncate failed: %d\n", ino, error);
-		ext4fs_update(ip, 1);
+			vput(vp);
+			return (error);
+		}
+		error = ext4fs_update(ip, 1);
+		if (error) {
+			vput(vp);
+			return (error);
+		}
 	} else {
 		printf("ext4fs: orphan inode %u: deleting\n", ino);
 	}
@@ -1083,6 +1726,15 @@ ext4fs_orphan_file_scan(struct mount *mp, int *count)
 		    orphan_ino);
 		return (error);
 	}
+
+	/*
+	 * The orphan-file block checksum recipe is not yet implemented in
+	 * IABSD.  Processing entries without authenticating the entire file
+	 * could free blocks named by corrupt metadata, so fail closed.
+	 */
+	printf("ext4fs: orphan-file recovery is not yet supported\n");
+	vput(ovp);
+	return (EOPNOTSUPP);
 
 	oip = VTOI(ovp);
 	odin = &oip->i_e4din->dinode;
@@ -1183,6 +1835,14 @@ ext4fs_orphan_cleanup(struct mount *mp)
 	if (!has_orphans)
 		return (0);
 
+	/*
+	 * Orphan recovery must be journaled or otherwise restartable before it
+	 * can safely mutate an image during mount.  Fail closed until that path
+	 * is implemented; do not clear either orphan root.
+	 */
+	printf("ext4fs: orphan cleanup is not yet supported safely\n");
+	return (EOPNOTSUPP);
+
 	printf("ext4fs: cleaning up orphan inodes\n");
 
 	/* Walk classic sb_last_orphan linked list */
@@ -1195,13 +1855,19 @@ ext4fs_orphan_cleanup(struct mount *mp)
 		if (error) {
 			printf("ext4fs: orphan cleanup: "
 			    "can't get inode %u\n", ino);
-			break;
+			return (error);
 		}
 		ip = VTOI(vp);
 		next = letoh32(ip->i_e4din->dinode.i_dtime);
 		vput(vp);
 
-		ext4fs_process_orphan(mp, ino, &count);
+		error = ext4fs_process_orphan(mp, ino, &count);
+		if (error)
+			return (error);
+		if (next > fs->m_inodes_count || count > fs->m_inodes_count) {
+			printf("ext4fs: corrupt orphan inode list\n");
+			return (EINVAL);
+		}
 		ino = next;
 	}
 
@@ -1213,7 +1879,9 @@ ext4fs_orphan_cleanup(struct mount *mp)
 	    EXT4FS_FEATURE_RO_COMPAT_ORPHAN_PRESENT) {
 		u_int32_t ro;
 
-		ext4fs_orphan_file_scan(mp, &count);
+		error = ext4fs_orphan_file_scan(mp, &count);
+		if (error)
+			return (error);
 
 		ro = letoh32(fs->m_sble.sb_feature_ro_compat);
 		ro &= ~EXT4FS_FEATURE_RO_COMPAT_ORPHAN_PRESENT;
