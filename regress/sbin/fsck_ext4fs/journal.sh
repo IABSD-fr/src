@@ -18,6 +18,17 @@ FSCK_TIMEOUT=${FSCK_TIMEOUT:-20}
 JOURNAL_SEED=${JOURNAL_SEED:-260921}
 RANDOM_CASES=${RANDOM_CASES:-6}
 MUTATION_CASES=${MUTATION_CASES:-18}
+JOURNAL_TEST_MODE=${JOURNAL_TEST_MODE:-all}
+VNCONFIG=${VNCONFIG:-vnconfig}
+MOUNT_EXT4FS=${MOUNT_EXT4FS:-mount_ext4fs}
+UMOUNT=${UMOUNT:-umount}
+
+case "$JOURNAL_TEST_MODE" in
+all|kernel) ;;
+*)	echo "JOURNAL_TEST_MODE must be 'all' or 'kernel'" >&2
+	exit 1
+	;;
+esac
 
 for tool in "$MKE2FS" "$DEBUGFS" "$E2FSCK" "$TIMEOUT" \
     sha256 dd tr cmp cp awk grep sed od; do
@@ -26,6 +37,19 @@ for tool in "$MKE2FS" "$DEBUGFS" "$E2FSCK" "$TIMEOUT" \
 		exit 0
 	fi
 done
+
+if [ "$JOURNAL_TEST_MODE" = kernel ]; then
+	for tool in "$VNCONFIG" "$MOUNT_EXT4FS" "$UMOUNT" id; do
+		if ! command -v "$tool" >/dev/null 2>&1; then
+			echo "SKIPPED: kernel journal regress requires $tool"
+			exit 0
+		fi
+	done
+	if [ "$(id -u)" -ne 0 ]; then
+		echo "SKIPPED: kernel journal regress must run as root"
+		exit 0
+	fi
+fi
 
 case "$FSCK_TIMEOUT:$JOURNAL_SEED:$RANDOM_CASES:$MUTATION_CASES" in
 *[!0-9:]*)	echo "timeout, seed, and case counts must be unsigned integers" >&2
@@ -39,6 +63,10 @@ esac
 RNG_STATE=$JOURNAL_SEED
 ulimit -c 0
 
+KERNEL_VND=
+KERNEL_MOUNTPOINT=
+KERNEL_MOUNTED=0
+
 work=$(mktemp -d /tmp/fsck_ext4fs_journal.XXXXXXXX)
 case "$work" in
 /tmp/fsck_ext4fs_journal.*) ;;
@@ -51,6 +79,14 @@ cleanup()
 {
 	rc=$?
 	trap - EXIT HUP INT TERM
+	if [ "$KERNEL_MOUNTED" -eq 1 ]; then
+		run_privileged "$UMOUNT" "$KERNEL_MOUNTPOINT" >/dev/null 2>&1 || :
+		KERNEL_MOUNTED=0
+	fi
+	if [ -n "$KERNEL_VND" ]; then
+		run_privileged "$VNCONFIG" -u "$KERNEL_VND" >/dev/null 2>&1 || :
+		KERNEL_VND=
+	fi
 	if [ "${KEEP_TMP:-0}" = 1 ] || [ "$rc" -ne 0 ]; then
 		echo "temporary files retained in $work"
 	else
@@ -69,13 +105,19 @@ fail()
 	exit 1
 }
 
+run_privileged()
+{
+	[ "$(id -u)" -eq 0 ] || return 1
+	"$@"
+}
+
 random_number()
 {
 	RNG_STATE=$(((RNG_STATE * 1103515245 + 12345) & 2147483647))
 	RANDOM_VALUE=$RNG_STATE
 }
 
-if [ -z "${FSCK_EXT4FS:-}" ]; then
+if [ "$JOURNAL_TEST_MODE" = all ] && [ -z "${FSCK_EXT4FS:-}" ]; then
 	objdir=$work/obj
 	mkdir "$objdir"
 	if ! MAKEOBJDIR="$objdir" "$MAKE" -s \
@@ -86,7 +128,7 @@ if [ -z "${FSCK_EXT4FS:-}" ]; then
 	fi
 	FSCK_EXT4FS=$objdir/fsck_ext4fs
 fi
-if [ ! -x "$FSCK_EXT4FS" ]; then
+if [ "$JOURNAL_TEST_MODE" = all ] && [ ! -x "$FSCK_EXT4FS" ]; then
 	test_name=build
 	fail "$FSCK_EXT4FS is not executable"
 fi
@@ -245,6 +287,16 @@ read_be32_journal()
 	    od -An -tu1)
 	[ "$#" -eq 4 ] || fail "could not read journal word"
 	JOURNAL_WORD=$((($1 << 24) | ($2 << 16) | ($3 << 8) | $4))
+}
+
+read_le32_image()
+{
+	le_image=$1
+	le_offset=$2
+	set -- $(dd if="$le_image" bs=1 skip="$le_offset" count=4 \
+	    status=none | od -An -tu1)
+	[ "$#" -eq 4 ] || fail "could not read little-endian image word"
+	IMAGE_WORD=$(($1 | ($2 << 8) | ($3 << 16) | ($4 << 24)))
 }
 
 write_byte()
@@ -874,6 +926,151 @@ test_malformed_geometry()
 	done
 }
 
+fuzz_reject_word()
+{
+	fr_base=$1
+	fr_root=$2
+	fr_name=$3
+	fr_logical=$4
+	fr_width=$5
+	fr_offset=$6
+	fr_value=$7
+
+	case_dir=$fr_root/$fr_name
+	mkdir "$case_dir"
+	cp "$fr_base" "$case_dir/image"
+	printf 'logical=%s width=%s offset=%s value=%s\n' \
+	    "$fr_logical" "$fr_width" "$fr_offset" "$fr_value" \
+	    >"$case_dir/mutation"
+	case "$fr_width" in
+	16)	write_be16_journal "$case_dir/image" "$fr_logical" \
+		    "$fr_offset" "$fr_value" ;;
+	32)	write_be32_journal "$case_dir/image" "$fr_logical" \
+		    "$fr_offset" "$fr_value" ;;
+	*)	fail "unsupported fuzz word width $fr_width" ;;
+	esac
+	expect_replay_failure_unchanged "$case_dir/image"
+}
+
+test_structured_field_fuzz()
+{
+	root_dir=$work/structured-field-fuzz
+	mkdir "$root_dir"
+
+	# A multi-tag, no-checksum descriptor reaches tag parsing directly.
+	case_dir=$root_dir/descriptor-base
+	mkdir "$case_dir"
+	create_image "$case_dir/image" 4096
+	find_free_blocks "$case_dir/image" 8
+	descriptor_target=$FREE_FIRST
+	make_random_payload "$case_dir/payload" 4096 8
+	{
+		printf 'journal_open\n'
+		printf 'journal_write -b %s %s\n' "$FREE_RANGE" \
+		    "$case_dir/payload"
+		printf 'journal_close\n'
+	} >"$case_dir/debugfs.cmd"
+	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
+	descriptor_base=$case_dir/image
+
+	read_be32_journal "$descriptor_base" 0 40
+	if [ $((JOURNAL_WORD & 2)) -ne 0 ]; then
+		descriptor_tag_size=12
+	else
+		descriptor_tag_size=8
+	fi
+	tag_final_start=$((28 + 7 * descriptor_tag_size))
+	tag_final_flags=$((tag_final_start + 6))
+	tag_extra_start=$((tag_final_start + descriptor_tag_size))
+	tag_extra_flags=$((tag_extra_start + 6))
+
+	# The descriptor is block 1, its eight data blocks are 2..9, and the
+	# commit is block 10.  The first v2 tag is followed by a 16-byte UUID;
+	# derive later offsets from the journal's 32/64-bit tag format.
+	while read name logical width offset value; do
+		fuzz_reject_word "$descriptor_base" "$root_dir" "$name" \
+		    "$logical" "$width" "$offset" "$value"
+	done <<-EOF
+	descriptor-type-zero 1 32 4 0
+	descriptor-type-max 1 32 4 4294967295
+	commit-magic-zero 10 32 0 0
+	commit-type-descriptor 10 32 4 1
+	commit-type-max 10 32 4 4294967295
+	commit-sequence-zero 10 32 8 0
+	tag-target-max 1 32 12 4294967295
+	tag-first-same-uuid 1 16 18 10
+	tag-count-too-small 1 16 18 8
+	tag-missing-last 1 16 $tag_final_flags 2
+	tag-unknown-flags 1 16 $tag_final_flags 32770
+	EOF
+
+	# Add a ninth synthetic tag after clearing LAST_TAG on tag eight.  Scan
+	# must reject the derived over-count rather than consume the commit block
+	# as journal data.
+	case_dir=$root_dir/tag-count-too-large
+	mkdir "$case_dir"
+	cp "$descriptor_base" "$case_dir/image"
+	write_be16_journal "$case_dir/image" 1 "$tag_final_flags" 2
+	write_be32_journal "$case_dir/image" 1 "$tag_extra_start" \
+	    "$descriptor_target"
+	write_be16_journal "$case_dir/image" 1 "$tag_extra_flags" 10
+	expect_replay_failure_unchanged "$case_dir/image"
+
+	# Revoke lengths are byte counts including the 16-byte header.  These
+	# boundary values are invalid for both four- and eight-byte records.
+	case_dir=$root_dir/revoke-base
+	mkdir "$case_dir"
+	create_image "$case_dir/image" 4096
+	find_free_blocks "$case_dir/image" 1
+	: >"$case_dir/empty"
+	{
+		printf 'journal_open\n'
+		printf 'journal_write -r %s %s\n' "$FREE_FIRST" \
+		    "$case_dir/empty"
+		printf 'journal_close\n'
+	} >"$case_dir/debugfs.cmd"
+	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
+	revoke_base=$case_dir/image
+	for length in 0 1 12 15 17 18 19 21 22 23 25 4095 4097 4294967295; do
+		fuzz_reject_word "$revoke_base" "$root_dir" \
+		    "revoke-length-$length" 1 32 12 "$length"
+	done
+	fuzz_reject_word "$revoke_base" "$root_dir" revoke-type-zero \
+	    1 32 4 0
+	fuzz_reject_word "$revoke_base" "$root_dir" revoke-type-max \
+	    1 32 4 4294967295
+
+	# Exercise superblock geometry and feature boundaries without checksums,
+	# so rejection is attributable to field validation rather than CRC.
+	read_be32_journal "$descriptor_base" 0 16
+	journal_maxlen=$JOURNAL_WORD
+	while read name offset value; do
+		fuzz_reject_word "$descriptor_base" "$root_dir" "$name" \
+		    0 32 "$offset" "$value"
+	done <<-EOF
+	super-magic-zero 0 0
+	super-type-v1 4 3
+	geometry-blocksize-zero 12 0
+	geometry-blocksize-small 12 1024
+	geometry-blocksize-large 12 8192
+	geometry-maxlen-zero 16 0
+	geometry-maxlen-one 16 1
+	geometry-maxlen-max 16 4294967295
+	geometry-first-zero 20 0
+	geometry-first-at-end 20 $journal_maxlen
+	geometry-start-zero 28 0
+	geometry-start-at-end 28 $journal_maxlen
+	geometry-start-max 28 4294967295
+	journal-errno-one 32 1
+	feature-compat-unknown 36 1
+	feature-incompat-unknown 40 2147483648
+	feature-csum-v2-v3 40 24
+	feature-ro-compat-unknown 44 1
+	journal-users-zero 64 0
+	journal-users-two 64 2
+	EOF
+}
+
 test_randomized_replay()
 {
 	root_dir=$work/randomized-replay
@@ -971,6 +1168,99 @@ test_randomized_mutations()
 	done
 }
 
+kernel_vnd_attach()
+{
+	kva_image=$1
+	if ! kva_output=$(run_privileged "$VNCONFIG" "$kva_image"); then
+		fail "could not attach vnode disk"
+	fi
+	set -- $kva_output
+	KERNEL_VND=${1:-}
+	case "$KERNEL_VND" in
+	vnd[0-9]*) ;;
+	*)	fail "vnconfig returned an invalid device: $kva_output" ;;
+	esac
+}
+
+kernel_vnd_detach()
+{
+	if [ "$KERNEL_MOUNTED" -eq 1 ]; then
+		run_privileged "$UMOUNT" "$KERNEL_MOUNTPOINT" ||
+		    fail "could not unmount $KERNEL_MOUNTPOINT"
+		KERNEL_MOUNTED=0
+	fi
+	if [ -n "$KERNEL_VND" ]; then
+		run_privileged "$VNCONFIG" -u "$KERNEL_VND" ||
+		    fail "could not detach $KERNEL_VND"
+		KERNEL_VND=
+	fi
+}
+
+test_kernel_mount_corruption()
+{
+	root_dir=$work/kernel-mount-corruption
+	case_dir=$root_dir/base
+	mkdir -p "$case_dir"
+	create_image "$case_dir/image" 4096
+	find_free_blocks "$case_dir/image" 1
+	make_payload "$case_dir/payload" 4096 1 K
+	{
+		printf 'journal_open -c -v 3\n'
+		printf 'journal_write -b %s %s\n' "$FREE_FIRST" \
+		    "$case_dir/payload"
+		printf 'journal_close\n'
+	} >"$case_dir/debugfs.cmd"
+	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
+	cp "$case_dir/image" "$root_dir/valid.img"
+	cp "$case_dir/image" "$root_dir/corrupt.img"
+	flip_journal_byte "$root_dir/corrupt.img" 2 100 1
+
+	# ext4's s_feature_incompat is at byte 96 in the 1024-byte superblock.
+	feature_offset=$((1024 + 96))
+	read_le32_image "$root_dir/corrupt.img" "$feature_offset"
+	[ $((IMAGE_WORD & 4)) -ne 0 ] ||
+	    fail "corrupt fixture does not have RECOVER set"
+
+	KERNEL_MOUNTPOINT=$root_dir/mnt
+	mkdir "$KERNEL_MOUNTPOINT"
+
+	# A valid twin must mount and replay first.  This proves the running
+	# kernel, vnode disk, mount utility, and fixture all exercise ext4fs.
+	kernel_vnd_attach "$root_dir/valid.img"
+	valid_device=/dev/${KERNEL_VND}c
+	if ! run_privileged "$MOUNT_EXT4FS" "$valid_device" \
+	    "$KERNEL_MOUNTPOINT" >"$root_dir/valid-mount.log" 2>&1; then
+		cat "$root_dir/valid-mount.log" >&2
+		fail "kernel rejected the valid journal control"
+	fi
+	KERNEL_MOUNTED=1
+	kernel_vnd_detach
+	read_le32_image "$root_dir/valid.img" "$feature_offset"
+	[ $((IMAGE_WORD & 4)) -eq 0 ] ||
+	    fail "valid kernel replay did not clear RECOVER"
+	case_dir=$root_dir
+	compare_blocks "$root_dir/valid.img" 4096 "$FREE_FIRST" 1 \
+	    "$root_dir/base/payload"
+	verify_e2fsck "$root_dir/valid.img"
+
+	# The corrupted twin must fail mount before making any disk change.
+	before=$(sha256 -q "$root_dir/corrupt.img")
+	kernel_vnd_attach "$root_dir/corrupt.img"
+	corrupt_device=/dev/${KERNEL_VND}c
+	if run_privileged "$MOUNT_EXT4FS" "$corrupt_device" \
+	    "$KERNEL_MOUNTPOINT" >"$root_dir/corrupt-mount.log" 2>&1; then
+		KERNEL_MOUNTED=1
+		fail "kernel mounted an image with a corrupted journal"
+	fi
+	kernel_vnd_detach
+	after=$(sha256 -q "$root_dir/corrupt.img")
+	[ "$before" = "$after" ] ||
+	    fail "failed kernel replay modified the image"
+	read_le32_image "$root_dir/corrupt.img" "$feature_offset"
+	[ $((IMAGE_WORD & 4)) -ne 0 ] ||
+	    fail "failed kernel replay cleared RECOVER"
+}
+
 run_test()
 {
 	test_name=$1
@@ -980,26 +1270,32 @@ run_test()
 	echo ' ok'
 }
 
-echo "random seed: $JOURNAL_SEED"
-run_test 'journal replay without checksums' test_nocsum
-run_test 'journal replay with checksum v2' test_csum_v2
-run_test 'journal replay with checksum v3' test_csum_v3
-run_test 'escaped journal data' test_escape
-run_test 'revoke suppresses an earlier write' test_revoke
-run_test 'later write survives an earlier revoke' test_revoke_then_later_write
-run_test 'deleted descriptor tag' test_deleted_tag
-run_test 'transaction spanning descriptor blocks' test_multi_descriptor
-run_test 'descriptor capacity boundary' test_descriptor_boundary
-run_test 'journal log block wraparound' test_log_wraparound
-run_test 'transaction ID wraparound' test_sequence_wraparound
-run_test 'read-only validation is non-mutating' test_read_only
-run_test 'bad data checksum is non-mutating' test_bad_data_checksum
-run_test 'incomplete transaction is non-mutating' test_incomplete_transaction
-run_test 'validation precedes every home write' test_validation_atomicity
-run_test '1K, 2K, and 4K filesystem blocks' test_block_sizes
-run_test 'malformed descriptor tags and sequences' test_malformed_tags
-run_test 'all journal checksum failure points' test_checksum_failures
-run_test 'malformed revoke lengths' test_malformed_revoke_lengths
-run_test 'malformed journal geometry and features' test_malformed_geometry
-run_test 'seeded replay matrix' test_randomized_replay
-run_test 'seeded checksum mutation sweep' test_randomized_mutations
+if [ "$JOURNAL_TEST_MODE" = all ]; then
+	echo "random seed: $JOURNAL_SEED"
+	run_test 'journal replay without checksums' test_nocsum
+	run_test 'journal replay with checksum v2' test_csum_v2
+	run_test 'journal replay with checksum v3' test_csum_v3
+	run_test 'escaped journal data' test_escape
+	run_test 'revoke suppresses an earlier write' test_revoke
+	run_test 'later write survives an earlier revoke' test_revoke_then_later_write
+	run_test 'deleted descriptor tag' test_deleted_tag
+	run_test 'transaction spanning descriptor blocks' test_multi_descriptor
+	run_test 'descriptor capacity boundary' test_descriptor_boundary
+	run_test 'journal log block wraparound' test_log_wraparound
+	run_test 'transaction ID wraparound' test_sequence_wraparound
+	run_test 'read-only validation is non-mutating' test_read_only
+	run_test 'bad data checksum is non-mutating' test_bad_data_checksum
+	run_test 'incomplete transaction is non-mutating' test_incomplete_transaction
+	run_test 'validation precedes every home write' test_validation_atomicity
+	run_test '1K, 2K, and 4K filesystem blocks' test_block_sizes
+	run_test 'malformed descriptor tags and sequences' test_malformed_tags
+	run_test 'all journal checksum failure points' test_checksum_failures
+	run_test 'malformed revoke lengths' test_malformed_revoke_lengths
+	run_test 'malformed journal geometry and features' test_malformed_geometry
+	run_test 'structured journal field fuzzing' test_structured_field_fuzz
+	run_test 'seeded replay matrix' test_randomized_replay
+	run_test 'seeded checksum mutation sweep' test_randomized_mutations
+else
+	run_test 'kernel mount preserves RECOVER on corruption' \
+	    test_kernel_mount_corruption
+fi
