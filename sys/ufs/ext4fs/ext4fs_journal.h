@@ -14,9 +14,6 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#ifndef _EXT4FS_JOURNAL_H_
-#define _EXT4FS_JOURNAL_H_
-
 /*
  * JBD2 journal on-disk structures.
  * All JBD2 fields are big-endian.
@@ -199,9 +196,19 @@ struct jbd2_replay_ctx {
 	u_int32_t		rc_replay_count;
 };
 
+struct ext4fs_journal_handle;
 struct proc;
 
-int ext4fs_journal_replay(struct vnode *, struct m_ext4fs *, struct proc *);
-int ext4fs_orphan_cleanup(struct mount *);
+int	ext4fs_journal_replay (struct vnode *, struct m_ext4fs *,
+    struct proc *);
 
-#endif /* _EXT4FS_JOURNAL_H_ */
+void	ext4fs_journal_abort (struct mount *, int);
+int	ext4fs_journal_begin (struct mount *, unsigned int,
+    struct ext4fs_journal_handle **);
+int	ext4fs_journal_dirty_metadata (struct ext4fs_journal_handle *,
+    struct buf *);
+int	ext4fs_journal_end (struct ext4fs_journal_handle *);
+int	ext4fs_journal_force_commit (struct mount *);
+int	ext4fs_journal_get_write_access (struct ext4fs_journal_handle *,
+    struct buf *, u_int64_t);
+int	ext4fs_journal_revoke (struct ext4fs_journal_handle *, u_int64_t);

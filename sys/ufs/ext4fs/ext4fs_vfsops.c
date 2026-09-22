@@ -61,6 +61,7 @@
 #include <ufs/ext4fs/ext4fs.h>
 #include <ufs/ext4fs/ext4fs_extern.h>
 #include <ufs/ext4fs/ext4fs_journal.h>
+#include <ufs/ext4fs/ext4fs_orphan.h>
 
 struct pool ext4fs_inode_pool;
 struct pool ext4fs_dinode_pool;
@@ -69,12 +70,6 @@ struct pool ext4fs_dinode_pool;
 	for (i = 0; i < nitems(features); i++)			\
 		if ((mask) & (features)[i].f_mask)		\
 			printf("%s ", (features)[i].f_name)
-
-int	ext4fs_block_group_has_super_block(int);
-int	ext4fs_mountfs(struct vnode *, struct mount *, struct proc *);
-int	ext4fs_sbcheck(struct ext4fs *, int);
-void	ext4fs_sbload(struct ext4fs *, struct m_ext4fs *);
-int	ext4fs_sbfill(struct vnode *, struct m_ext4fs *);
 
 const struct vfsops ext4fs_vfsops = {
 	.vfs_mount	= ext4fs_mount,
@@ -95,7 +90,7 @@ const struct vfsops ext4fs_vfsops = {
 struct pool ext4fs_inode_pool;
 
 int
-ext4fs_block_group_has_super_block(int group)
+ext4fs_block_group_has_super_block (int group)
 {
 	int a3, a5, a7;
 
@@ -110,7 +105,7 @@ ext4fs_block_group_has_super_block(int group)
 }
 
 int
-ext4fs_fhtovp(struct mount *mp, struct fid *fhp, struct vnode **vpp)
+ext4fs_fhtovp (struct mount *mp, struct fid *fhp, struct vnode **vpp)
 {
 	(void)mp;
 	(void)fhp;
@@ -123,7 +118,7 @@ ext4fs_fhtovp(struct mount *mp, struct fid *fhp, struct vnode **vpp)
  * Flush out all the files in a filesystem.
  */
 int
-ext4fs_flushfiles(struct mount *mp, int flags, struct proc *p)
+ext4fs_flushfiles (struct mount *mp, int flags, struct proc *p)
 {
 	struct ufsmount *ump;
 	int error;
@@ -144,7 +139,7 @@ ext4fs_flushfiles(struct mount *mp, int flags, struct proc *p)
 }
 
 int
-ext4fs_init(struct vfsconf *vfsp)
+ext4fs_init (struct vfsconf *vfsp)
 {
 	int result;
 	(void)vfsp;
@@ -159,7 +154,7 @@ ext4fs_init(struct vfsconf *vfsp)
 }
 
 int
-ext4fs_mount(struct mount *mp, const char *path, void *data,
+ext4fs_mount (struct mount *mp, const char *path, void *data,
 	struct nameidata *ndp, struct proc *p)
 {
 	struct ufs_args *args;
@@ -224,7 +219,7 @@ success:
  * Common code for mount and mountroot
  */
 int
-ext4fs_mountfs(struct vnode *devvp, struct mount *mp, struct proc *p)
+ext4fs_mountfs (struct vnode *devvp, struct mount *mp, struct proc *p)
 {
 	struct ufsmount *ump;
 	struct buf *bp;
@@ -433,7 +428,7 @@ out:
 }
 
 int
-ext4fs_sbcheck(struct ext4fs *sble, int ronly)
+ext4fs_sbcheck (struct ext4fs *sble, int ronly)
 {
 	u_int32_t mask, tmp;
 	int i;
@@ -534,7 +529,7 @@ ext4fs_sbcheck(struct ext4fs *sble, int ronly)
 }
 
 int
-ext4fs_sbfill(struct vnode *devvp, struct m_ext4fs *mfs)
+ext4fs_sbfill (struct vnode *devvp, struct m_ext4fs *mfs)
 {
 	struct ext4fs_dinode *rdp;
 	struct buf *bp;
@@ -621,7 +616,7 @@ ext4fs_sbfill(struct vnode *devvp, struct m_ext4fs *mfs)
 }
 
 void
-ext4fs_sbload(struct ext4fs *sble, struct m_ext4fs *dest)
+ext4fs_sbload (struct ext4fs *sble, struct m_ext4fs *dest)
 {
 	int feature_incompat_64bit;
 	feature_incompat_64bit = letoh32(sble->sb_feature_incompat) &
@@ -719,7 +714,7 @@ ext4fs_sbload(struct ext4fs *sble, struct m_ext4fs *dest)
 }
 
 int
-ext4fs_statfs(struct mount *mp, struct statfs *sbp, struct proc *p)
+ext4fs_statfs (struct mount *mp, struct statfs *sbp, struct proc *p)
 {
 	struct ufsmount *ump;
 	struct m_ext4fs *mfs;
@@ -769,7 +764,7 @@ ext4fs_statfs(struct mount *mp, struct statfs *sbp, struct proc *p)
  * Write a block group descriptor back to disk with updated checksum.
  */
 int
-ext4fs_bgd_write(struct m_ext4fs *fs, struct vnode *devvp, u_int32_t group)
+ext4fs_bgd_write (struct m_ext4fs *fs, struct vnode *devvp, u_int32_t group)
 {
 	struct buf *bp;
 	struct ext4fs_block_group_descriptor *gd;
@@ -808,7 +803,7 @@ ext4fs_bgd_write(struct m_ext4fs *fs, struct vnode *devvp, u_int32_t group)
  * Write the superblock to disk with updated counters and checksum.
  */
 int
-ext4fs_sbwrite(struct mount *mp)
+ext4fs_sbwrite (struct mount *mp)
 {
 	struct ufsmount *ump = VFSTOUFS(mp);
 	struct m_ext4fs *fs = ump->um_e4fs;
@@ -851,7 +846,7 @@ static u_long ext4fs_gennumber;
  * Allocate an inode in the file system.
  */
 int
-ext4fs_inode_alloc(struct inode *pip, mode_t mode, struct ucred *cred,
+ext4fs_inode_alloc (struct inode *pip, mode_t mode, struct ucred *cred,
     struct vnode **vpp)
 {
 	struct m_ext4fs *fs = pip->i_e4fs;
@@ -1080,7 +1075,7 @@ ext4fs_inode_alloc(struct inode *pip, mode_t mode, struct ucred *cred,
  * Free an inode.
  */
 void
-ext4fs_inode_free(struct inode *pip, ufsino_t ino, mode_t mode)
+ext4fs_inode_free (struct inode *pip, ufsino_t ino, mode_t mode)
 {
 	struct m_ext4fs *fs = pip->i_e4fs;
 	struct ext4fs_block_group_descriptor *gd;
@@ -1155,7 +1150,7 @@ ext4fs_inode_free(struct inode *pip, ufsino_t ino, mode_t mode)
 }
 
 static int
-ext4fs_sync_vnode(struct vnode *vp, void *arg)
+ext4fs_sync_vnode (struct vnode *vp, void *arg)
 {
 	struct ext4fs_sync_args *esa = arg;
 	struct inode *ip;
@@ -1188,7 +1183,7 @@ ext4fs_sync_vnode(struct vnode *vp, void *arg)
 }
 
 int
-ext4fs_sync(struct mount *mp, int waitfor, int stall,
+ext4fs_sync (struct mount *mp, int waitfor, int stall,
     struct ucred *cred, struct proc *p)
 {
 	struct ufsmount *ump = VFSTOUFS(mp);
@@ -1223,7 +1218,7 @@ ext4fs_sync(struct mount *mp, int waitfor, int stall,
 }
 
 int
-ext4fs_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
+ext4fs_sysctl (int *name, u_int namelen, void *oldp, size_t *oldlenp,
     void *newp, size_t newlen, struct proc *p)
 {
 	(void)name;
@@ -1238,7 +1233,7 @@ ext4fs_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 }
 
 int
-ext4fs_unmount(struct mount *mp, int mntflags, struct proc *p)
+ext4fs_unmount (struct mount *mp, int mntflags, struct proc *p)
 {
 	struct ufsmount *ump;
 	struct m_ext4fs *mfs;
@@ -1276,7 +1271,7 @@ ext4fs_unmount(struct mount *mp, int mntflags, struct proc *p)
 }
 
 int
-ext4fs_vget(struct mount *mp, ino_t ino, struct vnode **vpp)
+ext4fs_vget (struct mount *mp, ino_t ino, struct vnode **vpp)
 {
 	struct m_ext4fs *fs;
 	struct inode *ip;
@@ -1472,7 +1467,7 @@ ext4fs_vget(struct mount *mp, ino_t ino, struct vnode **vpp)
 }
 
 int
-ext4fs_vptofh(struct vnode *vp, struct fid *fhp)
+ext4fs_vptofh (struct vnode *vp, struct fid *fhp)
 {
 	(void)vp;
 	(void)fhp;
