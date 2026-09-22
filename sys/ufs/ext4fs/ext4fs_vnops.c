@@ -81,7 +81,7 @@ static const u_int8_t ext4fs_type_to_dt[EXT4FS_FT_MAX] = {
  * Returns 0 on success with the physical block stored in *pblk.
  */
 static int
-ext4fs_extent_pblk(struct inode *ip, u_int64_t lbn, u_int64_t *pblk,
+ext4fs_extent_pblk (struct inode *ip, u_int64_t lbn, u_int64_t *pblk,
     u_int64_t *ncontig)
 {
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
@@ -184,7 +184,7 @@ ext4fs_extent_pblk(struct inode *ip, u_int64_t lbn, u_int64_t *pblk,
  * Write inode back to disk with checksum update.
  */
 int
-ext4fs_update(struct inode *ip, int waitfor)
+ext4fs_update (struct inode *ip, int waitfor)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct buf *bp;
@@ -272,7 +272,7 @@ ext4fs_update(struct inode *ip, int waitfor)
  * Set inode size (both low and high 32-bit fields).
  */
 void
-ext4fs_setsize(struct inode *ip, u_int64_t size)
+ext4fs_setsize (struct inode *ip, u_int64_t size)
 {
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
 
@@ -285,7 +285,7 @@ ext4fs_setsize(struct inode *ip, u_int64_t size)
  * Tries the group of the goal block first, then scans all groups.
  */
 int
-ext4fs_blkalloc(struct inode *ip, u_int64_t goal, u_int32_t count,
+ext4fs_blkalloc (struct inode *ip, u_int64_t goal, u_int32_t count,
     u_int64_t *bnp, u_int32_t *countp)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
@@ -521,7 +521,7 @@ ext4fs_blkalloc(struct inode *ip, u_int64_t goal, u_int32_t count,
  * Free a filesystem block.
  */
 void
-ext4fs_blkfree(struct inode *ip, u_int64_t bno)
+ext4fs_blkfree (struct inode *ip, u_int64_t bno)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_block_group_descriptor *gd;
@@ -599,7 +599,7 @@ ext4fs_blkfree(struct inode *ip, u_int64_t bno)
  * and converts the inode root to an index node with one entry.
  */
 static int
-ext4fs_extent_grow_tree(struct inode *ip)
+ext4fs_extent_grow_tree (struct inode *ip)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
@@ -679,7 +679,7 @@ ext4fs_extent_grow_tree(struct inode *ip)
  * Returns ENOSPC if the parent index is also full (depth 2+ needed).
  */
 static int
-ext4fs_leaf_split(struct inode *ip, struct buf *old_bp,
+ext4fs_leaf_split (struct inode *ip, struct buf *old_bp,
     struct ext4fs_extent_header *old_eh)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
@@ -790,7 +790,7 @@ ext4fs_leaf_split(struct inode *ip, struct buf *old_bp,
  * inserts if room, splits leaf if full.
  */
 static int
-ext4fs_extent_insert_depth(struct inode *ip, u_int32_t lbn, u_int64_t pblk,
+ext4fs_extent_insert_depth (struct inode *ip, u_int32_t lbn, u_int64_t pblk,
     u_int16_t len)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
@@ -898,7 +898,7 @@ ext4fs_extent_insert_depth(struct inode *ip, u_int32_t lbn, u_int64_t pblk,
  * Tries to merge with the last extent if contiguous.
  */
 static int
-ext4fs_extent_insert(struct inode *ip, u_int32_t lbn, u_int64_t pblk,
+ext4fs_extent_insert (struct inode *ip, u_int32_t lbn, u_int64_t pblk,
     u_int16_t len)
 {
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
@@ -976,7 +976,7 @@ ext4fs_extent_insert(struct inode *ip, u_int32_t lbn, u_int64_t pblk,
  * Otherwise, allocate a new physical block and insert extent.
  */
 static int
-ext4fs_buf_alloc(struct inode *ip, u_int64_t lbn, int size,
+ext4fs_buf_alloc (struct inode *ip, u_int64_t lbn, int size,
     struct ucred *cred, struct buf **bpp, int flags)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
@@ -1081,7 +1081,7 @@ ext4fs_buf_alloc(struct inode *ip, u_int64_t lbn, int size,
  * Batches frees by block group for efficiency.
  */
 static void
-ext4fs_free_extents(struct inode *ip, struct ext4fs_extent *ext,
+ext4fs_free_extents (struct inode *ip, struct ext4fs_extent *ext,
     u_int16_t entries)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
@@ -1186,7 +1186,7 @@ ext4fs_free_extents(struct inode *ip, struct ext4fs_extent *ext,
  * Returns number of filesystem blocks freed.
  */
 static u_int64_t
-ext4fs_trim_extents(struct inode *ip, struct ext4fs_extent *ext,
+ext4fs_trim_extents (struct inode *ip, struct ext4fs_extent *ext,
     u_int16_t *entries_p, u_int32_t new_nblocks)
 {
 	u_int16_t entries = *entries_p;
@@ -1253,7 +1253,7 @@ ext4fs_trim_extents(struct inode *ip, struct ext4fs_extent *ext,
  * Supports both depth-0 (inline) and depth > 0 (tree) extent trees.
  */
 int
-ext4fs_truncate(struct inode *ip, off_t length, int flags, struct ucred *cred)
+ext4fs_truncate (struct inode *ip, off_t length, int flags, struct ucred *cred)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
@@ -1480,33 +1480,33 @@ ext4fs_truncate(struct inode *ip, off_t length, int flags, struct ucred *cred)
 
 /* Forward declarations */
 
-int ext4fs_access(void *);
-int ext4fs_advlock(void *);
-int ext4fs_bmap(void *);
-int ext4fs_chmod(struct vnode *, mode_t, struct ucred *);
-int ext4fs_chown(struct vnode *, uid_t, gid_t, struct ucred *);
-int ext4fs_create(void *);
-int ext4fs_fsync(void *);
-int ext4fs_getattr(void *);
-int ext4fs_inactive(void *);
-int ext4fs_link(void *);
-int ext4fs_lookup(void *);
-int ext4fs_mkdir(void *);
-int ext4fs_mknod(void *);
-int ext4fs_open(void *);
-int ext4fs_pathconf(void *);
-int ext4fs_print(void *);
-int ext4fs_read(void *);
-int ext4fs_readdir(void *);
-int ext4fs_readlink(void *);
-int ext4fs_reclaim(void *);
-int ext4fs_remove(void *);
-int ext4fs_rename(void *);
-int ext4fs_rmdir(void *);
-int ext4fs_setattr(void *);
-int ext4fs_strategy(void *);
-int ext4fs_symlink(void *);
-int ext4fs_write(void *);
+int ext4fs_access (void *);
+int ext4fs_advlock (void *);
+int ext4fs_bmap (void *);
+int ext4fs_chmod (struct vnode *, mode_t, struct ucred *);
+int ext4fs_chown (struct vnode *, uid_t, gid_t, struct ucred *);
+int ext4fs_create (void *);
+int ext4fs_fsync (void *);
+int ext4fs_getattr (void *);
+int ext4fs_inactive (void *);
+int ext4fs_link (void *);
+int ext4fs_lookup (void *);
+int ext4fs_mkdir (void *);
+int ext4fs_mknod (void *);
+int ext4fs_open (void *);
+int ext4fs_pathconf (void *);
+int ext4fs_print (void *);
+int ext4fs_read (void *);
+int ext4fs_readdir (void *);
+int ext4fs_readlink (void *);
+int ext4fs_reclaim (void *);
+int ext4fs_remove (void *);
+int ext4fs_rename (void *);
+int ext4fs_rmdir (void *);
+int ext4fs_setattr (void *);
+int ext4fs_strategy (void *);
+int ext4fs_symlink (void *);
+int ext4fs_write (void *);
 
 const struct vops ext4fs_vops = {
 	.vop_lookup	= ext4fs_lookup,
@@ -1547,7 +1547,7 @@ const struct vops ext4fs_vops = {
 /* Stub implementations */
 
 int
-ext4fs_lookup(void *v)
+ext4fs_lookup (void *v)
 {
 	struct vop_lookup_args *ap = v;
 	struct vnode *vdp = ap->a_dvp;
@@ -1798,7 +1798,7 @@ found:
  * Common code to create a new inode and enter it in a directory.
  */
 static int
-ext4fs_makeinode(int mode, struct vnode *dvp, struct vnode **vpp,
+ext4fs_makeinode (int mode, struct vnode *dvp, struct vnode **vpp,
     struct componentname *cnp)
 {
 	struct inode *ip, *pdir;
@@ -1867,7 +1867,7 @@ bad:
 }
 
 int
-ext4fs_create(void *v)
+ext4fs_create (void *v)
 {
 	struct vop_create_args *ap = v;
 	return (ext4fs_makeinode(
@@ -1876,7 +1876,7 @@ ext4fs_create(void *v)
 }
 
 int
-ext4fs_mknod(void *v)
+ext4fs_mknod (void *v)
 {
 	struct vop_mknod_args *ap = v;
 	struct vnode **vpp = ap->a_vpp;
@@ -1909,7 +1909,7 @@ ext4fs_mknod(void *v)
 }
 
 int
-ext4fs_open(void *v)
+ext4fs_open (void *v)
 {
 	struct vop_open_args *ap = v;
 	struct inode *ip = VTOI(ap->a_vp);
@@ -1928,7 +1928,7 @@ ext4fs_open(void *v)
 }
 
 int
-ext4fs_access(void *v)
+ext4fs_access (void *v)
 {
 	struct vop_access_args *ap = v;
 	struct vnode *vp = ap->a_vp;
@@ -1954,7 +1954,7 @@ ext4fs_access(void *v)
 }
 
 int
-ext4fs_getattr(void *v)
+ext4fs_getattr (void *v)
 {
 	struct vop_getattr_args *ap = v;
 	struct vnode *vp = ap->a_vp;
@@ -2005,7 +2005,7 @@ ext4fs_getattr(void *v)
 }
 
 int
-ext4fs_chmod(struct vnode *vp, mode_t mode, struct ucred *cred)
+ext4fs_chmod (struct vnode *vp, mode_t mode, struct ucred *cred)
 {
 	struct inode *ip = VTOI(vp);
 
@@ -2042,7 +2042,7 @@ ext4fs_chmod(struct vnode *vp, mode_t mode, struct ucred *cred)
 }
 
 int
-ext4fs_chown(struct vnode *vp, uid_t uid, gid_t gid, struct ucred *cred)
+ext4fs_chown (struct vnode *vp, uid_t uid, gid_t gid, struct ucred *cred)
 {
 	struct inode *ip = VTOI(vp);
 
@@ -2089,7 +2089,7 @@ ext4fs_chown(struct vnode *vp, uid_t uid, gid_t gid, struct ucred *cred)
 }
 
 int
-ext4fs_setattr(void *v)
+ext4fs_setattr (void *v)
 {
 	struct vop_setattr_args *ap = v;
 	struct vattr *vap = ap->a_vap;
@@ -2195,7 +2195,7 @@ ext4fs_setattr(void *v)
 }
 
 int
-ext4fs_read(void *v)
+ext4fs_read (void *v)
 {
 	struct vop_read_args *ap = v;
 	struct vnode *vp = ap->a_vp;
@@ -2274,7 +2274,7 @@ ext4fs_read(void *v)
 }
 
 int
-ext4fs_write(void *v)
+ext4fs_write (void *v)
 {
 	struct vop_write_args *ap = v;
 	struct vnode *vp = ap->a_vp;
@@ -2449,7 +2449,7 @@ do_io:
 }
 
 int
-ext4fs_fsync(void *v)
+ext4fs_fsync (void *v)
 {
 	struct vop_fsync_args *ap = v;
 	struct vnode *vp = ap->a_vp;
@@ -2463,7 +2463,7 @@ ext4fs_fsync(void *v)
 }
 
 int
-ext4fs_remove(void *v)
+ext4fs_remove (void *v)
 {
 	struct vop_remove_args *ap = v;
 	struct vnode *vp = ap->a_vp;
@@ -2501,7 +2501,7 @@ out:
 }
 
 int
-ext4fs_link(void *v)
+ext4fs_link (void *v)
 {
 	struct vop_link_args *ap = v;
 	struct vnode *dvp = ap->a_dvp;
@@ -2560,7 +2560,7 @@ out2:
  * target vnode must be locked on entry and will be vput on exit.
  */
 static int
-ext4fs_checkpath(struct inode *source, struct inode *target, struct ucred *cred)
+ext4fs_checkpath (struct inode *source, struct inode *target, struct ucred *cred)
 {
 	struct vnode *vp;
 	struct m_ext4fs *fs = source->i_e4fs;
@@ -2638,7 +2638,7 @@ out:
 }
 
 int
-ext4fs_rename(void *v)
+ext4fs_rename (void *v)
 {
 	struct vop_rename_args *ap = v;
 	struct vnode *tvp = ap->a_tvp;
@@ -2938,7 +2938,7 @@ out:
 }
 
 int
-ext4fs_mkdir(void *v)
+ext4fs_mkdir (void *v)
 {
 	struct vop_mkdir_args *ap = v;
 	struct vnode *dvp = ap->a_dvp;
@@ -3066,7 +3066,7 @@ out:
 }
 
 int
-ext4fs_rmdir(void *v)
+ext4fs_rmdir (void *v)
 {
 	struct vop_rmdir_args *ap = v;
 	struct vnode *vp = ap->a_vp;
@@ -3119,7 +3119,7 @@ out:
 }
 
 int
-ext4fs_symlink(void *v)
+ext4fs_symlink (void *v)
 {
 	struct vop_symlink_args *ap = v;
 	struct vnode *dvp = ap->a_dvp;
@@ -3170,7 +3170,7 @@ ext4fs_symlink(void *v)
 }
 
 int
-ext4fs_readdir(void *v)
+ext4fs_readdir (void *v)
 {
 	struct vop_readdir_args *ap = v;
 	struct uio *uio = ap->a_uio;
@@ -3280,7 +3280,7 @@ done:
 }
 
 int
-ext4fs_readlink(void *v)
+ext4fs_readlink (void *v)
 {
 	struct vop_readlink_args *ap = v;
 	struct vnode *vp = ap->a_vp;
@@ -3306,7 +3306,7 @@ ext4fs_readlink(void *v)
  * Enter a directory entry for inode ip into directory dvp.
  */
 int
-ext4fs_direnter(struct inode *ip, struct vnode *dvp,
+ext4fs_direnter (struct inode *ip, struct vnode *dvp,
     struct componentname *cnp)
 {
 	struct inode *dp = VTOI(dvp);
@@ -3444,7 +3444,7 @@ ext4fs_direnter(struct inode *ip, struct vnode *dvp,
  * Remove a directory entry.
  */
 int
-ext4fs_dirremove(struct vnode *dvp, struct componentname *cnp)
+ext4fs_dirremove (struct vnode *dvp, struct componentname *cnp)
 {
 	struct inode *dp = VTOI(dvp);
 	struct m_ext4fs *fs = dp->i_e4fs;
@@ -3493,7 +3493,7 @@ ext4fs_dirremove(struct vnode *dvp, struct componentname *cnp)
  * Check if a directory is empty (contains only "." and "..").
  */
 int
-ext4fs_dirempty(struct inode *ip, ufsino_t parentino, struct ucred *cred)
+ext4fs_dirempty (struct inode *ip, ufsino_t parentino, struct ucred *cred)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
@@ -3568,7 +3568,7 @@ ext4fs_dirempty(struct inode *ip, ufsino_t parentino, struct ucred *cred)
  * Rewrite an existing directory entry to point to a new inode.
  */
 int
-ext4fs_dirrewrite(struct inode *dp, struct inode *ip,
+ext4fs_dirrewrite (struct inode *dp, struct inode *ip,
     struct componentname *cnp)
 {
 	struct m_ext4fs *fs = dp->i_e4fs;
@@ -3606,7 +3606,7 @@ ext4fs_dirrewrite(struct inode *dp, struct inode *ip,
 }
 
 int
-ext4fs_inactive(void *v)
+ext4fs_inactive (void *v)
 {
 	struct vop_inactive_args *ap = v;
 	struct vnode *vp = ap->a_vp;
@@ -3681,7 +3681,7 @@ out:
 }
 
 int
-ext4fs_reclaim(void *v)
+ext4fs_reclaim (void *v)
 {
 	struct vop_reclaim_args *ap = v;
 	struct vnode *vp = ap->a_vp;
@@ -3702,7 +3702,7 @@ ext4fs_reclaim(void *v)
 }
 
 int
-ext4fs_bmap(void *v)
+ext4fs_bmap (void *v)
 {
 	struct vop_bmap_args *ap = v;
 	struct inode *ip = VTOI(ap->a_vp);
@@ -3742,7 +3742,7 @@ ext4fs_bmap(void *v)
 }
 
 int
-ext4fs_strategy(void *v)
+ext4fs_strategy (void *v)
 {
 	struct vop_strategy_args *ap = v;
 	struct buf *bp = ap->a_bp;
@@ -3782,7 +3782,7 @@ ext4fs_strategy(void *v)
 }
 
 int
-ext4fs_print(void *v)
+ext4fs_print (void *v)
 {
 	struct vop_print_args *ap = v;
 	struct inode *ip = VTOI(ap->a_vp);
@@ -3796,7 +3796,7 @@ ext4fs_print(void *v)
 }
 
 int
-ext4fs_pathconf(void *v)
+ext4fs_pathconf (void *v)
 {
 	struct vop_pathconf_args *ap = v;
 
@@ -3830,7 +3830,7 @@ ext4fs_pathconf(void *v)
 }
 
 int
-ext4fs_advlock(void *v)
+ext4fs_advlock (void *v)
 {
 	struct vop_advlock_args *ap = v;
 	struct inode *ip = VTOI(ap->a_vp);

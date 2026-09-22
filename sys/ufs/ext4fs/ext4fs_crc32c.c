@@ -30,7 +30,7 @@
  * superblock. Otherwise, compute it from the filesystem UUID.
  */
 u_int32_t
-ext4fs_csum_seed(struct m_ext4fs *fs)
+ext4fs_csum_seed (struct m_ext4fs *fs)
 {
 	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_CSUM_SEED)
 		return ~fs->m_checksum_seed;
@@ -48,7 +48,7 @@ ext4fs_csum_seed(struct m_ext4fs *fs)
  * during computation.
  */
 u_int32_t
-ext4fs_sb_csum(struct ext4fs *sb)
+ext4fs_sb_csum (struct ext4fs *sb)
 {
 	u_int32_t crc;
 	size_t offset;
@@ -70,7 +70,7 @@ ext4fs_sb_csum(struct ext4fs *sb)
  * The block_group_id is always chained into the CRC (after the seed).
  */
 u_int16_t
-ext4fs_bgd_csum(struct m_ext4fs *fs,
+ext4fs_bgd_csum (struct m_ext4fs *fs,
     struct ext4fs_block_group_descriptor *bgd, u_int32_t block_group_id)
 {
 	u_int32_t crc;
@@ -108,7 +108,7 @@ ext4fs_bgd_csum(struct m_ext4fs *fs,
  * Returns 0 if the checksum is valid, or EINVAL if it doesn't match.
  */
 int
-ext4fs_bgd_csum_verify(struct m_ext4fs *fs,
+ext4fs_bgd_csum_verify (struct m_ext4fs *fs,
     struct ext4fs_block_group_descriptor *bgd, u_int32_t block_group_id)
 {
 	u_int16_t provided, calculated;
@@ -137,7 +137,7 @@ ext4fs_bgd_csum_verify(struct m_ext4fs *fs,
  * 256-byte inode with checksum fields zeroed.
  */
 u_int32_t
-ext4fs_inode_csum(struct m_ext4fs *fs,
+ext4fs_inode_csum (struct m_ext4fs *fs,
     struct ext4fs_dinode_256 *dp, u_int32_t ino)
 {
 	u_int32_t crc;
@@ -171,7 +171,7 @@ ext4fs_inode_csum(struct m_ext4fs *fs,
  * Returns 0 if the checksum is valid, or EINVAL if it doesn't match.
  */
 int
-ext4fs_inode_csum_verify(struct m_ext4fs *fs,
+ext4fs_inode_csum_verify (struct m_ext4fs *fs,
     struct ext4fs_dinode_256 *dp, u_int32_t ino)
 {
 	u_int32_t provided, calculated;
@@ -196,7 +196,7 @@ ext4fs_inode_csum_verify(struct m_ext4fs *fs,
 }
 
 u_int32_t
-ext4fs_bitmap_csum(struct m_ext4fs *fs, u_int32_t group,
+ext4fs_bitmap_csum (struct m_ext4fs *fs, u_int32_t group,
     void *bitmap, size_t size)
 {
 	u_int32_t crc, seed;
@@ -218,7 +218,7 @@ ext4fs_bitmap_csum(struct m_ext4fs *fs, u_int32_t group,
  * Checksum covers: UUID seed, inode number, inode generation, block data.
  */
 void
-ext4fs_dir_set_csum(struct m_ext4fs *fs, u_int32_t ino, u_int32_t gen_le,
+ext4fs_dir_set_csum (struct m_ext4fs *fs, u_int32_t ino, u_int32_t gen_le,
     void *buf)
 {
 	struct ext4fs_directory_tail *tail;
@@ -251,7 +251,7 @@ ext4fs_dir_set_csum(struct m_ext4fs *fs, u_int32_t ino, u_int32_t gen_le,
  * If metadata checksums are not enabled, always returns 0.
  */
 int
-ext4fs_sb_csum_verify(struct ext4fs *sb)
+ext4fs_sb_csum_verify (struct ext4fs *sb)
 {
 	u_int32_t provided, calculated;
 
@@ -281,7 +281,7 @@ ext4fs_sb_csum_verify(struct ext4fs *sb)
  * then the block data up to and including the zeroed tail.
  */
 void
-ext4fs_extent_block_csum_set(struct m_ext4fs *fs, u_int32_t ino,
+ext4fs_extent_block_csum_set (struct m_ext4fs *fs, u_int32_t ino,
     u_int32_t gen_le, void *buf)
 {
 	u_int32_t crc, seed, ino_le;

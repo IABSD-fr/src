@@ -17,7 +17,7 @@ locations directly through `bwrite()`, `bdwrite()`, and `bawrite()`.
 Recovery hardening is in progress and must be completed before this reader is
 used as the recovery side of a journal writer.
 
-### Phase 1 implementation status (2026-09-21)
+### Phase 1 implementation status (2026-09-22)
 
 The kernel and `fsck_ext4fs` recovery implementations now compile from the
 same documented JBD2 format definitions. Recovery uses a validation pass before
@@ -28,9 +28,9 @@ Journal-target and revoke membership use bounded hash tables, and physically
 aliased journal extents are rejected.
 
 Disposable images generated with e2fsprogs have been replayed successfully for
-no-checksum, checksum-v2, and checksum-v3 journals. The resulting home block
-matched the journal payload and `e2fsck -fn` accepted each recovered image.
-Read-only validation rejected replay without changing the image hash.
+no-checksum, single-tag checksum-v2, and checksum-v3 journals. The resulting
+home block matched the journal payload and `e2fsck -fn` accepted each recovered
+image. Read-only validation rejected replay without changing the image hash.
 
 The automated `fsck_ext4fs` regression suite now covers checksum formats,
 descriptor boundaries, deleted tags, revoke ordering, log and transaction-ID
@@ -75,11 +75,19 @@ Phase 1 is not complete. The remaining release blockers are:
       flushes have succeeded.
 - [x] Apply the same recovery rules to `fsck_ext4fs`, preferably through shared
       format/parsing helpers where kernel/userland boundaries permit it.
+- [ ] Define and implement restartable handling when `RECOVER` is set but the
+      journal superblock has `s_start == 0`.
+- [ ] Accept e2fsprogs checksum-v2 descriptor blocks containing multiple tags.
+- [ ] Implement safe, restartable recovery of the classic orphan list and the
+      orphan file, persisting recovery progress before clearing either orphan
+      root or `ORPHAN_PRESENT`.
 
 ### Phase 1 tests
 
-- [x] Replay e2fsprogs-generated journals using no checksum, checksum v2, and
-      checksum v3 formats.
+- [x] Replay e2fsprogs-generated journals using no checksum, single-tag
+      checksum v2, and checksum v3 formats.
+- [ ] Replay an e2fsprogs-generated checksum-v2 descriptor containing multiple
+      tags.
 - [x] Cover escaped data and a committed revoke-only transaction that
       suppresses an earlier logged home-block write.
 - [x] Replay a checksum-v3 transaction spanning multiple descriptor blocks.
@@ -98,6 +106,11 @@ Phase 1 is not complete. The remaining release blockers are:
 - [x] Verify corrupted journals fail the mount without clearing `RECOVER`.
       The root-only `run-regress-journal-mount` target checks a valid replay
       control, byte-for-byte failure atomicity, and preservation of `RECOVER`.
+- [ ] Exercise every userland recovery fixture through the kernel mount path.
+- [ ] Test `RECOVER` with `s_start == 0`, including failures injected before
+      and after each durability boundary, and prove that retry is idempotent.
+- [ ] Run the kernel-mount recovery matrix and injected-power-loss tests in an
+      IABSD VM.
 
 ## Phase 2: Introduce the runtime journal core
 

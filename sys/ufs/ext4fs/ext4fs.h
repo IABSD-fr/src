@@ -42,6 +42,7 @@
 #include <ufs/ext4fs/ext4fs_crc32c.h>
 
 struct fid;
+struct componentname;
 struct inode;
 struct nameidata;
 struct statfs;
@@ -566,60 +567,60 @@ extern struct pool ext4fs_inode_pool;
 extern struct pool ext4fs_dinode_pool;
 
 /* VFS operations */
-int ext4fs_fhtovp(struct mount *, struct fid *, struct vnode **);
-int ext4fs_init(struct vfsconf *);
-int ext4fs_mount(struct mount *, const char *, void *,
+int ext4fs_fhtovp (struct mount *, struct fid *, struct vnode **);
+int ext4fs_init (struct vfsconf *);
+int ext4fs_mount (struct mount *, const char *, void *,
 	struct nameidata *, struct proc *);
-int ext4fs_statfs(struct mount *, struct statfs *, struct proc *);
-int ext4fs_sync(struct mount *, int, int, struct ucred *,
+int ext4fs_statfs (struct mount *, struct statfs *, struct proc *);
+int ext4fs_sync (struct mount *, int, int, struct ucred *,
 	struct proc *);
-int ext4fs_sysctl(int *, u_int, void *, size_t *, void *, size_t,
+int ext4fs_sysctl (int *, u_int, void *, size_t *, void *, size_t,
 	struct proc *);
-int ext4fs_unmount(struct mount *, int, struct proc *);
-int ext4fs_vget(struct mount *, ino_t, struct vnode **);
-int ext4fs_vptofh(struct vnode *, struct fid *);
+int ext4fs_unmount (struct mount *, int, struct proc *);
+int ext4fs_vget (struct mount *, ino_t, struct vnode **);
+int ext4fs_vptofh (struct vnode *, struct fid *);
 
 /* VNode operations */
 
-int ext4fs_lookup(void *);
-int ext4fs_create(void *);
-int ext4fs_mknod(void *);
-int ext4fs_open(void *);
-int ext4fs_access(void *);
-int ext4fs_getattr(void *);
-int ext4fs_setattr(void *);
-int ext4fs_read(void *);
-int ext4fs_write(void *);
-int ext4fs_fsync(void *);
-int ext4fs_remove(void *);
-int ext4fs_link(void *);
-int ext4fs_rename(void *);
-int ext4fs_mkdir(void *);
-int ext4fs_rmdir(void *);
-int ext4fs_symlink(void *);
-int ext4fs_readdir(void *);
-int ext4fs_readlink(void *);
-int ext4fs_inactive(void *);
-int ext4fs_reclaim(void *);
-int ext4fs_bmap(void *);
-int ext4fs_strategy(void *);
-int ext4fs_print(void *);
-int ext4fs_pathconf(void *);
-int ext4fs_advlock(void *);
+int ext4fs_lookup (void *);
+int ext4fs_create (void *);
+int ext4fs_mknod (void *);
+int ext4fs_open (void *);
+int ext4fs_access (void *);
+int ext4fs_getattr (void *);
+int ext4fs_setattr (void *);
+int ext4fs_read (void *);
+int ext4fs_write (void *);
+int ext4fs_fsync (void *);
+int ext4fs_remove (void *);
+int ext4fs_link (void *);
+int ext4fs_rename (void *);
+int ext4fs_mkdir (void *);
+int ext4fs_rmdir (void *);
+int ext4fs_symlink (void *);
+int ext4fs_readdir (void *);
+int ext4fs_readlink (void *);
+int ext4fs_inactive (void *);
+int ext4fs_reclaim (void *);
+int ext4fs_bmap (void *);
+int ext4fs_strategy (void *);
+int ext4fs_print (void *);
+int ext4fs_pathconf (void *);
+int ext4fs_advlock (void *);
 
-int ext4fs_update(struct inode *, int);
+int ext4fs_update (struct inode *, int);
 
-u_int32_t ext4fs_sb_csum(struct ext4fs *);
-int ext4fs_sb_csum_verify(struct ext4fs *);
-u_int32_t ext4fs_csum_seed(struct m_ext4fs *);
-u_int32_t ext4fs_bitmap_csum(struct m_ext4fs *, u_int32_t, void *, size_t);
-u_int16_t ext4fs_bgd_csum(struct m_ext4fs *,
+u_int32_t ext4fs_sb_csum (struct ext4fs *);
+int ext4fs_sb_csum_verify (struct ext4fs *);
+u_int32_t ext4fs_csum_seed (struct m_ext4fs *);
+u_int32_t ext4fs_bitmap_csum (struct m_ext4fs *, u_int32_t, void *, size_t);
+u_int16_t ext4fs_bgd_csum (struct m_ext4fs *,
 	struct ext4fs_block_group_descriptor *, u_int32_t);
-int ext4fs_bgd_csum_verify(struct m_ext4fs *,
+int ext4fs_bgd_csum_verify (struct m_ext4fs *,
 	struct ext4fs_block_group_descriptor *, u_int32_t);
-u_int32_t ext4fs_inode_csum(struct m_ext4fs *,
+u_int32_t ext4fs_inode_csum (struct m_ext4fs *,
 	struct ext4fs_dinode_256 *, u_int32_t);
-int ext4fs_inode_csum_verify(struct m_ext4fs *,
+int ext4fs_inode_csum_verify (struct m_ext4fs *,
 	struct ext4fs_dinode_256 *, u_int32_t);
 
 /* Directory entry size: 8 bytes header + name, rounded up to 4 */
@@ -627,7 +628,7 @@ int ext4fs_inode_csum_verify(struct m_ext4fs *,
 
 /* Convert inode mode to directory file type */
 static inline u_int8_t
-ext4fs_mode_to_ft(u_int16_t mode)
+ext4fs_mode_to_ft (u_int16_t mode)
 {
 	switch (mode & S_IFMT) {
 	case S_IFREG:	return EXT4FS_FT_REG_FILE;
@@ -642,29 +643,36 @@ ext4fs_mode_to_ft(u_int16_t mode)
 }
 
 /* Block allocation / free */
-int ext4fs_blkalloc(struct inode *, u_int64_t, u_int32_t, u_int64_t *,
+int ext4fs_blkalloc (struct inode *, u_int64_t, u_int32_t, u_int64_t *,
     u_int32_t *);
-void ext4fs_blkfree(struct inode *, u_int64_t);
+void ext4fs_blkfree (struct inode *, u_int64_t);
 
 /* Inode allocation / free */
-int ext4fs_inode_alloc(struct inode *, mode_t, struct ucred *,
+int ext4fs_inode_alloc (struct inode *, mode_t, struct ucred *,
 	struct vnode **);
-void ext4fs_inode_free(struct inode *, ufsino_t, mode_t);
+void ext4fs_inode_free (struct inode *, ufsino_t, mode_t);
 
 /* Directory operations */
-int ext4fs_direnter(struct inode *, struct vnode *,
+int ext4fs_direnter (struct inode *, struct vnode *,
 	struct componentname *);
-int ext4fs_dirremove(struct vnode *, struct componentname *);
-int ext4fs_dirempty(struct inode *, ufsino_t, struct ucred *);
-int ext4fs_dirrewrite(struct inode *, struct inode *,
+int ext4fs_dirremove (struct vnode *, struct componentname *);
+int ext4fs_dirempty (struct inode *, ufsino_t, struct ucred *);
+int ext4fs_dirrewrite (struct inode *, struct inode *,
 	struct componentname *);
 
 /* Truncation */
-int ext4fs_truncate(struct inode *, off_t, int, struct ucred *);
+int ext4fs_truncate (struct inode *, off_t, int, struct ucred *);
 
 /* Size update */
-void ext4fs_setsize(struct inode *, u_int64_t);
+void	ext4fs_setsize (struct inode *, u_int64_t);
 
-/* Superblock / BGD write-back */
-int ext4fs_bgd_write(struct m_ext4fs *, struct vnode *, u_int32_t);
-int ext4fs_sbwrite(struct mount *);
+/* Superblock */
+int	ext4fs_sbcheck (struct ext4fs *, int);
+int	ext4fs_block_group_has_super_block (int);
+int	ext4fs_mountfs (struct vnode *, struct mount *, struct proc *);
+void	ext4fs_sbload (struct ext4fs *, struct m_ext4fs *);
+int	ext4fs_sbfill (struct vnode *, struct m_ext4fs *);
+
+/* Writes */
+int	ext4fs_bgd_write (struct m_ext4fs *, struct vnode *, u_int32_t);
+int	ext4fs_sbwrite (struct mount *);
