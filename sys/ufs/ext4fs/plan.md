@@ -94,8 +94,11 @@ Phase 1 is not complete. The remaining release blockers are:
       byte-for-byte unchanged.
 - [x] Confirm a bad payload in transaction 2 prevents transaction 1 from being
       applied, proving the validation pass precedes all home-block writes.
-- [ ] Fuzz journal headers, tag counts, revoke lengths, and geometry fields.
+- [x] Fuzz journal headers, tag counts, revoke lengths, and geometry fields.
 - [ ] Verify corrupted journals fail the mount without clearing `RECOVER`.
+      A root-only `run-regress-journal-mount` target now checks a valid replay
+      control, byte-for-byte failure atomicity, and preservation of `RECOVER`;
+      it still needs to be executed as root.
 
 ## Phase 2: Introduce the runtime journal core
 
