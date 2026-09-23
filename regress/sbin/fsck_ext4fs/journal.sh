@@ -13,6 +13,7 @@ MKE2FS=${MKE2FS:-mke2fs}
 DEBUGFS=${DEBUGFS:-debugfs}
 E2FSCK=${E2FSCK:-e2fsck}
 MAKE=${MAKE:-make}
+CC=${CC:-cc}
 TIMEOUT=${TIMEOUT:-timeout}
 FSCK_TIMEOUT=${FSCK_TIMEOUT:-20}
 JOURNAL_SEED=${JOURNAL_SEED:-260921}
@@ -39,7 +40,7 @@ for tool in "$MKE2FS" "$DEBUGFS" "$E2FSCK" "$TIMEOUT" \
 done
 
 if [ "$JOURNAL_TEST_MODE" = kernel ]; then
-	for tool in "$VNCONFIG" "$MOUNT_EXT4FS" "$UMOUNT" id; do
+	for tool in "$VNCONFIG" "$MOUNT_EXT4FS" "$UMOUNT" "$CC" id; do
 		if ! command -v "$tool" >/dev/null 2>&1; then
 			echo "SKIPPED: kernel journal regress requires $tool"
 			exit 0
@@ -105,6 +106,18 @@ fail()
 	exit 1
 }
 
+ORPHAN_FIXTURE=
+if [ "$JOURNAL_TEST_MODE" = kernel ]; then
+	ORPHAN_FIXTURE=$work/orphan_fixture
+	if ! "$CC" -Wall -Wextra -Werror -I"$srcroot/sys" \
+	    "$script_dir/orphan_fixture.c" -o "$ORPHAN_FIXTURE" \
+	    >"$work/orphan-fixture-build.log" 2>&1; then
+		cat "$work/orphan-fixture-build.log" >&2
+		test_name=build
+		fail "could not build orphan fixture helper"
+	fi
+fi
+
 run_privileged()
 {
 	[ "$(id -u)" -eq 0 ] || return 1
@@ -143,6 +156,19 @@ create_image()
 	    -O '^orphan_file' "$image" >"$case_dir/mke2fs.log" 2>&1; then
 		cat "$case_dir/mke2fs.log" >&2
 		fail "mke2fs failed"
+	fi
+}
+
+create_orphan_file_image()
+{
+	image=$1
+	block_size=$2
+	CURRENT_BLOCK_SIZE=$block_size
+	dd if=/dev/zero of="$image" bs=1m count=0 seek=64 status=none
+	if ! "$MKE2FS" -q -F -t ext4 -b "$block_size" \
+	    -O orphan_file "$image" >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs with orphan_file failed"
 	fi
 }
 
@@ -235,6 +261,10 @@ run_fsck()
 replay()
 {
 	image=$1
+	if [ "$JOURNAL_TEST_MODE" = kernel ]; then
+		kernel_replay "$image"
+		return
+	fi
 	run_fsck -fy "$image" "$case_dir/fsck.log"
 	if [ "$FSCK_STATUS" -ne 0 ]; then
 		cat "$case_dir/fsck.log" >&2
@@ -309,6 +339,19 @@ write_byte()
 	byte_octal=$(printf '%03o' "$byte_value")
 	printf "\\$byte_octal" | dd of="$byte_image" bs=1 seek="$byte_offset" count=1 \
 	    conv=notrunc status=none
+}
+
+flip_image_byte()
+{
+	fib_image=$1
+	fib_offset=$2
+	fib_mask=$3
+	fib_value=$(dd if="$fib_image" bs=1 skip="$fib_offset" count=1 \
+	    status=none | od -An -tu1 | awk 'NF { print $1 + 0 }')
+	case "$fib_value" in
+	*[!0-9]*|'') fail "could not read image byte" ;;
+	esac
+	write_byte "$fib_image" "$fib_offset" $((fib_value ^ fib_mask))
 }
 
 write_be16_journal()
@@ -427,6 +470,29 @@ test_csum_v2()
 	test_basic_replay csum-v2 'journal_open -c -v 2'
 }
 
+test_csum_v2_multiple_tags()
+{
+	case_dir=$work/csum-v2-multiple-tags
+	mkdir "$case_dir"
+	create_image "$case_dir/image" 4096
+	find_free_blocks "$case_dir/image" 3
+	make_random_payload "$case_dir/payload" 4096 3
+	{
+		printf 'journal_open -c -v 2\n'
+		printf 'journal_write -b %s %s\n' "$FREE_RANGE" \
+		    "$case_dir/payload"
+		printf 'journal_close\n'
+	} >"$case_dir/debugfs.cmd"
+	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
+	tags=$("$DEBUGFS" -R 'logdump -a' "$case_dir/image" 2>&1 |
+	    grep -c 'FS block')
+	[ "$tags" -eq 3 ] || fail "fixture does not contain three tags"
+	replay "$case_dir/image"
+	compare_blocks "$case_dir/image" 4096 "$FREE_FIRST" 3 \
+	    "$case_dir/payload"
+	verify_e2fsck "$case_dir/image"
+}
+
 test_csum_v3()
 {
 	test_basic_replay csum-v3 'journal_open -c -v 3'
@@ -473,8 +539,10 @@ test_revoke()
 	} >"$case_dir/debugfs.cmd"
 	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
 	replay "$case_dir/image"
-	grep -q 'journal revoke: 1 blocks revoked' "$case_dir/fsck.log" ||
-	    fail "revoke record was not processed"
+	if [ "$JOURNAL_TEST_MODE" = all ]; then
+		grep -q 'journal revoke: 1 blocks revoked' "$case_dir/fsck.log" ||
+		    fail "revoke record was not processed"
+	fi
 	compare_blocks "$case_dir/image" 4096 "$FREE_FIRST" 1 \
 	    "$case_dir/zero"
 	verify_e2fsck "$case_dir/image"
@@ -528,6 +596,54 @@ test_read_only()
 	[ "$before" = "$after" ] || fail "read-only validation modified image"
 	grep -q 'journal validates but must be replayed with write access' \
 	    "$case_dir/fsck.log" || fail "missing read-only replay diagnostic"
+}
+
+test_clean_journal_recovery()
+{
+	case_dir=$work/clean-journal-recovery
+	mkdir "$case_dir"
+	create_image "$case_dir/image" 4096
+	find_free_blocks "$case_dir/image" 1
+	make_payload "$case_dir/payload" 4096 1 Z
+	{
+		printf 'journal_open\n'
+		printf 'journal_write -b %s %s\n' "$FREE_FIRST" \
+		    "$case_dir/payload"
+		printf 'journal_close\n'
+	} >"$case_dir/debugfs.cmd"
+	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
+
+	# Model a crash after home-block replay and the durable s_start=0 write,
+	# but before the filesystem superblock's RECOVER bit was cleared.
+	dd if="$case_dir/payload" of="$case_dir/image" bs=4096 \
+	    seek="$FREE_FIRST" count=1 conv=notrunc status=none
+	write_be32_journal "$case_dir/image" 0 28 0
+	feature_offset=$((1024 + 96))
+	read_le32_image "$case_dir/image" "$feature_offset"
+	[ $((IMAGE_WORD & 4)) -ne 0 ] ||
+	    fail "clean-journal fixture does not have RECOVER set"
+
+	if [ "$JOURNAL_TEST_MODE" = all ]; then
+		before=$(sha256 -q "$case_dir/image")
+		run_fsck -fn "$case_dir/image" "$case_dir/fsck-readonly.log"
+		[ "$FSCK_STATUS" -eq 8 ] ||
+		    fail "read-only clean-journal recovery returned $FSCK_STATUS"
+		after=$(sha256 -q "$case_dir/image")
+		[ "$before" = "$after" ] ||
+		    fail "read-only clean-journal recovery modified the image"
+		grep -q 'RECOVER must be cleared with write access' \
+		    "$case_dir/fsck-readonly.log" ||
+		    fail "missing clean-journal read-only diagnostic"
+	fi
+
+	replay "$case_dir/image"
+	read_be32_journal "$case_dir/image" 0 28
+	[ "$JOURNAL_WORD" -eq 0 ] || fail "clean journal was made non-empty"
+	read_le32_image "$case_dir/image" "$feature_offset"
+	[ $((IMAGE_WORD & 4)) -eq 0 ] || fail "RECOVER was not cleared"
+	compare_blocks "$case_dir/image" 4096 "$FREE_FIRST" 1 \
+	    "$case_dir/payload"
+	verify_e2fsck "$case_dir/image"
 }
 
 test_bad_data_checksum()
@@ -690,8 +806,10 @@ test_deleted_tag()
 	replace_journal_block "$case_dir/image" 2 "$case_dir/commit"
 	write_be16_journal "$case_dir/image" 1 18 12
 	replay "$case_dir/image"
-	grep -q 'journal replay: 0 blocks replayed' "$case_dir/fsck.log" ||
-	    fail "deleted tag unexpectedly replayed a data block"
+	if [ "$JOURNAL_TEST_MODE" = all ]; then
+		grep -q 'journal replay: 0 blocks replayed' "$case_dir/fsck.log" ||
+		    fail "deleted tag unexpectedly replayed a data block"
+	fi
 	compare_blocks "$case_dir/image" 4096 "$FREE_FIRST" 1 "$case_dir/zero"
 	verify_e2fsck "$case_dir/image"
 }
@@ -737,8 +855,11 @@ test_log_wraparound()
 	    "$case_dir/journal.6"
 	write_be32_journal "$case_dir/image" 0 28 "$wrap_start"
 	replay "$case_dir/image"
-	grep -q "journal scan: start block $wrap_start" "$case_dir/fsck.log" ||
-	    fail "journal did not start at wrap boundary"
+	if [ "$JOURNAL_TEST_MODE" = all ]; then
+		grep -q "journal scan: start block $wrap_start" \
+		    "$case_dir/fsck.log" ||
+		    fail "journal did not start at wrap boundary"
+	fi
 	compare_blocks "$case_dir/image" 4096 "$first_target" 1 \
 	    "$case_dir/first"
 	compare_blocks "$case_dir/image" 4096 "$second_target" 1 \
@@ -770,8 +891,10 @@ test_sequence_wraparound()
 	write_be32_journal "$case_dir/image" 4 8 0
 	write_be32_journal "$case_dir/image" 6 8 0
 	replay "$case_dir/image"
-	grep -q 'end sequence 1 (2 transactions)' "$case_dir/fsck.log" ||
-	    fail "transaction sequence did not wrap through zero"
+	if [ "$JOURNAL_TEST_MODE" = all ]; then
+		grep -q 'end sequence 1 (2 transactions)' "$case_dir/fsck.log" ||
+		    fail "transaction sequence did not wrap through zero"
+	fi
 	compare_blocks "$case_dir/image" 4096 "$first_target" 1 \
 	    "$case_dir/first"
 	compare_blocks "$case_dir/image" 4096 "$second_target" 1 \
@@ -1058,8 +1181,7 @@ test_structured_field_fuzz()
 	geometry-maxlen-max 16 4294967295
 	geometry-first-zero 20 0
 	geometry-first-at-end 20 $journal_maxlen
-	geometry-start-zero 28 0
-	geometry-start-at-end 28 $journal_maxlen
+geometry-start-at-end 28 $journal_maxlen
 	geometry-start-max 28 4294967295
 	journal-errno-one 32 1
 	feature-compat-unknown 36 1
@@ -1093,10 +1215,6 @@ test_randomized_replay()
 		esac
 		random_number
 		count=$((1 + RANDOM_VALUE % 16))
-		# TODO: fsck_ext4fs currently rejects e2fsprogs checksum-v2
-		# descriptors with multiple tags.  Keep randomized v2 cases
-		# single-tag until that parser bug has a dedicated fix.
-		[ "$open_command" != 'journal_open -c -v 2' ] || count=1
 		random_number
 		gap=$((RANDOM_VALUE % 16))
 		create_image "$case_dir/image" "$block_size"
@@ -1196,6 +1314,238 @@ kernel_vnd_detach()
 	fi
 }
 
+kernel_mount_image()
+{
+	km_image=$1
+	KERNEL_MOUNTPOINT=$case_dir/mnt
+	mkdir -p "$KERNEL_MOUNTPOINT"
+	kernel_vnd_attach "$km_image"
+	km_device=/dev/${KERNEL_VND}c
+	if ! run_privileged "$MOUNT_EXT4FS" "$km_device" \
+	    "$KERNEL_MOUNTPOINT" >"$case_dir/kernel-mount.log" 2>&1; then
+		cat "$case_dir/kernel-mount.log" >&2
+		kernel_vnd_detach
+		fail "kernel rejected a valid mount fixture"
+	fi
+	KERNEL_MOUNTED=1
+	kernel_vnd_detach
+}
+
+kernel_replay()
+{
+	kr_image=$1
+	kr_feature_offset=$((1024 + 96))
+	read_le32_image "$kr_image" "$kr_feature_offset"
+	[ $((IMAGE_WORD & 4)) -ne 0 ] ||
+	    fail "kernel fixture does not have RECOVER set"
+
+	kernel_mount_image "$kr_image"
+
+	read_le32_image "$kr_image" "$kr_feature_offset"
+	[ $((IMAGE_WORD & 4)) -eq 0 ] ||
+	    fail "kernel replay did not clear RECOVER"
+}
+
+kernel_expect_mount_failure_unchanged()
+{
+	kf_image=$1
+	before=$(sha256 -q "$kf_image")
+	KERNEL_MOUNTPOINT=$case_dir/mnt
+	mkdir -p "$KERNEL_MOUNTPOINT"
+	kernel_vnd_attach "$kf_image"
+	kf_device=/dev/${KERNEL_VND}c
+	if run_privileged "$MOUNT_EXT4FS" "$kf_device" \
+	    "$KERNEL_MOUNTPOINT" >"$case_dir/kernel-mount.log" 2>&1; then
+		KERNEL_MOUNTED=1
+		fail "kernel mounted a corrupt orphan fixture"
+	fi
+	kernel_vnd_detach
+	after=$(sha256 -q "$kf_image")
+	[ "$before" = "$after" ] ||
+	    fail "failed orphan recovery modified the image"
+}
+
+test_classic_orphan_recovery()
+{
+	case_dir=$work/classic-orphan-recovery
+	mkdir "$case_dir"
+	create_image "$case_dir/image" 4096
+	make_payload "$case_dir/kept-payload" 4096 3 T
+	make_payload "$case_dir/deleted-payload" 4096 2 D
+	dd if=/dev/zero bs=1000 count=1 status=none | tr '\000' X \
+	    >"$case_dir/xattr-value"
+	{
+		printf 'write %s /kept\n' "$case_dir/kept-payload"
+		printf 'write %s /deleted\n' "$case_dir/deleted-payload"
+		printf 'ea_set -f %s /deleted user.large\n' \
+		    "$case_dir/xattr-value"
+	} >"$case_dir/debugfs.cmd"
+	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
+	kept_ino=$("$DEBUGFS" -R 'stat /kept' "$case_dir/image" \
+	    2>/dev/null | awk '/^Inode:/ { print $2; exit }')
+	deleted_ino=$("$DEBUGFS" -R 'stat /deleted' "$case_dir/image" \
+	    2>/dev/null | awk '/^Inode:/ { print $2; exit }')
+	deleted_xattr=$("$DEBUGFS" -R 'stat /deleted' "$case_dir/image" \
+	    2>/dev/null | awk '/^File ACL:/ { print $3; exit }')
+	case "$kept_ino:$deleted_ino" in
+	*[!0-9:]*) fail "could not resolve classic orphan inodes" ;;
+	esac
+	case "$deleted_xattr" in
+	''|*[!0-9]*|0) fail "classic orphan fixture lacks an external xattr" ;;
+	esac
+	{
+		printf 'unlink /deleted\n'
+		printf 'set_inode_field <%s> links_count 0\n' "$deleted_ino"
+		printf 'set_inode_field <%s> dtime 0\n' "$deleted_ino"
+		printf 'set_inode_field <%s> size 4096\n' "$kept_ino"
+		printf 'set_inode_field <%s> dtime %s\n' \
+		    "$kept_ino" "$deleted_ino"
+		printf 'set_super_value last_orphan %s\n' "$kept_ino"
+	} >"$case_dir/debugfs.cmd"
+	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
+	"$DEBUGFS" -R orphan_inodes "$case_dir/image" 2>&1 |
+	    grep -q "ino $deleted_ino" ||
+	    fail "classic orphan fixture does not contain its tail"
+
+	kernel_mount_image "$case_dir/image"
+	"$DEBUGFS" -R "testi <$deleted_ino>" "$case_dir/image" 2>&1 |
+	    grep -q 'not in use' || fail "deleted classic orphan remains allocated"
+	set -- $("$DEBUGFS" -R "blocks <$kept_ino>" "$case_dir/image" \
+	    2>/dev/null)
+	[ "$#" -eq 1 ] || fail "linked classic orphan was not truncated"
+	dd if="$case_dir/kept-payload" of="$case_dir/expected" bs=4096 \
+	    count=1 status=none
+	if ! "$DEBUGFS" -R "dump /kept $case_dir/actual" \
+	    "$case_dir/image" >/dev/null 2>&1; then
+		fail "could not extract recovered linked orphan"
+	fi
+	cmp -s "$case_dir/expected" "$case_dir/actual" ||
+	    fail "linked orphan data changed during truncation"
+	"$DEBUGFS" -R orphan_inodes "$case_dir/image" 2>&1 |
+	    grep -q 'Orphan inode list empty' ||
+	    fail "classic orphan root was not cleared"
+	verify_e2fsck "$case_dir/image"
+
+	# A second mount proves the completed state is itself restartable.
+	kernel_mount_image "$case_dir/image"
+	verify_e2fsck "$case_dir/image"
+}
+
+make_orphan_file_fixture()
+{
+	off_image=$1
+	off_payload=$2
+	create_orphan_file_image "$off_image" 4096
+	printf 'write %s /deleted\n' "$off_payload" \
+	    >"$case_dir/debugfs.cmd"
+	run_debugfs "$off_image" "$case_dir/debugfs.cmd"
+	ORPHAN_TARGET=$("$DEBUGFS" -R 'stat /deleted' "$off_image" \
+	    2>/dev/null | awk '/^Inode:/ { print $2; exit }')
+	ORPHAN_FILE_INO=$("$DEBUGFS" -R stats "$off_image" 2>/dev/null |
+	    awk '/Orphan file inode:/ { print $4; exit }')
+	ORPHAN_FILE_BLOCK=$("$DEBUGFS" \
+	    -R "bmap <$ORPHAN_FILE_INO> 0" "$off_image" 2>/dev/null |
+	    awk 'NF { value = $NF } END { print value }')
+	ORPHAN_FILE_SEED=$("$DEBUGFS" -R stats "$off_image" 2>/dev/null |
+	    awk '/Checksum seed:/ { print $3; exit }')
+	ORPHAN_FILE_GEN=$("$DEBUGFS" \
+	    -R "stat <$ORPHAN_FILE_INO>" "$off_image" 2>/dev/null |
+	    awk '/Generation:/ { print $2; exit }')
+	case "$ORPHAN_TARGET:$ORPHAN_FILE_INO:$ORPHAN_FILE_BLOCK:"\
+"$ORPHAN_FILE_GEN" in
+	*[!0-9:]*) fail "could not resolve orphan-file geometry" ;;
+	esac
+	case "$ORPHAN_FILE_SEED" in
+	0x[0-9a-fA-F]*) ;;
+	*) fail "could not resolve orphan-file checksum seed" ;;
+	esac
+	{
+		printf 'unlink /deleted\n'
+		printf 'set_inode_field <%s> links_count 0\n' "$ORPHAN_TARGET"
+		printf 'set_inode_field <%s> dtime 0\n' "$ORPHAN_TARGET"
+	} >"$case_dir/debugfs.cmd"
+	run_debugfs "$off_image" "$case_dir/debugfs.cmd"
+	if ! "$ORPHAN_FIXTURE" "$off_image" 4096 "$ORPHAN_FILE_BLOCK" \
+	    "$ORPHAN_FILE_SEED" "$ORPHAN_FILE_INO" "$ORPHAN_FILE_GEN" \
+	    "$ORPHAN_TARGET" >"$case_dir/orphan-fixture.log" 2>&1; then
+		cat "$case_dir/orphan-fixture.log" >&2
+		fail "could not populate orphan file"
+	fi
+	if ! "$DEBUGFS" -w -R 'feature orphan_present' "$off_image" \
+	    >"$case_dir/orphan-feature.log" 2>&1; then
+		cat "$case_dir/orphan-feature.log" >&2
+		fail "could not set ORPHAN_PRESENT"
+	fi
+}
+
+test_orphan_file_recovery()
+{
+	case_dir=$work/orphan-file-recovery
+	mkdir "$case_dir"
+	make_payload "$case_dir/payload" 4096 3 O
+	make_orphan_file_fixture "$case_dir/image" "$case_dir/payload"
+	"$DEBUGFS" -R orphan_inodes "$case_dir/image" 2>&1 |
+	    grep -q "ino $ORPHAN_TARGET" ||
+	    fail "orphan-file fixture does not contain its target"
+
+	kernel_mount_image "$case_dir/image"
+	"$DEBUGFS" -R "testi <$ORPHAN_TARGET>" "$case_dir/image" 2>&1 |
+	    grep -q 'not in use' || fail "orphan-file target remains allocated"
+	read_le32_image "$case_dir/image" $((1024 + 100))
+	[ $((IMAGE_WORD & 65536)) -eq 0 ] ||
+	    fail "ORPHAN_PRESENT was not cleared"
+	verify_e2fsck "$case_dir/image"
+	kernel_mount_image "$case_dir/image"
+	verify_e2fsck "$case_dir/image"
+}
+
+test_corrupt_orphan_file()
+{
+	case_dir=$work/corrupt-orphan-file
+	mkdir "$case_dir"
+	make_payload "$case_dir/payload" 4096 1 C
+	make_orphan_file_fixture "$case_dir/image" "$case_dir/payload"
+	flip_image_byte "$case_dir/image" \
+	    $((ORPHAN_FILE_BLOCK * 4096 + 4095)) 1
+	read_le32_image "$case_dir/image" $((1024 + 100))
+	[ $((IMAGE_WORD & 65536)) -ne 0 ] ||
+	    fail "corrupt fixture does not have ORPHAN_PRESENT set"
+	kernel_expect_mount_failure_unchanged "$case_dir/image"
+	read_le32_image "$case_dir/image" $((1024 + 100))
+	[ $((IMAGE_WORD & 65536)) -ne 0 ] ||
+	    fail "failed orphan recovery cleared ORPHAN_PRESENT"
+}
+
+test_corrupt_classic_orphans()
+{
+	case_dir=$work/corrupt-classic-orphans
+	mkdir "$case_dir"
+	create_image "$case_dir/image" 4096
+	make_payload "$case_dir/first-payload" 4096 1 A
+	make_payload "$case_dir/second-payload" 4096 1 B
+	{
+		printf 'write %s /first\n' "$case_dir/first-payload"
+		printf 'write %s /second\n' "$case_dir/second-payload"
+	} >"$case_dir/debugfs.cmd"
+	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
+	first_ino=$("$DEBUGFS" -R 'stat /first' "$case_dir/image" \
+	    2>/dev/null | awk '/^Inode:/ { print $2; exit }')
+	second_ino=$("$DEBUGFS" -R 'stat /second' "$case_dir/image" \
+	    2>/dev/null | awk '/^Inode:/ { print $2; exit }')
+	case "$first_ino:$second_ino" in
+	*[!0-9:]*) fail "could not resolve corrupt classic orphan inodes" ;;
+	esac
+	{
+		printf 'set_inode_field <%s> dtime %s\n' \
+		    "$first_ino" "$second_ino"
+		printf 'set_inode_field <%s> dtime %s\n' \
+		    "$second_ino" "$first_ino"
+		printf 'set_super_value last_orphan %s\n' "$first_ino"
+	} >"$case_dir/debugfs.cmd"
+	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
+	kernel_expect_mount_failure_unchanged "$case_dir/image"
+}
+
 test_kernel_mount_corruption()
 {
 	root_dir=$work/kernel-mount-corruption
@@ -1274,6 +1624,8 @@ if [ "$JOURNAL_TEST_MODE" = all ]; then
 	echo "random seed: $JOURNAL_SEED"
 	run_test 'journal replay without checksums' test_nocsum
 	run_test 'journal replay with checksum v2' test_csum_v2
+	run_test 'checksum v2 descriptor with multiple tags' \
+	    test_csum_v2_multiple_tags
 	run_test 'journal replay with checksum v3' test_csum_v3
 	run_test 'escaped journal data' test_escape
 	run_test 'revoke suppresses an earlier write' test_revoke
@@ -1284,6 +1636,8 @@ if [ "$JOURNAL_TEST_MODE" = all ]; then
 	run_test 'journal log block wraparound' test_log_wraparound
 	run_test 'transaction ID wraparound' test_sequence_wraparound
 	run_test 'read-only validation is non-mutating' test_read_only
+	run_test 'restart clean journal with RECOVER set' \
+	    test_clean_journal_recovery
 	run_test 'bad data checksum is non-mutating' test_bad_data_checksum
 	run_test 'incomplete transaction is non-mutating' test_incomplete_transaction
 	run_test 'validation precedes every home write' test_validation_atomicity
@@ -1296,6 +1650,31 @@ if [ "$JOURNAL_TEST_MODE" = all ]; then
 	run_test 'seeded replay matrix' test_randomized_replay
 	run_test 'seeded checksum mutation sweep' test_randomized_mutations
 else
+	run_test 'kernel: journal without checksums' test_nocsum
+	run_test 'kernel: checksum v2' test_csum_v2
+	run_test 'kernel: checksum v2 multiple tags' \
+	    test_csum_v2_multiple_tags
+	run_test 'kernel: checksum v3' test_csum_v3
+	run_test 'kernel: escaped data' test_escape
+	run_test 'kernel: revoke' test_revoke
+	run_test 'kernel: later write after revoke' test_revoke_then_later_write
+	run_test 'kernel: deleted tag' test_deleted_tag
+	run_test 'kernel: multiple descriptors' test_multi_descriptor
+	run_test 'kernel: descriptor boundary' test_descriptor_boundary
+	run_test 'kernel: log wraparound' test_log_wraparound
+	run_test 'kernel: sequence wraparound' test_sequence_wraparound
+	run_test 'kernel: clean journal with RECOVER' \
+	    test_clean_journal_recovery
+	run_test 'kernel: filesystem block sizes' test_block_sizes
+	run_test 'kernel: seeded replay matrix' test_randomized_replay
+	run_test 'kernel: restartable classic orphan recovery' \
+	    test_classic_orphan_recovery
+	run_test 'kernel: restartable orphan-file recovery' \
+	    test_orphan_file_recovery
+	run_test 'kernel: corrupt orphan file is non-mutating' \
+	    test_corrupt_orphan_file
+	run_test 'kernel: classic orphan cycle is non-mutating' \
+	    test_corrupt_classic_orphans
 	run_test 'kernel mount preserves RECOVER on corruption' \
 	    test_kernel_mount_corruption
 fi

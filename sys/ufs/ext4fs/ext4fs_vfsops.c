@@ -369,16 +369,6 @@ ext4fs_mountfs (struct vnode *devvp, struct mount *mp, struct proc *p)
 	ump->um_e4fs->m_read_only = ronly;
 	ump->um_fstype = UM_EXT4FS;
 
-	if (ronly == 0) {
-		if (recovered)
-			mfs->m_state &= ~EXT4FS_STATE_VALID;
-		else if (mfs->m_state == EXT4FS_STATE_VALID)
-			mfs->m_state = 0;
-		else
-			mfs->m_state = EXT4FS_STATE_ERROR;
-		mfs->m_fs_was_modified = 1;
-	}
-
 	mp->mnt_data = ump;
 	mp->mnt_stat.f_fsid.val[0] = (long)dev;
 	mp->mnt_stat.f_fsid.val[1] = mp->mnt_vfc->vfc_typenum;
@@ -398,6 +388,19 @@ ext4fs_mountfs (struct vnode *devvp, struct mount *mp, struct proc *p)
 		error = ext4fs_orphan_cleanup(mp);
 		if (error)
 			goto out;
+		/*
+		 * Keep the on-disk filesystem clean while orphan recovery is
+		 * checkpointing.  Every incomplete recovery retains an orphan
+		 * root and can therefore be resumed by the next writable mount.
+		 * Mark it dirty only after those recovery roots are gone.
+		 */
+		if (recovered)
+			mfs->m_state &= ~EXT4FS_STATE_VALID;
+		else if (mfs->m_state == EXT4FS_STATE_VALID)
+			mfs->m_state = 0;
+		else
+			mfs->m_state = EXT4FS_STATE_ERROR;
+		mfs->m_fs_was_modified = 1;
 		error = ext4fs_sbwrite(mp);
 		if (error)
 			goto out;
