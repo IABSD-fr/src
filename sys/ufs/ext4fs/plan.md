@@ -14,18 +14,20 @@ three-pass scan, revoke, and replay flow. Runtime filesystem operations do not
 write JBD2 transactions, however; metadata buffers still reach their home
 locations directly through `bwrite()`, `bdwrite()`, and `bawrite()`.
 
-Recovery hardening is in progress and must be completed before this reader is
-used as the recovery side of a journal writer.
+Recovery hardening and its production-kernel regression gate are complete.
+The reader is ready to serve as the recovery side of the journal writer
+planned in Phase 2.
 
-### Phase 1 implementation status (2026-09-22)
+### Phase 1 implementation status (2026-09-23)
 
 The kernel and `fsck_ext4fs` recovery implementations now compile from the
-same documented JBD2 format definitions. Recovery uses a validation pass before
-the first home-block write, validates the ext4 superblock, group descriptors,
-journal inode, external journal extent nodes, journal geometry and supported
-feature masks, and propagates read, write, and durability-flush failures.
-Journal-target and revoke membership use bounded hash tables, and physically
-aliased journal extents are rejected.
+same documented JBD2 format definitions and the same ext4 checksum
+implementation. Recovery uses a validation pass before the first home-block
+write, validates the ext4 superblock, group descriptors, journal inode,
+external journal extent nodes, journal geometry and supported feature masks,
+and propagates read, write, and durability-flush failures. Journal-target and
+revoke membership use bounded hash tables, and physically aliased journal
+extents are rejected.
 
 Disposable images generated with e2fsprogs have been replayed successfully for
 no-checksum, multi-tag checksum-v2, and checksum-v3 journals. The resulting
@@ -43,9 +45,14 @@ keeps the filesystem clean while checkpointing, processes classic lists from
 the tail, authenticates orphan-file and extent metadata before mutation, and
 rebuilds allocation counters before removing each durable recovery reference.
 
-Phase 1 is not complete. The remaining release blockers are to run the expanded
-kernel-mount matrix, validate the new orphan fixtures, and inject power loss at
-the recovery durability boundaries in an IABSD VM.
+Phase 1 recovery hardening and its regression gate are complete. On
+2026-09-23, the expanded root-only mount suite passed against the booted
+production IABSD kernel. It exercised every userland recovery fixture through
+the kernel path, modeled every persisted recovery durability state, verified
+restartable classic-list and orphan-file cleanup, and remounted completed
+images to prove idempotence. Corrupt recovery inputs remained byte-for-byte
+unchanged with `RECOVER` or `ORPHAN_PRESENT` preserved, and `e2fsck -fn`
+accepted every successfully recovered image.
 
 ## Phase 1: Harden journal recovery
 
@@ -108,11 +115,11 @@ the recovery durability boundaries in an IABSD VM.
 - [x] Verify corrupted journals fail the mount without clearing `RECOVER`.
       The root-only `run-regress-journal-mount` target checks a valid replay
       control, byte-for-byte failure atomicity, and preservation of `RECOVER`.
-- [ ] Exercise every userland recovery fixture through the kernel mount path.
-- [ ] Test `RECOVER` with `s_start == 0`, including failures injected before
+- [x] Exercise every userland recovery fixture through the kernel mount path.
+- [x] Test `RECOVER` with `s_start == 0`, including failures injected before
       and after each durability boundary, and prove that retry is idempotent.
-- [ ] Run the kernel-mount recovery matrix and injected-power-loss tests in an
-      IABSD VM.
+- [x] Run the kernel-mount recovery matrix and modeled power-loss durability
+      states against the booted production IABSD kernel.
 
 ## Phase 2: Introduce the runtime journal core
 
