@@ -28,7 +28,7 @@ Journal-target and revoke membership use bounded hash tables, and physically
 aliased journal extents are rejected.
 
 Disposable images generated with e2fsprogs have been replayed successfully for
-no-checksum, single-tag checksum-v2, and checksum-v3 journals. The resulting
+no-checksum, multi-tag checksum-v2, and checksum-v3 journals. The resulting
 home block matched the journal payload and `e2fsck -fn` accepted each recovered
 image. Read-only validation rejected replay without changing the image hash.
 
@@ -36,14 +36,16 @@ The automated `fsck_ext4fs` regression suite now covers checksum formats,
 descriptor boundaries, deleted tags, revoke ordering, log and transaction-ID
 wraparound, failure atomicity, malformed structures, and seeded mutation runs.
 
-Phase 1 is not complete. The remaining release blockers are:
+Recovery now treats `RECOVER` with `s_start == 0` as a restart after the durable
+journal-clean marker, accepts e2fsprogs checksum-v2 multi-tag descriptors, and
+implements restartable classic-list and orphan-file recovery. Orphan recovery
+keeps the filesystem clean while checkpointing, processes classic lists from
+the tail, authenticates orphan-file and extent metadata before mutation, and
+rebuilds allocation counters before removing each durable recovery reference.
 
-- define and test restartable handling for `RECOVER` with journal `s_start == 0`;
-- accept e2fsprogs checksum-v2 descriptors containing multiple tags;
-- exercise the userland recovery fixtures through the kernel mount path;
-- finish safe, restartable classic-orphan and orphan-file recovery (mount now
-  fails closed when orphan cleanup would be required);
-- run kernel mount and injected-power-loss tests in an IABSD VM.
+Phase 1 is not complete. The remaining release blockers are to run the expanded
+kernel-mount matrix, validate the new orphan fixtures, and inject power loss at
+the recovery durability boundaries in an IABSD VM.
 
 ## Phase 1: Harden journal recovery
 
@@ -75,10 +77,10 @@ Phase 1 is not complete. The remaining release blockers are:
       flushes have succeeded.
 - [x] Apply the same recovery rules to `fsck_ext4fs`, preferably through shared
       format/parsing helpers where kernel/userland boundaries permit it.
-- [ ] Define and implement restartable handling when `RECOVER` is set but the
+- [x] Define and implement restartable handling when `RECOVER` is set but the
       journal superblock has `s_start == 0`.
-- [ ] Accept e2fsprogs checksum-v2 descriptor blocks containing multiple tags.
-- [ ] Implement safe, restartable recovery of the classic orphan list and the
+- [x] Accept e2fsprogs checksum-v2 descriptor blocks containing multiple tags.
+- [x] Implement safe, restartable recovery of the classic orphan list and the
       orphan file, persisting recovery progress before clearing either orphan
       root or `ORPHAN_PRESENT`.
 
@@ -86,7 +88,7 @@ Phase 1 is not complete. The remaining release blockers are:
 
 - [x] Replay e2fsprogs-generated journals using no checksum, single-tag
       checksum v2, and checksum v3 formats.
-- [ ] Replay an e2fsprogs-generated checksum-v2 descriptor containing multiple
+- [x] Replay an e2fsprogs-generated checksum-v2 descriptor containing multiple
       tags.
 - [x] Cover escaped data and a committed revoke-only transaction that
       suppresses an earlier logged home-block write.

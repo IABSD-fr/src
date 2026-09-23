@@ -578,9 +578,11 @@ jbd2_parse_tag (struct jbd2_replay_ctx *ctx, char *buf, u_int32_t bufsize,
     u_int32_t *checksum, int *uuid_seen)
 {
 	const u_int8_t zero_uuid[16] = { 0 };
-	int has_csum_v3, has_64bit;
+	int has_csum_v2, has_csum_v3, has_64bit;
 	u_int32_t known_flags, tag_size;
 
+	has_csum_v2 = ctx->rc_features_incompat &
+	    JBD2_FEATURE_INCOMPAT_CSUM_V2;
 	has_csum_v3 = ctx->rc_features_incompat &
 	    JBD2_FEATURE_INCOMPAT_CSUM_V3;
 	has_64bit = ctx->rc_features_incompat &
@@ -625,6 +627,11 @@ jbd2_parse_tag (struct jbd2_replay_ctx *ctx, char *buf, u_int32_t bufsize,
 			*offset += 4;
 		}
 	}
+	if (has_csum_v2) {
+		if (*offset + JBD2_CSUM_V2_TAG_EXTRA > bufsize)
+			return (EINVAL);
+		*offset += JBD2_CSUM_V2_TAG_EXTRA;
+	}
 	/* Only the low 16 bits carry defined tag flags on disk. */
 	if (has_csum_v3)
 		*flags &= 0xffff;
@@ -643,16 +650,16 @@ jbd2_parse_tag (struct jbd2_replay_ctx *ctx, char *buf, u_int32_t bufsize,
 			return (EINVAL);
 	} else {
 		/*
-		 * The open-coded UUID can be omitted from the final tag even when
-		 * SAME_UUID is clear.  Consume it when present; the journal
-		 * superblock and data checksum still bind every accepted tag to the
-		 * filesystem UUID.
+		 * The open-coded UUID is present only when SAME_UUID is clear.
+		 * e2fsprogs writes a zero UUID here; accept it because the journal
+		 * superblock and the data checksum still bind the tag to this journal.
 		 */
-		if (*offset + sizeof(ctx->rc_uuid) <= bufsize &&
+		if (*offset + sizeof(ctx->rc_uuid) > bufsize ||
 		    (memcmp(buf + *offset, ctx->rc_uuid,
-		    sizeof(ctx->rc_uuid)) == 0 ||
-		    memcmp(buf + *offset, zero_uuid, sizeof(zero_uuid)) == 0))
-			*offset += sizeof(ctx->rc_uuid);
+		    sizeof(ctx->rc_uuid)) != 0 &&
+		    memcmp(buf + *offset, zero_uuid, sizeof(zero_uuid)) != 0))
+			return (EINVAL);
+		*offset += sizeof(ctx->rc_uuid);
 		*uuid_seen = 1;
 	}
 
@@ -1502,9 +1509,14 @@ ext4fs_journal_replay (struct vnode *devvp, struct m_ext4fs *fs,
 	if (error)
 		goto out;
 	if (ctx.rc_start == 0) {
-		printf("ext4fs: RECOVER is set but journal start is zero\n");
-		error = EINVAL;
-		goto out;
+		/*
+		 * Replay may already have made the home blocks and the clean
+		 * journal marker durable, then lost power before clearing RECOVER.
+		 * Complete that final step without changing the journal sequence.
+		 */
+		printf("ext4fs: journal is already clean; completing recovery\n");
+		ctx.rc_end_sequence = ctx.rc_sequence;
+		goto clear_recover;
 	}
 
 	printf("ext4fs: replaying journal (sequence %u, start block %u, "
@@ -1576,6 +1588,7 @@ clear:
 		goto out;
 	}
 
+clear_recover:
 	/*
 	 * Re-read the post-replay superblock before changing RECOVER.  The
 	 * transaction may itself have contained a newer superblock image;

@@ -483,6 +483,8 @@ jbd2_parse_tag(struct fsck_jbd2_ctx *ctx, char *buf, u_int32_t bufsize,
     u_int32_t *checksum, int *uuid_seen)
 {
 	const u_int8_t zero_uuid[16] = { 0 };
+	int has_csum_v2 = ctx->features_incompat &
+	    JBD2_FEATURE_INCOMPAT_CSUM_V2;
 	int has_csum_v3 = ctx->features_incompat &
 	    JBD2_FEATURE_INCOMPAT_CSUM_V3;
 	int has_64bit = ctx->features_incompat &
@@ -519,30 +521,45 @@ jbd2_parse_tag(struct fsck_jbd2_ctx *ctx, char *buf, u_int32_t bufsize,
 			*offset += 4;
 		}
 	}
+	if (has_csum_v2) {
+		if (*offset + JBD2_CSUM_V2_TAG_EXTRA > bufsize)
+			return (EINVAL);
+		*offset += JBD2_CSUM_V2_TAG_EXTRA;
+	}
 	/* Only the low 16 bits carry defined tag flags on disk. */
 	if (has_csum_v3)
 		*flags &= 0xffff;
 	if (*flags & ~(JBD2_FLAG_ESCAPE | JBD2_FLAG_SAME_UUID |
-	    JBD2_FLAG_DELETED | JBD2_FLAG_LAST_TAG))
+	    JBD2_FLAG_DELETED | JBD2_FLAG_LAST_TAG)) {
+		pfatal("JOURNAL TAG HAS UNKNOWN FLAGS 0x%x\n", *flags);
 		return (EINVAL);
-	if (*target >= sblock.m_blocks_count)
+	}
+	if (*target >= sblock.m_blocks_count) {
+		pfatal("JOURNAL TAG TARGET %llu IS OUT OF RANGE\n",
+		    (unsigned long long)*target);
 		return (EINVAL);
-	if (jbd2_is_journal_block(ctx, *target))
+	}
+	if (jbd2_is_journal_block(ctx, *target)) {
+		pfatal("JOURNAL TAG TARGET %llu IS IN THE JOURNAL\n",
+		    (unsigned long long)*target);
 		return (EINVAL);
+	}
 	if (*flags & JBD2_FLAG_SAME_UUID) {
-		if (!*uuid_seen)
+		if (!*uuid_seen) {
+			pfatal("FIRST JOURNAL TAG OMITS ITS UUID\n");
 			return (EINVAL);
+		}
 	} else {
 		/*
-		 * The open-coded UUID can be omitted from the final tag even when
-		 * SAME_UUID is clear.  Consume it when present; the journal
-		 * superblock and data checksum still bind every accepted tag to the
-		 * filesystem UUID.
+		 * The open-coded UUID is present only when SAME_UUID is clear.
+		 * e2fsprogs writes a zero UUID here; accept it because the journal
+		 * superblock and the data checksum still bind the tag to this journal.
 		 */
-		if (*offset + sizeof(ctx->uuid) <= bufsize &&
-		    (memcmp(buf + *offset, ctx->uuid, sizeof(ctx->uuid)) == 0 ||
-		    memcmp(buf + *offset, zero_uuid, sizeof(zero_uuid)) == 0))
-			*offset += sizeof(ctx->uuid);
+		if (*offset + sizeof(ctx->uuid) > bufsize ||
+		    (memcmp(buf + *offset, ctx->uuid, sizeof(ctx->uuid)) != 0 &&
+		    memcmp(buf + *offset, zero_uuid, sizeof(zero_uuid)) != 0))
+			return (EINVAL);
+		*offset += sizeof(ctx->uuid);
 		*uuid_seen = 1;
 	}
 	return (0);
@@ -1264,9 +1281,18 @@ fsck_journal_replay(int apply)
 	if (error)
 		goto out;
 	if (ctx.start == 0) {
-		pfatal("RECOVER IS SET BUT JOURNAL START IS ZERO\n");
-		error = EINVAL;
-		goto out;
+		/*
+		 * This is the restart point after replay and the clean journal
+		 * marker became durable, but before RECOVER was cleared.
+		 */
+		printf("journal is already clean; completing recovery\n");
+		ctx.end_sequence = ctx.sequence;
+		if (!apply) {
+			printf("RECOVER must be cleared with write access\n");
+			error = EROFS;
+			goto out;
+		}
+		goto clear_recover;
 	}
 
 	printf("replaying journal (sequence %u, start block %u, %u blocks)\n",
@@ -1327,6 +1353,7 @@ clear:
 	if (error)
 		goto out;
 
+clear_recover:
 	{
 		struct ext4fs *sble;
 		u_int32_t incompat;

@@ -68,6 +68,9 @@
 #define JBD2_MAX_BLOCKMAP_ENTRIES	(1U << 20)
 #define JBD2_MAX_REVOKE_ENTRIES		(1U << 18)
 
+/* Extra trailing bytes in the e2fsprogs checksum-v2 tag encoding. */
+#define JBD2_CSUM_V2_TAG_EXTRA		2
+
 /* Common block header (12 bytes) */
 struct jbd2_header {
 	u_int32_t	h_magic;
