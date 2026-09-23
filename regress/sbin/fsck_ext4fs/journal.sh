@@ -386,6 +386,15 @@ write_be32_journal()
 	write_byte "$w32_image" $((w32_offset + 3)) "$w32_b3"
 }
 
+mark_journal_clean()
+{
+	mjc_image=$1
+	read_be32_journal "$mjc_image" 0 24
+	mjc_sequence=$(((JOURNAL_WORD + 1) & 4294967295))
+	write_be32_journal "$mjc_image" 0 24 "$mjc_sequence"
+	write_be32_journal "$mjc_image" 0 28 0
+}
+
 flip_journal_byte()
 {
 	image=$1
@@ -425,6 +434,17 @@ replace_journal_block()
 expect_replay_failure_unchanged()
 {
 	image=$1
+	if [ "$JOURNAL_TEST_MODE" = kernel ]; then
+		feature_offset=$((1024 + 96))
+		read_le32_image "$image" "$feature_offset"
+		[ $((IMAGE_WORD & 4)) -ne 0 ] ||
+		    fail "malformed kernel fixture does not have RECOVER set"
+		kernel_expect_mount_failure_unchanged "$image"
+		read_le32_image "$image" "$feature_offset"
+		[ $((IMAGE_WORD & 4)) -ne 0 ] ||
+		    fail "failed kernel replay cleared RECOVER"
+		return
+	fi
 	before=$(sha256 -q "$image")
 	run_fsck -fy "$image" "$case_dir/fsck.log"
 	if [ "$FSCK_STATUS" -eq 0 ]; then
@@ -585,6 +605,20 @@ test_read_only()
 		printf 'journal_close\n'
 	} >"$case_dir/debugfs.cmd"
 	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
+	if [ "$JOURNAL_TEST_MODE" = kernel ]; then
+		feature_offset=$((1024 + 96))
+		read_le32_image "$case_dir/image" "$feature_offset"
+		[ $((IMAGE_WORD & 4)) -ne 0 ] ||
+		    fail "read-only kernel fixture does not have RECOVER set"
+		kernel_mount_image "$case_dir/image" -o ro
+		read_le32_image "$case_dir/image" "$feature_offset"
+		[ $((IMAGE_WORD & 4)) -eq 0 ] ||
+		    fail "read-only kernel replay did not clear RECOVER"
+		compare_blocks "$case_dir/image" 4096 "$FREE_FIRST" 1 \
+		    "$case_dir/payload"
+		verify_e2fsck "$case_dir/image"
+		return
+	fi
 	before=$(sha256 -q "$case_dir/image")
 	run_fsck -fn "$case_dir/image" "$case_dir/fsck.log"
 	if [ "$FSCK_STATUS" -eq 0 ]; then
@@ -617,7 +651,7 @@ test_clean_journal_recovery()
 	# but before the filesystem superblock's RECOVER bit was cleared.
 	dd if="$case_dir/payload" of="$case_dir/image" bs=4096 \
 	    seek="$FREE_FIRST" count=1 conv=notrunc status=none
-	write_be32_journal "$case_dir/image" 0 28 0
+	mark_journal_clean "$case_dir/image"
 	feature_offset=$((1024 + 96))
 	read_le32_image "$case_dir/image" "$feature_offset"
 	[ $((IMAGE_WORD & 4)) -ne 0 ] ||
@@ -1317,11 +1351,13 @@ kernel_vnd_detach()
 kernel_mount_image()
 {
 	km_image=$1
+	shift
 	KERNEL_MOUNTPOINT=$case_dir/mnt
 	mkdir -p "$KERNEL_MOUNTPOINT"
 	kernel_vnd_attach "$km_image"
 	km_device=/dev/${KERNEL_VND}c
-	if ! run_privileged "$MOUNT_EXT4FS" "$km_device" \
+	if ! run_privileged "$TIMEOUT" -k 2 "$FSCK_TIMEOUT" \
+	    "$MOUNT_EXT4FS" "$@" "$km_device" \
 	    "$KERNEL_MOUNTPOINT" >"$case_dir/kernel-mount.log" 2>&1; then
 		cat "$case_dir/kernel-mount.log" >&2
 		kernel_vnd_detach
@@ -1354,15 +1390,16 @@ kernel_expect_mount_failure_unchanged()
 	mkdir -p "$KERNEL_MOUNTPOINT"
 	kernel_vnd_attach "$kf_image"
 	kf_device=/dev/${KERNEL_VND}c
-	if run_privileged "$MOUNT_EXT4FS" "$kf_device" \
+	if run_privileged "$TIMEOUT" -k 2 "$FSCK_TIMEOUT" \
+	    "$MOUNT_EXT4FS" "$kf_device" \
 	    "$KERNEL_MOUNTPOINT" >"$case_dir/kernel-mount.log" 2>&1; then
 		KERNEL_MOUNTED=1
-		fail "kernel mounted a corrupt orphan fixture"
+		fail "kernel mounted a malformed recovery fixture"
 	fi
 	kernel_vnd_detach
 	after=$(sha256 -q "$kf_image")
 	[ "$before" = "$after" ] ||
-	    fail "failed orphan recovery modified the image"
+	    fail "failed kernel recovery modified the image"
 }
 
 test_classic_orphan_recovery()
@@ -1578,7 +1615,8 @@ test_kernel_mount_corruption()
 	# kernel, vnode disk, mount utility, and fixture all exercise ext4fs.
 	kernel_vnd_attach "$root_dir/valid.img"
 	valid_device=/dev/${KERNEL_VND}c
-	if ! run_privileged "$MOUNT_EXT4FS" "$valid_device" \
+	if ! run_privileged "$TIMEOUT" -k 2 "$FSCK_TIMEOUT" \
+	    "$MOUNT_EXT4FS" "$valid_device" \
 	    "$KERNEL_MOUNTPOINT" >"$root_dir/valid-mount.log" 2>&1; then
 		cat "$root_dir/valid-mount.log" >&2
 		fail "kernel rejected the valid journal control"
@@ -1597,7 +1635,8 @@ test_kernel_mount_corruption()
 	before=$(sha256 -q "$root_dir/corrupt.img")
 	kernel_vnd_attach "$root_dir/corrupt.img"
 	corrupt_device=/dev/${KERNEL_VND}c
-	if run_privileged "$MOUNT_EXT4FS" "$corrupt_device" \
+	if run_privileged "$TIMEOUT" -k 2 "$FSCK_TIMEOUT" \
+	    "$MOUNT_EXT4FS" "$corrupt_device" \
 	    "$KERNEL_MOUNTPOINT" >"$root_dir/corrupt-mount.log" 2>&1; then
 		KERNEL_MOUNTED=1
 		fail "kernel mounted an image with a corrupted journal"
@@ -1609,6 +1648,75 @@ test_kernel_mount_corruption()
 	read_le32_image "$root_dir/corrupt.img" "$feature_offset"
 	[ $((IMAGE_WORD & 4)) -ne 0 ] ||
 	    fail "failed kernel replay cleared RECOVER"
+}
+
+test_recovery_boundary_states()
+{
+	root_dir=$work/recovery-boundary-states
+	case_dir=$root_dir/base
+	mkdir -p "$case_dir"
+	create_image "$case_dir/image" 4096
+	find_free_blocks "$case_dir/image" 3
+	target=$FREE_FIRST
+	make_random_payload "$case_dir/payload" 4096 3
+	{
+		printf 'journal_open\n'
+		printf 'journal_write -b %s %s\n' "$FREE_RANGE" \
+		    "$case_dir/payload"
+		printf 'journal_close\n'
+	} >"$case_dir/debugfs.cmd"
+	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
+	cp "$case_dir/image" "$root_dir/before-home-flush.img"
+	cp "$case_dir/image" "$root_dir/partial-home-replay.img"
+	cp "$case_dir/image" "$root_dir/after-home-flush.img"
+	dd if="$case_dir/payload" of="$root_dir/partial-home-replay.img" \
+	    bs=4096 seek="$target" count=1 conv=notrunc status=none
+	dd if="$case_dir/payload" of="$root_dir/after-home-flush.img" \
+	    bs=4096 seek="$target" count=3 conv=notrunc status=none
+	cp "$root_dir/after-home-flush.img" \
+	    "$root_dir/after-journal-flush.img"
+	mark_journal_clean "$root_dir/after-journal-flush.img"
+	cp "$root_dir/after-journal-flush.img" \
+	    "$root_dir/after-recover-flush.img"
+	if ! "$DEBUGFS" -w -R 'feature ^needs_recovery' \
+	    "$root_dir/after-recover-flush.img" \
+	    >"$root_dir/clear-recover.log" 2>&1; then
+		cat "$root_dir/clear-recover.log" >&2
+		fail "could not prepare the post-RECOVER durability state"
+	fi
+
+	for state in before-home-flush partial-home-replay after-home-flush \
+	    after-journal-flush after-recover-flush; do
+		case_dir=$root_dir/$state
+		mkdir "$case_dir"
+		mv "$root_dir/$state.img" "$case_dir/image"
+		feature_offset=$((1024 + 96))
+		read_le32_image "$case_dir/image" "$feature_offset"
+		case "$state" in
+		after-recover-flush)
+			[ $((IMAGE_WORD & 4)) -eq 0 ] ||
+			    fail "post-RECOVER fixture still needs recovery"
+			;;
+		*)
+			[ $((IMAGE_WORD & 4)) -ne 0 ] ||
+			    fail "$state fixture does not have RECOVER set"
+			;;
+		esac
+
+		kernel_mount_image "$case_dir/image"
+		read_le32_image "$case_dir/image" "$feature_offset"
+		[ $((IMAGE_WORD & 4)) -eq 0 ] ||
+		    fail "$state retry did not clear RECOVER"
+		compare_blocks "$case_dir/image" 4096 "$target" 3 \
+		    "$root_dir/base/payload"
+		verify_e2fsck "$case_dir/image"
+
+		# A second mount must preserve the completed recovery state.
+		kernel_mount_image "$case_dir/image"
+		compare_blocks "$case_dir/image" 4096 "$target" 3 \
+		    "$root_dir/base/payload"
+		verify_e2fsck "$case_dir/image"
+	done
 }
 
 run_test()
@@ -1663,10 +1771,31 @@ else
 	run_test 'kernel: descriptor boundary' test_descriptor_boundary
 	run_test 'kernel: log wraparound' test_log_wraparound
 	run_test 'kernel: sequence wraparound' test_sequence_wraparound
+	run_test 'kernel: read-only mount recovery' test_read_only
 	run_test 'kernel: clean journal with RECOVER' \
 	    test_clean_journal_recovery
+	run_test 'kernel: bad data checksum is non-mutating' \
+	    test_bad_data_checksum
+	run_test 'kernel: incomplete transaction is non-mutating' \
+	    test_incomplete_transaction
+	run_test 'kernel: validation precedes every home write' \
+	    test_validation_atomicity
 	run_test 'kernel: filesystem block sizes' test_block_sizes
+	run_test 'kernel: malformed descriptor tags and sequences' \
+	    test_malformed_tags
+	run_test 'kernel: all journal checksum failure points' \
+	    test_checksum_failures
+	run_test 'kernel: malformed revoke lengths' \
+	    test_malformed_revoke_lengths
+	run_test 'kernel: malformed journal geometry and features' \
+	    test_malformed_geometry
+	run_test 'kernel: structured journal field fuzzing' \
+	    test_structured_field_fuzz
 	run_test 'kernel: seeded replay matrix' test_randomized_replay
+	run_test 'kernel: seeded checksum mutation sweep' \
+	    test_randomized_mutations
+	run_test 'kernel: restartable recovery durability states' \
+	    test_recovery_boundary_states
 	run_test 'kernel: restartable classic orphan recovery' \
 	    test_classic_orphan_recovery
 	run_test 'kernel: restartable orphan-file recovery' \
