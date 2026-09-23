@@ -61,7 +61,6 @@
 #include <ufs/ufs/ufs_extern.h>
 
 #include <ufs/ext4fs/ext4fs.h>
-#include <ufs/ext4fs/ext4fs_crc32c.h>
 
 /* Convert ext4 directory entry file type to BSD dirent type */
 static const u_int8_t ext4fs_type_to_dt[EXT4FS_FT_MAX] = {
@@ -253,7 +252,9 @@ ext4fs_update (struct inode *ip, int waitfor)
 	/* Recompute inode checksum */
 	csum = ext4fs_inode_csum(fs, ip->i_e4din, ip->i_number);
 	ip->i_e4din->dinode.i_checksum_lo = htole16(csum & 0xFFFF);
-	ip->i_e4din->dinode.i_checksum_hi = htole16((csum >> 16) & 0xFFFF);
+	if (ext4fs_inode_has_csum_hi(ip->i_e4din))
+		ip->i_e4din->dinode.i_checksum_hi =
+		    htole16((csum >> 16) & 0xFFFF);
 
 	/* Copy inode to buffer */
 	memcpy((char *)bp->b_data + offset_in_block, ip->i_e4din,

@@ -218,7 +218,8 @@ ext4fs_orphan_inode_write (struct m_ext4fs *fs, struct vnode *devvp,
 		return (error);
 	checksum = ext4fs_inode_csum(fs, dp, ino);
 	dp->dinode.i_checksum_lo = htole16(checksum & 0xffff);
-	dp->dinode.i_checksum_hi = htole16(checksum >> 16);
+	if (ext4fs_inode_has_csum_hi(dp))
+		dp->dinode.i_checksum_hi = htole16(checksum >> 16);
 	error = bread(devvp, (daddr_t)EXT4FS_FSBTODB(fs, block),
 	    fs->m_block_size, &bp);
 	if (error) {
@@ -649,6 +650,10 @@ ext4fs_orphan_xattr_references (struct ext4fs_orphan_extent_ctx *ctx,
 				    ((char *)table_bp->b_data +
 				    (size_t)i * ctx->fs->m_inode_size);
 				memcpy(&dp, din, sizeof(dp));
+				if (letoh16(din->i_mode) == 0 &&
+				    letoh16(din->i_links_count) == 0 &&
+				    letoh32(din->i_dtime) == 0)
+					continue;
 				error = ext4fs_inode_csum_verify(ctx->fs,
 				    &dp, ino);
 				if (error) {

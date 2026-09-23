@@ -18,11 +18,27 @@
 
 #include <sys/types.h>
 
+struct ext4fs;
+struct ext4fs_block_group_descriptor;
+struct ext4fs_dinode_256;
 struct m_ext4fs;
 
+u_int32_t ext4fs_sb_csum (struct ext4fs *);
+int ext4fs_sb_csum_verify (struct ext4fs *);
+u_int32_t ext4fs_csum_seed (struct m_ext4fs *);
+
 /* Compute block or inode bitmap checksum (group number + bitmap data) */
-u_int32_t ext4fs_bitmap_csum (struct m_ext4fs *fs, u_int32_t group,
-    void *bitmap, size_t size);
+u_int32_t ext4fs_bitmap_csum (struct m_ext4fs *, u_int32_t, void *,
+    size_t);
+u_int16_t ext4fs_bgd_csum (struct m_ext4fs *,
+    struct ext4fs_block_group_descriptor *, u_int32_t);
+int ext4fs_bgd_csum_verify (struct m_ext4fs *,
+    struct ext4fs_block_group_descriptor *, u_int32_t);
+u_int32_t ext4fs_inode_csum (struct m_ext4fs *,
+    struct ext4fs_dinode_256 *, u_int32_t);
+int ext4fs_inode_has_csum_hi (const struct ext4fs_dinode_256 *);
+int ext4fs_inode_csum_verify (struct m_ext4fs *,
+    struct ext4fs_dinode_256 *, u_int32_t);
 
 /*
  * Write a directory block checksum tail at the end of buf.

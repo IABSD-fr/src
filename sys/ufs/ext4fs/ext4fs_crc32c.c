@@ -16,7 +16,14 @@
 
 #include <sys/param.h>
 #include <sys/types.h>
+#ifdef _KERNEL
 #include <sys/systm.h>
+#else
+#include <errno.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+#endif
 
 #include <lib/libkern/crc32c.h>
 
@@ -136,6 +143,17 @@ ext4fs_bgd_csum_verify (struct m_ext4fs *fs,
  * The checksum covers the inode number, generation, and the full
  * 256-byte inode with checksum fields zeroed.
  */
+int
+ext4fs_inode_has_csum_hi (const struct ext4fs_dinode_256 *dp)
+{
+	size_t end;
+
+	/* i_extra_isize counts bytes beginning at the 128-byte boundary. */
+	end = offsetof(struct ext4fs_dinode, i_checksum_hi) +
+	    sizeof(dp->dinode.i_checksum_hi);
+	return (letoh16(dp->dinode.i_extra_isize) >= end - 128);
+}
+
 u_int32_t
 ext4fs_inode_csum (struct m_ext4fs *fs,
     struct ext4fs_dinode_256 *dp, u_int32_t ino)
@@ -159,7 +177,8 @@ ext4fs_inode_csum (struct m_ext4fs *fs,
 
 	tmp = *dp;
 	tmp.dinode.i_checksum_lo = 0;
-	tmp.dinode.i_checksum_hi = 0;
+	if (ext4fs_inode_has_csum_hi(dp))
+		tmp.dinode.i_checksum_hi = 0;
 	crc = crc32c(crc, (const uint8_t *)&tmp, sizeof(tmp));
 
 	return ~crc;
@@ -181,9 +200,11 @@ ext4fs_inode_csum_verify (struct m_ext4fs *fs,
 		return 0;
 
 	provided = letoh16(dp->dinode.i_checksum_lo);
-	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
-		provided |= (u_int32_t)letoh16(dp->dinode.i_checksum_hi) << 16;
 	calculated = ext4fs_inode_csum(fs, dp, ino);
+	if (ext4fs_inode_has_csum_hi(dp))
+		provided |= (u_int32_t)letoh16(dp->dinode.i_checksum_hi) << 16;
+	else
+		calculated &= 0xffff;
 
 	if (provided != calculated) {
 		printf("ext4fs: inode %u checksum mismatch: "

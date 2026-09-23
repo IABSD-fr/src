@@ -611,19 +611,6 @@ int ext4fs_advlock (void *);
 
 int ext4fs_update (struct inode *, int);
 
-u_int32_t ext4fs_sb_csum (struct ext4fs *);
-int ext4fs_sb_csum_verify (struct ext4fs *);
-u_int32_t ext4fs_csum_seed (struct m_ext4fs *);
-u_int32_t ext4fs_bitmap_csum (struct m_ext4fs *, u_int32_t, void *, size_t);
-u_int16_t ext4fs_bgd_csum (struct m_ext4fs *,
-	struct ext4fs_block_group_descriptor *, u_int32_t);
-int ext4fs_bgd_csum_verify (struct m_ext4fs *,
-	struct ext4fs_block_group_descriptor *, u_int32_t);
-u_int32_t ext4fs_inode_csum (struct m_ext4fs *,
-	struct ext4fs_dinode_256 *, u_int32_t);
-int ext4fs_inode_csum_verify (struct m_ext4fs *,
-	struct ext4fs_dinode_256 *, u_int32_t);
-
 /* Directory entry size: 8 bytes header + name, rounded up to 4 */
 #define EXT4FS_DIRSIZ(namlen)	(((8 + (namlen)) + 3) & ~3)
 

@@ -262,4 +262,5 @@ Do not include these in the first working milestone:
 - Published ext4 JBD2 on-disk format documentation:
   <https://cdn.kernel.org/doc/html/latest/filesystems/ext4/journal.html>
 - IABSD's existing ext4fs implementation and locally generated filesystem
-  images. Linux source code is intentionally not used as implementation input.
+  images. Source code with an incompatible licence is intentionally not
+  used as implementation input.
