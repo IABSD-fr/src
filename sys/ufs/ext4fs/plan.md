@@ -320,12 +320,120 @@ The read-only pass also requires the complete image hash to remain unchanged.
       `PROG=` and a `REGRESS_ROOT_TARGETS` gate.
 - [x] Build the helper with `-Wall -Werror -Wextra`, validate the shell driver,
       and smoke-test every writable helper state without root privileges.
-- [ ] Run `run-regress-ext4fsops` as root against the booted production kernel.
-- [ ] Add malformed extent, directory, bitmap, descriptor, and geometry
-      fixtures that prove rejection is bounded and non-mutating.
-- [ ] Add multi-UID sticky/flag tests, same-inode rename coverage, special-file
-      behavior, injected I/O failures, and parallel allocation/free stress.
-- [ ] Run the full ordinary-operation and corruption suites on amd64 and i386.
+- [x] Run `run-regress-ext4fsops` as root against the booted production kernel.
+
+Expand the baseline with the following six groups of tests.  All kernel tests
+must exercise the booted production kernel, without a test-only kernel
+configuration or instrumentation.  Root-only cases must remain behind the
+BSD regress `REGRESS_ROOT_TARGETS` gate.  Fixtures must be ext4 filesystems;
+ext2 and ext3 compatibility is outside this project.
+
+### 1. Malformed metadata and non-mutation
+
+- [ ] Generate extent fixtures with bad magic, invalid depth, impossible
+      `eh_entries`/`eh_max`, unordered or overlapping logical ranges,
+      out-of-filesystem physical ranges, bad index targets, invalid unwritten
+      extents, and bad extent-block checksums.
+- [ ] Exercise corrupt depth-1 and depth-2 extent index/leaf blocks, including
+      self-reference and cyclic-reference cases, under a bounded timeout.
+- [ ] Generate directory blocks with zero, undersized, unaligned, and
+      over-running record lengths; inconsistent name lengths and inode
+      numbers; invalid file types; and damaged checksum tails.
+- [ ] Corrupt block and inode bitmap checksums and construct bitmaps which mark
+      reserved or out-of-final-group objects available.
+- [ ] Corrupt 32-byte and 64-byte group descriptors, their checksums, and each
+      bitmap/inode-table pointer independently.
+- [ ] Exercise overflowing group counts, truncated final groups, invalid
+      `FLEX_BG` placement, inconsistent uninitialized-group flags, and
+      filesystem geometry near 32-bit arithmetic boundaries.
+- [ ] Require every malformed fixture to fail in bounded time without a panic
+      or loop, and compare complete pre- and post-test image hashes to prove
+      that rejection did not modify the filesystem.
+
+### 2. ENOSPC and failure rollback
+
+- [ ] Exhaust data blocks and verify the results of a partial write, append,
+      sparse-file extension, truncate growth, and extent-tree split.
+- [ ] Exhaust free inodes and verify create, mkdir, mknod, symlink, and hard
+      link failure paths.
+- [ ] Force directory growth, rename replacement, and cross-directory rename
+      at low-space boundaries, checking both the old and new namespace after
+      each failure.
+- [ ] Hold an unlinked file open while exhausting space, then close it and
+      verify that its inode and blocks become reusable exactly once.
+- [ ] After every injected resource failure, verify the expected errno,
+      unmount cleanly, run `e2fsck -fn`, remount, validate surviving file data
+      and names, and check free-space/free-inode accounting.
+- [ ] Cover real device I/O error handling when a production-kernel mechanism
+      can provide deterministic failures without ext4fs instrumentation; keep
+      these cases separate from ordinary ENOSPC tests.
+
+### 3. Namespace, protection, and special files
+
+- [ ] Run credential-aware operations as multiple unprivileged UIDs and GIDs
+      from the root-gated helper, including owner, group, and supplementary-
+      group permission checks.
+- [ ] Verify sticky-directory unlink and rename rules for the directory owner,
+      file owner, unrelated users, and root.
+- [ ] Verify immutable and append-only behavior for write, truncate, link,
+      unlink, rename, and directory mutation, including persistence across a
+      remount.
+- [ ] Cover rename where source and destination are the same inode, all valid
+      file/directory source-target combinations, empty and non-empty directory
+      replacement, `.`/`..` rejection, and ancestor-cycle rejection.
+- [ ] Exercise FIFO blocking and non-blocking I/O, UNIX-domain socket creation
+      and removal, and safe character/block-device node metadata operations
+      without opening arbitrary devices.
+- [ ] Repeat rejected namespace operations enough times to expose vnode,
+      buffer, or reference leaks, then require an ordinary non-forced unmount.
+
+### 4. Parallel allocation and free stress
+
+- [ ] Add a deterministic seeded multi-process workload which concurrently
+      creates, writes, truncates, links, renames, unlinks, and recreates files
+      in shared and disjoint directories.
+- [ ] Run allocation/free races on both a mostly empty image and an image near
+      block and inode exhaustion.
+- [ ] Include competing directory growth, same-name creation, rename
+      replacement, and open-unlinked-file workloads.
+- [ ] Keep a userspace model of successful operations and verify namespace,
+      lengths, link counts, and file contents after sync and remount.
+- [ ] Bound every worker and the overall run with timeouts; record the seed on
+      failure so every random schedule/workload can be reproduced.
+- [ ] Finish every stress pass with a clean unmount, `e2fsck -fn`, a remount
+      verification pass, and another clean unmount.
+
+### 5. Format and boundary matrix
+
+- [ ] Test valid unwritten extents for reads, partial conversion, truncate,
+      hole punching where supported, and zero exposure at block boundaries.
+- [ ] Test read-only access to depth-2-or-deeper extent trees and prove that
+      unsupported mutations fail without changing the image; convert these to
+      success tests when deep-tree mutation is implemented.
+- [ ] Test indexed directories at one and multiple index levels; require
+      unsupported mutations to be rejected without silently damaging the
+      index.
+- [ ] Exercise 32-byte and 64-byte group descriptors, `FLEX_BG`, `UNINIT_BG`,
+      `metadata_csum`, and the explicitly supported feature combinations.
+- [ ] Exercise one-group and multi-group filesystems, a short final block
+      group, sparse large images, and logical/physical values around 2^31 and
+      2^32 without requiring fully allocated multi-terabyte storage.
+- [ ] Run each applicable case with 1 KiB, 2 KiB, and 4 KiB filesystem block
+      sizes and verify `HUGE_FILE` block accounting and timestamp boundaries.
+
+### 6. Architecture coverage
+
+- [ ] Build the kernel and both regression helpers with warnings treated as
+      errors on amd64 and i386, fixing narrowing, signedness, shift, and format
+      issues rather than suppressing them.
+- [ ] Run the complete ordinary-operation, malformed-metadata, ENOSPC,
+      namespace, and stress suites through the booted production kernel on
+      amd64 and i386.
+- [ ] Use identical deterministic seeds and fixture manifests on both
+      architectures, and compare expected errno values, namespace results,
+      file contents, and `e2fsck -fn` results.
+- [ ] Record architecture, filesystem block size, feature set, random seed,
+      and the exact failed stage in retained-fixture diagnostics.
 
 ## Phase 4: Convert metadata writers
 
