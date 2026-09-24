@@ -263,9 +263,14 @@ Writable initialization persists `RECOVER` before transaction data can become
 durable.  Clean unmount forces all work through the writer, verifies that the
 journal is empty, then durably clears `RECOVER` and sets `VALID`.  The kernel
 objects compile with production `-Werror` flags on amd64 and i386, and the
-non-root journal recovery and journal-core regression suites pass.  The final
-Phase 3 item remains open because no production metadata path invokes the
-writer yet; that activation and its root-only production-kernel tests begin
+non-root journal recovery and journal-core regression suites pass.
+
+On 2026-09-24, the root-only `run-regress-journal-mount` suite also passed in
+full against the rebuilt and booted production kernel.  This revalidates the
+kernel recovery matrix, runtime initialization, clean teardown, and the new
+incomplete-tail recovery rules without a test-only kernel configuration.  The
+final Phase 3 item remains open because no production metadata path invokes
+the writer yet; activation and writer-specific production-kernel tests begin
 with Phase 4.
 
 ## Phase 4: Convert metadata writers
