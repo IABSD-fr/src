@@ -273,6 +273,60 @@ final Phase 3 item remains open because no production metadata path invokes
 the writer yet; activation and writer-specific production-kernel tests begin
 with Phase 4.
 
+## Pre-Phase 4 ext4fs audit and baseline tests (2026-09-24)
+
+The existing non-journal filesystem paths were audited before connecting them
+to the runtime journal.  The audit used only IABSD/OpenBSD/BSD source and the
+published ext4 on-disk format; Linux source was not used.  The implementation
+is not yet safe to declare production-ready.  Journalling the current writers
+would make several existing semantic and corruption bugs durable, so the
+following issues are pre-Phase 4 blockers:
+
+- validate normal extent trees as strictly as journal and orphan extent trees,
+  including depth, entry capacity, ordering, physical ranges, checksums, and
+  unwritten extents; reject writes and truncates of unsupported depth-2-or-
+  deeper trees rather than treating index blocks as leaves;
+- validate mount geometry and every block-group metadata location with
+  overflow-safe arithmetic on both 32-bit and 64-bit systems, authenticate
+  allocation bitmaps before use, bound the short final group, and make
+  `FLEX_BG` plus uninitialized-group reconstruction safe;
+- validate directory records before dereferencing them, verify directory
+  checksums, and either maintain indexed directories or reject their mutation;
+- restore BSD namespace and protection semantics, particularly sticky
+  directories, same-inode and type-changing rename cases, immutable/append
+  flags, special vnode initialization, and error propagation during deletion;
+- serialize allocation/free accounting, avoid publishing initialized extents
+  before their data is written, retain dirty inode state after I/O errors, and
+  handle external extended-attribute block lifetime;
+- define the writable ext4 feature profile explicitly: extent and file-type
+  requirements, 32-byte versus 64-byte group descriptors, journal-less ext4,
+  checksum feature dependencies, and indexed directories;
+- remove signed `off_t` decoding and timestamp-shift undefined behavior, and
+  use the correct `HUGE_FILE` block-count units, with i386 coverage.
+
+A new root-only `regress/sys/ext4fsops` suite provides a repeatable baseline
+through the booted production kernel.  It builds a separate `PROG=ext4fsops`
+workload helper and runs it on 1 KiB, 2 KiB, and 4 KiB ext4 images.  Each
+mutation stage is followed by an unmounted `e2fsck -fn` check and a remount
+verification.  Coverage includes partial and multi-block I/O, append and
+overwrite, sparse files above 4 GiB, truncate shrink/regrow, depth-1 extent-
+tree promotion, directory growth/deletion/reuse, hard links, fast and
+block-backed symlinks, FIFO creation, same- and cross-directory rename,
+replacement, directory-loop rejection, open-unlinked lifetime, mode and
+timestamp persistence, maximum-length names, and read-only mutation rejection.
+The read-only pass also requires the complete image hash to remain unchanged.
+
+- [x] Integrate the ordinary-operation suite into `regress/sys` with its own
+      `PROG=` and a `REGRESS_ROOT_TARGETS` gate.
+- [x] Build the helper with `-Wall -Werror -Wextra`, validate the shell driver,
+      and smoke-test every writable helper state without root privileges.
+- [ ] Run `run-regress-ext4fsops` as root against the booted production kernel.
+- [ ] Add malformed extent, directory, bitmap, descriptor, and geometry
+      fixtures that prove rejection is bounded and non-mutating.
+- [ ] Add multi-UID sticky/flag tests, same-inode rename coverage, special-file
+      behavior, injected I/O failures, and parallel allocation/free stress.
+- [ ] Run the full ordinary-operation and corruption suites on amd64 and i386.
+
 ## Phase 4: Convert metadata writers
 
 Audit every metadata write in `sys/ufs/ext4fs` and route it through a journal
