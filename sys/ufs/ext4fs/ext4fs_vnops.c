@@ -988,6 +988,8 @@ ext4fs_buf_alloc (struct inode *ip, u_int64_t lbn, int size,
 	/* Check if already mapped */
 	error = ext4fs_extent_pblk(ip, lbn, &pblk, &ncontig);
 	if (error == 0 && pblk != 0) {
+		if (bpp == NULL)
+			return (0);
 		/* Already mapped, just read */
 		error = bread(ip->i_devvp,
 		    (daddr_t)EXT4FS_FSBTODB(fs, pblk),
@@ -1067,12 +1069,14 @@ ext4fs_buf_alloc (struct inode *ip, u_int64_t lbn, int size,
 
 	ip->i_flag |= IN_CHANGE | IN_UPDATE;
 
-	/* Get buffer for the new block */
-	*bpp = getblk(ip->i_devvp,
-	    (daddr_t)EXT4FS_FSBTODB(fs, pblk),
-	    fs->m_block_size, 0, INFSLP);
-	if (flags & B_CLRBUF)
-		clrbuf(*bpp);
+	if (bpp != NULL) {
+		/* Get a raw buffer for metadata callers. */
+		*bpp = getblk(ip->i_devvp,
+		    (daddr_t)EXT4FS_FSBTODB(fs, pblk),
+		    fs->m_block_size, 0, INFSLP);
+		if (flags & B_CLRBUF)
+			clrbuf(*bpp);
+	}
 
 	return (0);
 }
@@ -2400,21 +2404,22 @@ ext4fs_write (void *v)
 		} else {
 			/* Partial block or not past EOF: single alloc */
 			error = ext4fs_buf_alloc(ip, lbn, fs->m_block_size,
-			    ap->a_cred, &bp, B_CLRBUF);
+			    ap->a_cred, NULL, 0);
 			if (error)
 				break;
+			bp = getblk(vp, (daddr_t)lbn, fs->m_block_size,
+			    0, INFSLP);
+			clrbuf(bp);
 			goto do_io;
 		}
 
 		/* Full block: getblk without read; partial: bread */
 		if (blkoffset == 0 && xfersize == fs->m_block_size) {
-			bp = getblk(ip->i_devvp,
-			    (daddr_t)EXT4FS_FSBTODB(fs, pblk),
-			    fs->m_block_size, 0, INFSLP);
+			bp = getblk(vp, (daddr_t)lbn, fs->m_block_size,
+			    0, INFSLP);
 		} else {
-			error = bread(ip->i_devvp,
-			    (daddr_t)EXT4FS_FSBTODB(fs, pblk),
-			    fs->m_block_size, &bp);
+			error = bread(vp, (daddr_t)lbn, fs->m_block_size,
+			    &bp);
 			if (error) {
 				brelse(bp);
 				break;
