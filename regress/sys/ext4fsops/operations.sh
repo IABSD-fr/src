@@ -11,6 +11,7 @@ E2FSCK=${E2FSCK:-e2fsck}
 VNCONFIG=${VNCONFIG:-vnconfig}
 MOUNT_EXT4FS=${MOUNT_EXT4FS:-mount_ext4fs}
 UMOUNT=${UMOUNT:-umount}
+PSTAT=${PSTAT:-pstat}
 TIMEOUT=${TIMEOUT:-timeout}
 EXT4FSOPS=${EXT4FSOPS:-./ext4fsops}
 EXT4FS_TIMEOUT=${EXT4FS_TIMEOUT:-60}
@@ -137,7 +138,22 @@ mount_image()
 
 unmount_image()
 {
-	"$UMOUNT" "$mountpoint" || fail "unmount failed"
+	stage=$1
+	if ! "$UMOUNT" "$mountpoint"; then
+		if command -v "$PSTAT" >/dev/null 2>&1; then
+			"$PSTAT" -v >"$case_dir/pstat-unmount.log" 2>&1 || :
+			awk -v mountpoint="$mountpoint" '
+			    /^\*\*\* MOUNT / {
+				if (printing)
+					exit
+				if (index($0, mountpoint) != 0)
+					printing = 1
+			    }
+			    printing { print }
+			' "$case_dir/pstat-unmount.log" >&2
+		fi
+		fail "unmount failed after $stage"
+	fi
 	mounted=0
 }
 
@@ -172,7 +188,7 @@ run_case()
 	attach_image
 	mount_image ""
 	run_step create
-	unmount_image
+	unmount_image create
 	detach_image
 	check_image create
 
@@ -180,14 +196,14 @@ run_case()
 	mount_image ""
 	run_step verify-create
 	run_step mutate
-	unmount_image
+	unmount_image mutate
 	detach_image
 	check_image mutate
 
 	attach_image
 	mount_image ""
 	run_step verify-final
-	unmount_image
+	unmount_image final
 	detach_image
 	check_image final
 
@@ -195,7 +211,7 @@ run_case()
 	attach_image
 	mount_image ro
 	run_step verify-readonly
-	unmount_image
+	unmount_image read-only
 	detach_image
 	after=$(sha256 -q "$image")
 	[ "$before" = "$after" ] || fail "read-only mount changed the image"

@@ -2642,8 +2642,8 @@ ext4fs_checkpath (struct inode *source, struct inode *target, struct ucred *cred
 		if (ino == ROOTINO)
 			break;
 
-		VOP_UNLOCK(vp);
-		error = VFS_VGET(vp->v_mount, ino, &vp);
+		vput(vp);
+		error = VFS_VGET(ITOV(source)->v_mount, ino, &vp);
 		if (error) {
 			vp = NULL;
 			break;
