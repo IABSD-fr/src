@@ -330,6 +330,15 @@ ext2 and ext3 compatibility is outside this project.
 
 ### 1. Malformed metadata and non-mutation
 
+- [x] Integrate a separate `regress/sys/ext4fs_corrupt` suite with its own
+      `PROG=ext4fs_corrupt`, a non-root fixture check, and a production-kernel
+      target protected by `REGRESS_ROOT_TARGETS`.
+- [x] Add the initial 1 KiB, 2 KiB, and 4 KiB rejection matrix for bad
+      superblock and group-descriptor checksums, invalid block size, zero
+      block/inode group sizes, invalid inode/descriptor sizes, invalid first
+      inode, unsupported incompat features, and `RECOVER` without a journal.
+      Each kernel case has a valid read-only control, a timeout, and a complete
+      pre/post image hash comparison.
 - [ ] Generate extent fixtures with bad magic, invalid depth, impossible
       `eh_entries`/`eh_max`, unordered or overlapping logical ranges,
       out-of-filesystem physical ranges, bad index targets, invalid unwritten
