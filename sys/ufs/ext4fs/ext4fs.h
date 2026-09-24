@@ -47,6 +47,7 @@ struct inode;
 struct nameidata;
 struct statfs;
 struct vfsconf;
+struct ext4fs_journal;
 
 #define EXT4FS_EXTENT_DEPTH_MAX		5
 #define EXT4FS_FUNCTION_MAX		32
@@ -424,6 +425,7 @@ struct m_ext4fs {
 	u_int32_t	m_inode_table_blocks_per_group;
 	u_int32_t	m_resize_dind_block;
 	struct ext4fs_block_group_descriptor *m_gd;
+	struct ext4fs_journal *m_journal;
 };
 
 struct ext4fs_block_group_descriptor {

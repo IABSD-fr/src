@@ -173,6 +173,7 @@ struct jbd2_replay_ctx {
 	u_int32_t		rc_first;
 	u_int32_t		rc_sequence;	/* starting sequence */
 	u_int32_t		rc_start;	/* starting block */
+	u_int32_t		rc_max_transaction;
 
 	/* Journal feature flags */
 	u_int32_t		rc_features_compat;
@@ -199,15 +200,34 @@ struct jbd2_replay_ctx {
 	u_int32_t		rc_replay_count;
 };
 
+struct buf;
 struct ext4fs_journal_handle;
+struct mount;
 struct proc;
+struct vnode;
 
+int	jbd2_journal_open (struct vnode *, struct m_ext4fs *,
+    struct jbd2_replay_ctx *, u_int64_t *);
+void	jbd2_journal_close (struct jbd2_replay_ctx *);
 int	ext4fs_journal_replay (struct vnode *, struct m_ext4fs *,
     struct proc *);
 
+int	ext4fs_journal_init (struct mount *);
+void	ext4fs_journal_destroy (struct mount *);
 void	ext4fs_journal_abort (struct mount *, int);
+
+/*
+ * A buffer passed to get_write_access() must be B_BUSY.  On success, the
+ * handle owns it and the caller must not bwrite(), bdwrite(), bawrite(), or
+ * brelse() it.  dirty_metadata() transfers that ownership to the transaction;
+ * otherwise journal_end() releases it.  A transaction keeps every dirtied
+ * buffer busy until the commit/checkpoint path writes it, or abort teardown
+ * invalidates and releases it.
+ */
 int	ext4fs_journal_begin (struct mount *, unsigned int,
     struct ext4fs_journal_handle **);
+int	ext4fs_journal_add_ordered (struct ext4fs_journal_handle *,
+    struct vnode *);
 int	ext4fs_journal_dirty_metadata (struct ext4fs_journal_handle *,
     struct buf *);
 int	ext4fs_journal_end (struct ext4fs_journal_handle *);

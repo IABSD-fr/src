@@ -1309,17 +1309,14 @@ jbd2_flush_device (struct vnode *devvp, struct proc *p)
 }
 
 /*
- * Main entry point: replay the ext4 journal.
- *
- * Called during mount when the RECOVER incompat flag is set.
- * Reads the internal journal inode directly from the inode table,
- * runs the three-pass replay, then clears the journal.
+ * Open and validate the internal journal, then build its complete logical to
+ * physical block map.  Recovery and the runtime journal core both use this
+ * path so they cannot disagree about journal geometry or feature support.
  */
 int
-ext4fs_journal_replay (struct vnode *devvp, struct m_ext4fs *fs,
-    struct proc *p)
+jbd2_journal_open (struct vnode *devvp, struct m_ext4fs *fs,
+    struct jbd2_replay_ctx *ctx, u_int64_t *jblock0p)
 {
-	struct jbd2_replay_ctx ctx;
 	struct jbd2_superblock *jsb;
 	struct ext4fs_dinode *jdi;
 	struct buf *bp, *ibp;
@@ -1327,19 +1324,19 @@ ext4fs_journal_replay (struct vnode *devvp, struct m_ext4fs *fs,
 	u_int32_t btype, unsupported;
 	int error;
 
-	memset(&ctx, 0, sizeof(ctx));
-	ctx.rc_devvp = devvp;
-	ctx.rc_fs = fs;
+	memset(ctx, 0, sizeof(*ctx));
+	ctx->rc_devvp = devvp;
+	ctx->rc_fs = fs;
 	bp = NULL;
 	ibp = NULL;
 
-	error = jbd2_read_journal_inode(&ctx, &ibp, &jdi);
+	error = jbd2_read_journal_inode(ctx, &ibp, &jdi);
 	if (error)
 		goto out;
 
-	ctx.rc_journal_eh = &jdi->i_extent_header;
-	ctx.rc_journal_ino = fs->m_journal_inode_number;
-	ctx.rc_journal_gen = jdi->i_nfs_generation;
+	ctx->rc_journal_eh = &jdi->i_extent_header;
+	ctx->rc_journal_ino = fs->m_journal_inode_number;
+	ctx->rc_journal_gen = jdi->i_nfs_generation;
 	if (!(letoh32(jdi->i_flags) & EXTFS_INODE_FLAG_EXTENTS)) {
 		printf("ext4fs: journal inode does not use extents\n");
 		error = EINVAL;
@@ -1353,7 +1350,7 @@ ext4fs_journal_replay (struct vnode *devvp, struct m_ext4fs *fs,
 		goto out;
 	}
 
-	error = jbd2_extent_lookup(&ctx, ctx.rc_journal_eh,
+	error = jbd2_extent_lookup(ctx, ctx->rc_journal_eh,
 	    sizeof(jdi->i_block), -1, 0, &jblock0);
 	if (error || jblock0 == 0) {
 		printf("ext4fs: can't locate journal block 0\n");
@@ -1361,17 +1358,14 @@ ext4fs_journal_replay (struct vnode *devvp, struct m_ext4fs *fs,
 		goto out;
 	}
 
-	/* Read journal superblock (journal block 0) */
 	error = bread(devvp, (daddr_t)EXT4FS_FSBTODB(fs, jblock0),
 	    fs->m_block_size, &bp);
 	if (error) {
 		printf("ext4fs: can't read journal superblock\n");
 		goto out;
 	}
-
 	jsb = (struct jbd2_superblock *)bp->b_data;
 
-	/* Validate journal superblock */
 	if (betoh32(jsb->s_header.h_magic) != JBD2_MAGIC) {
 		printf("ext4fs: bad journal magic 0x%x\n",
 		    betoh32(jsb->s_header.h_magic));
@@ -1392,53 +1386,47 @@ ext4fs_journal_replay (struct vnode *devvp, struct m_ext4fs *fs,
 		goto out;
 	}
 
-	ctx.rc_blocksize = betoh32(jsb->s_blocksize);
-	ctx.rc_maxlen = betoh32(jsb->s_maxlen);
-	ctx.rc_first = betoh32(jsb->s_first);
-	ctx.rc_sequence = betoh32(jsb->s_sequence);
-	ctx.rc_start = betoh32(jsb->s_start);
-
-	if (btype == JBD2_SUPERBLOCK_V2) {
-		ctx.rc_features_compat = betoh32(jsb->s_feature_compat);
-		ctx.rc_features_incompat = betoh32(jsb->s_feature_incompat);
-		ctx.rc_features_ro_compat = betoh32(jsb->s_feature_ro_compat);
-		if (betoh32(jsb->s_nr_users) != 1) {
-			printf("ext4fs: shared journal is not supported\n");
-			error = EINVAL;
-			goto out;
-		}
-	} else {
-		ctx.rc_features_compat = 0;
-		ctx.rc_features_incompat = 0;
-		ctx.rc_features_ro_compat = 0;
-	}
-
-	if (ctx.rc_blocksize != fs->m_block_size) {
-		printf("ext4fs: journal blocksize %u != fs blocksize %llu\n",
-		    ctx.rc_blocksize, (unsigned long long)fs->m_block_size);
+	ctx->rc_blocksize = betoh32(jsb->s_blocksize);
+	ctx->rc_maxlen = betoh32(jsb->s_maxlen);
+	ctx->rc_first = betoh32(jsb->s_first);
+	ctx->rc_sequence = betoh32(jsb->s_sequence);
+	ctx->rc_start = betoh32(jsb->s_start);
+	ctx->rc_max_transaction = betoh32(jsb->s_max_transaction);
+	ctx->rc_features_compat = betoh32(jsb->s_feature_compat);
+	ctx->rc_features_incompat = betoh32(jsb->s_feature_incompat);
+	ctx->rc_features_ro_compat = betoh32(jsb->s_feature_ro_compat);
+	if (betoh32(jsb->s_nr_users) != 1) {
+		printf("ext4fs: shared journal is not supported\n");
 		error = EINVAL;
 		goto out;
 	}
-	if (journal_bytes % ctx.rc_blocksize != 0) {
+
+	if (ctx->rc_blocksize != fs->m_block_size) {
+		printf("ext4fs: journal blocksize %u != fs blocksize %llu\n",
+		    ctx->rc_blocksize, (unsigned long long)fs->m_block_size);
+		error = EINVAL;
+		goto out;
+	}
+	if (journal_bytes % ctx->rc_blocksize != 0) {
 		printf("ext4fs: journal inode size is not block aligned\n");
 		error = EINVAL;
 		goto out;
 	}
-	journal_blocks = journal_bytes / ctx.rc_blocksize;
-	if (ctx.rc_first == 0 || ctx.rc_first >= ctx.rc_maxlen ||
-	    ctx.rc_maxlen > journal_blocks ||
-	    ctx.rc_maxlen > JBD2_MAX_BLOCKMAP_ENTRIES ||
-	    (ctx.rc_start != 0 && (ctx.rc_start < ctx.rc_first ||
-	    ctx.rc_start >= ctx.rc_maxlen))) {
+	journal_blocks = journal_bytes / ctx->rc_blocksize;
+	if (ctx->rc_first == 0 || ctx->rc_first >= ctx->rc_maxlen ||
+	    ctx->rc_maxlen > journal_blocks ||
+	    ctx->rc_maxlen > JBD2_MAX_BLOCKMAP_ENTRIES ||
+	    (ctx->rc_start != 0 && (ctx->rc_start < ctx->rc_first ||
+	    ctx->rc_start >= ctx->rc_maxlen))) {
 		printf("ext4fs: invalid journal geometry: first=%u start=%u "
-		    "maxlen=%u inode-blocks=%llu\n", ctx.rc_first,
-		    ctx.rc_start, ctx.rc_maxlen,
+		    "maxlen=%u inode-blocks=%llu\n", ctx->rc_first,
+		    ctx->rc_start, ctx->rc_maxlen,
 		    (unsigned long long)journal_blocks);
 		error = EINVAL;
 		goto out;
 	}
 
-	unsupported = ctx.rc_features_compat &
+	unsupported = ctx->rc_features_compat &
 	    ~JBD2_FEATURE_COMPAT_SUPPORTED;
 	if (unsupported != 0) {
 		printf("ext4fs: unsupported journal compat features 0x%x\n",
@@ -1446,7 +1434,7 @@ ext4fs_journal_replay (struct vnode *devvp, struct m_ext4fs *fs,
 		error = EINVAL;
 		goto out;
 	}
-	unsupported = ctx.rc_features_incompat &
+	unsupported = ctx->rc_features_incompat &
 	    ~JBD2_FEATURE_INCOMPAT_SUPPORTED;
 	if (unsupported != 0) {
 		printf("ext4fs: unsupported journal incompat features 0x%x\n",
@@ -1454,7 +1442,7 @@ ext4fs_journal_replay (struct vnode *devvp, struct m_ext4fs *fs,
 		error = EINVAL;
 		goto out;
 	}
-	unsupported = ctx.rc_features_ro_compat &
+	unsupported = ctx->rc_features_ro_compat &
 	    ~JBD2_FEATURE_RO_COMPAT_SUPPORTED;
 	if (unsupported != 0) {
 		printf("ext4fs: unsupported journal ro-compat features 0x%x\n",
@@ -1462,13 +1450,13 @@ ext4fs_journal_replay (struct vnode *devvp, struct m_ext4fs *fs,
 		error = EINVAL;
 		goto out;
 	}
-	if ((ctx.rc_features_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V2) &&
-	    (ctx.rc_features_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3)) {
+	if ((ctx->rc_features_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V2) &&
+	    (ctx->rc_features_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3)) {
 		printf("ext4fs: journal enables both checksum v2 and v3\n");
 		error = EINVAL;
 		goto out;
 	}
-	if (btype == JBD2_SUPERBLOCK_V2) {
+	{
 		const u_int8_t zero_uuid[16] = { 0 };
 		const u_int8_t *expected_uuid;
 
@@ -1482,17 +1470,17 @@ ext4fs_journal_replay (struct vnode *devvp, struct m_ext4fs *fs,
 			goto out;
 		}
 	}
-	memcpy(ctx.rc_uuid, jsb->s_uuid, sizeof(ctx.rc_uuid));
-	ctx.rc_checksum_seed = crc32c(0, jsb->s_uuid,
+	memcpy(ctx->rc_uuid, jsb->s_uuid, sizeof(ctx->rc_uuid));
+	ctx->rc_checksum_seed = crc32c(0, jsb->s_uuid,
 	    sizeof(jsb->s_uuid));
-	if (jbd2_has_csum_v2or3(&ctx) &&
+	if (jbd2_has_csum_v2or3(ctx) &&
 	    jsb->s_checksum_type != JBD2_CHECKSUM_CRC32C) {
 		printf("ext4fs: unsupported journal checksum type %u\n",
 		    jsb->s_checksum_type);
 		error = EINVAL;
 		goto out;
 	}
-	if (!jbd2_superblock_csum_verify(&ctx, jsb)) {
+	if (!jbd2_superblock_csum_verify(ctx, jsb)) {
 		printf("ext4fs: invalid journal superblock checksum\n");
 		error = EINVAL;
 		goto out;
@@ -1500,12 +1488,56 @@ ext4fs_journal_replay (struct vnode *devvp, struct m_ext4fs *fs,
 
 	brelse(bp);
 	bp = NULL;
+	error = jbd2_build_blockmap(ctx);
+	if (error)
+		goto out;
+	*jblock0p = jblock0;
 
-	/* Build the complete logical-to-physical map while the inode is pinned. */
-	error = jbd2_build_blockmap(&ctx);
-	brelse(ibp);
-	ibp = NULL;
-	ctx.rc_journal_eh = NULL;
+out:
+	if (bp != NULL)
+		brelse(bp);
+	if (ibp != NULL)
+		brelse(ibp);
+	ctx->rc_journal_eh = NULL;
+	if (error)
+		jbd2_journal_close(ctx);
+	return (error);
+}
+
+void
+jbd2_journal_close (struct jbd2_replay_ctx *ctx)
+{
+	if (ctx->rc_blockset != NULL)
+		free(ctx->rc_blockset, M_TEMP,
+		    (ctx->rc_blockset_mask + 1) * sizeof(*ctx->rc_blockset));
+	if (ctx->rc_blockmap != NULL)
+		free(ctx->rc_blockmap, M_TEMP,
+		    ctx->rc_blockmap_count * sizeof(*ctx->rc_blockmap));
+	if (ctx->rc_revoke != NULL)
+		free(ctx->rc_revoke, M_TEMP,
+		    ctx->rc_revoke_alloc * sizeof(*ctx->rc_revoke));
+	memset(ctx, 0, sizeof(*ctx));
+}
+
+/*
+ * Main entry point: replay the ext4 journal.
+ *
+ * Called during mount when the RECOVER incompat flag is set.
+ * Reads the internal journal inode directly from the inode table,
+ * runs the three-pass replay, then clears the journal.
+ */
+int
+ext4fs_journal_replay (struct vnode *devvp, struct m_ext4fs *fs,
+    struct proc *p)
+{
+	struct jbd2_replay_ctx ctx;
+	struct jbd2_superblock *jsb;
+	struct buf *bp;
+	u_int64_t jblock0;
+	int error;
+
+	bp = NULL;
+	error = jbd2_journal_open(devvp, fs, &ctx, &jblock0);
 	if (error)
 		goto out;
 	if (ctx.rc_start == 0) {
@@ -1643,19 +1675,6 @@ clear_recover:
 out:
 	if (bp != NULL)
 		brelse(bp);
-	if (ibp != NULL)
-		brelse(ibp);
-	if (ctx.rc_blockset != NULL)
-		free(ctx.rc_blockset, M_TEMP,
-		    (ctx.rc_blockset_mask + 1) * sizeof(*ctx.rc_blockset));
-	if (ctx.rc_blockmap != NULL)
-		free(ctx.rc_blockmap, M_TEMP,
-		    ctx.rc_blockmap_count *
-		    sizeof(struct jbd2_blockmap_entry));
-	if (ctx.rc_revoke != NULL)
-		free(ctx.rc_revoke, M_TEMP,
-		    ctx.rc_revoke_alloc *
-		    sizeof(struct jbd2_revoke_entry));
-
+	jbd2_journal_close(&ctx);
 	return (error);
 }

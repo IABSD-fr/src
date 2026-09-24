@@ -388,6 +388,13 @@ ext4fs_mountfs (struct vnode *devvp, struct mount *mp, struct proc *p)
 		error = ext4fs_orphan_cleanup(mp);
 		if (error)
 			goto out;
+	}
+
+	error = ext4fs_journal_init(mp);
+	if (error)
+		goto out;
+
+	if (ronly == 0) {
 		/*
 		 * Keep the on-disk filesystem clean while orphan recovery is
 		 * checkpointing.  Every incomplete recovery retains an orphan
@@ -418,6 +425,8 @@ out:
 		VOP_UNLOCK(devvp);
 	}
 	if (ump) {
+		if (mfs != NULL && mfs->m_journal != NULL)
+			ext4fs_journal_destroy(mp);
 		if (mfs && mfs->m_gd != NULL) {
 			size_t gd_size = mfs->m_block_group_count *
 			    sizeof(struct ext4fs_block_group_descriptor);
@@ -1249,11 +1258,15 @@ ext4fs_unmount (struct mount *mp, int mntflags, struct proc *p)
 		return (error);
 	ump = VFSTOUFS(mp);
 	mfs = ump->um_e4fs;
+	if ((error = ext4fs_journal_force_commit(mp)) != 0)
+		return (error);
 
 	if (!mfs->m_read_only && mfs->m_fs_was_modified) {
 		mfs->m_state = EXT4FS_STATE_VALID;
-		ext4fs_sbwrite(mp);
+		if ((error = ext4fs_sbwrite(mp)) != 0)
+			return (error);
 	}
+	ext4fs_journal_destroy(mp);
 
 	if (ump->um_devvp->v_type != VBAD)
 		ump->um_devvp->v_specmountpoint = NULL;
