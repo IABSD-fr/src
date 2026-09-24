@@ -106,7 +106,9 @@ struct jbd2_superblock {
 	u_int8_t	s_checksum_type;
 	u_int8_t	s_padding2[3];
 	/* 0x54 */
-	u_int8_t	s_padding[168];
+	u_int32_t	s_num_fc_blocks;
+	u_int32_t	s_head;
+	u_int8_t	s_padding[160];
 	/* 0xFC */
 	u_int32_t	s_checksum;
 	/* 0x100 */
@@ -173,6 +175,7 @@ struct jbd2_replay_ctx {
 	u_int32_t		rc_first;
 	u_int32_t		rc_sequence;	/* starting sequence */
 	u_int32_t		rc_start;	/* starting block */
+	u_int32_t		rc_head;	/* next unused block when clean */
 	u_int32_t		rc_max_transaction;
 
 	/* Journal feature flags */
@@ -209,6 +212,17 @@ struct vnode;
 int	jbd2_journal_open (struct vnode *, struct m_ext4fs *,
     struct jbd2_replay_ctx *, u_int64_t *);
 void	jbd2_journal_close (struct jbd2_replay_ctx *);
+int	jbd2_has_csum_v2or3 (struct jbd2_replay_ctx *);
+u_int32_t	jbd2_block_checksum (struct jbd2_replay_ctx *, const void *,
+    size_t);
+u_int32_t	jbd2_data_block_checksum (struct jbd2_replay_ctx *,
+    const void *, u_int32_t);
+u_int32_t	jbd2_descriptor_limit (struct jbd2_replay_ctx *);
+int	jbd2_superblock_csum_verify (struct jbd2_replay_ctx *,
+    struct jbd2_superblock *);
+void	jbd2_superblock_csum_set (struct jbd2_replay_ctx *,
+    struct jbd2_superblock *);
+int	jbd2_flush_device (struct vnode *, struct proc *);
 int	ext4fs_journal_replay (struct vnode *, struct m_ext4fs *,
     struct proc *);
 
@@ -232,6 +246,7 @@ int	ext4fs_journal_dirty_metadata (struct ext4fs_journal_handle *,
     struct buf *);
 int	ext4fs_journal_end (struct ext4fs_journal_handle *);
 int	ext4fs_journal_force_commit (struct mount *);
+int	ext4fs_journal_mark_clean (struct mount *);
 int	ext4fs_journal_get_write_access (struct ext4fs_journal_handle *,
     struct buf *, u_int64_t);
 int	ext4fs_journal_revoke (struct ext4fs_journal_handle *, u_int64_t);

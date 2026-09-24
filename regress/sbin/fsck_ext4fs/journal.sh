@@ -712,10 +712,15 @@ test_incomplete_transaction()
 		printf 'journal_close\n'
 	} >"$case_dir/debugfs.cmd"
 	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
+	dd if="$case_dir/image" of="$case_dir/home-before" bs=4096 \
+	    skip="$FREE_FIRST" count=1 status=none
 	journal_block "$case_dir/image" 3
 	dd if=/dev/zero of="$case_dir/image" bs=4096 \
 	    seek="$JOURNAL_BLOCK" count=1 conv=notrunc status=none
-	expect_replay_failure_unchanged "$case_dir/image"
+	replay "$case_dir/image"
+	compare_blocks "$case_dir/image" 4096 "$FREE_FIRST" 1 \
+	    "$case_dir/home-before"
+	verify_e2fsck "$case_dir/image"
 }
 
 test_validation_atomicity()
@@ -1150,28 +1155,45 @@ test_structured_field_fuzz()
 	done <<-EOF
 	descriptor-type-zero 1 32 4 0
 	descriptor-type-max 1 32 4 4294967295
-	commit-magic-zero 10 32 0 0
 	commit-type-descriptor 10 32 4 1
 	commit-type-max 10 32 4 4294967295
 	commit-sequence-zero 10 32 8 0
 	tag-target-max 1 32 12 4294967295
 	tag-first-same-uuid 1 16 18 10
-	tag-count-too-small 1 16 18 8
 	tag-missing-last 1 16 $tag_final_flags 2
 	tag-unknown-flags 1 16 $tag_final_flags 32770
 	EOF
 
-	# Add a ninth synthetic tag after clearing LAST_TAG on tag eight.  Scan
-	# must reject the derived over-count rather than consume the commit block
-	# as journal data.
+	# A shorter, otherwise valid descriptor followed by journal data is
+	# indistinguishable from an interrupted transaction.  It must be
+	# discarded without writing any of its home blocks.
+	case_dir=$root_dir/tag-count-too-small
+	mkdir "$case_dir"
+	cp "$descriptor_base" "$case_dir/image"
+	dd if="$descriptor_base" of="$case_dir/home-before" bs=4096 \
+	    skip="$descriptor_target" count=8 status=none
+	write_be16_journal "$case_dir/image" 1 18 8
+	replay "$case_dir/image"
+	compare_blocks "$case_dir/image" 4096 "$descriptor_target" 8 \
+	    "$case_dir/home-before"
+	verify_e2fsck "$case_dir/image"
+
+	# Add a ninth valid tag after clearing LAST_TAG on tag eight.  The old
+	# commit block is then payload and no commit record remains, so this is
+	# another interrupted transaction and none of it may reach home blocks.
 	case_dir=$root_dir/tag-count-too-large
 	mkdir "$case_dir"
 	cp "$descriptor_base" "$case_dir/image"
+	dd if="$descriptor_base" of="$case_dir/home-before" bs=4096 \
+	    skip="$descriptor_target" count=8 status=none
 	write_be16_journal "$case_dir/image" 1 "$tag_final_flags" 2
 	write_be32_journal "$case_dir/image" 1 "$tag_extra_start" \
 	    "$descriptor_target"
 	write_be16_journal "$case_dir/image" 1 "$tag_extra_flags" 10
-	expect_replay_failure_unchanged "$case_dir/image"
+	replay "$case_dir/image"
+	compare_blocks "$case_dir/image" 4096 "$descriptor_target" 8 \
+	    "$case_dir/home-before"
+	verify_e2fsck "$case_dir/image"
 
 	# Revoke lengths are byte counts including the 16-byte header.  These
 	# boundary values are invalid for both four- and eight-byte records.

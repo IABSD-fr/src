@@ -541,19 +541,27 @@ jbd2_data_block_csum_verify (struct jbd2_replay_ctx *ctx, void *data,
     u_int32_t sequence, u_int32_t provided)
 {
 	u_int32_t crc;
-	u_int32_t sequence_be;
 
 	if (!jbd2_has_csum_v2or3(ctx))
 		return (1);
 
-	sequence_be = htobe32(sequence);
-	crc = crc32c(ctx->rc_checksum_seed, (const uint8_t *)&sequence_be,
-	    sizeof(sequence_be));
-	crc = ~crc32c(crc, data, ctx->rc_blocksize);
+	crc = jbd2_data_block_checksum(ctx, data, sequence);
 
 	if (ctx->rc_features_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3)
 		return (crc == provided);
 	return ((u_int16_t)crc == (u_int16_t)provided);
+}
+
+u_int32_t
+jbd2_data_block_checksum (struct jbd2_replay_ctx *ctx, const void *data,
+    u_int32_t sequence)
+{
+	u_int32_t crc, sequence_be;
+
+	sequence_be = htobe32(sequence);
+	crc = crc32c(ctx->rc_checksum_seed, (const uint8_t *)&sequence_be,
+	    sizeof(sequence_be));
+	return (~crc32c(crc, data, ctx->rc_blocksize));
 }
 
 u_int32_t
@@ -825,8 +833,6 @@ jbd2_pass_scan (struct jbd2_replay_ctx *ctx)
 		hdr = (struct jbd2_header *)bp->b_data;
 		if (betoh32(hdr->h_magic) != JBD2_MAGIC) {
 			brelse(bp);
-			if (in_transaction)
-				return (EINVAL);
 			break;
 		}
 		if (betoh32(hdr->h_sequence) != seq) {
@@ -893,8 +899,13 @@ jbd2_pass_scan (struct jbd2_replay_ctx *ctx)
 			return (EINVAL);
 		}
 	}
-	if (in_transaction)
-		return (EINVAL);
+	/*
+	 * A well-formed transaction without a matching commit block is the
+	 * normal result of losing power while its log records are being written.
+	 * rc_end_sequence advances only at a verified commit, so the later passes
+	 * ignore this incomplete tail.  Malformed records encountered before the
+	 * tail still fail above.
+	 */
 
 	printf("ext4fs: journal scan: end sequence %u (%u transactions)\n",
 	    ctx->rc_end_sequence,
@@ -1391,6 +1402,7 @@ jbd2_journal_open (struct vnode *devvp, struct m_ext4fs *fs,
 	ctx->rc_first = betoh32(jsb->s_first);
 	ctx->rc_sequence = betoh32(jsb->s_sequence);
 	ctx->rc_start = betoh32(jsb->s_start);
+	ctx->rc_head = betoh32(jsb->s_head);
 	ctx->rc_max_transaction = betoh32(jsb->s_max_transaction);
 	ctx->rc_features_compat = betoh32(jsb->s_feature_compat);
 	ctx->rc_features_incompat = betoh32(jsb->s_feature_incompat);
@@ -1417,7 +1429,9 @@ jbd2_journal_open (struct vnode *devvp, struct m_ext4fs *fs,
 	    ctx->rc_maxlen > journal_blocks ||
 	    ctx->rc_maxlen > JBD2_MAX_BLOCKMAP_ENTRIES ||
 	    (ctx->rc_start != 0 && (ctx->rc_start < ctx->rc_first ||
-	    ctx->rc_start >= ctx->rc_maxlen))) {
+	    ctx->rc_start >= ctx->rc_maxlen)) ||
+	    (ctx->rc_head != 0 && (ctx->rc_head < ctx->rc_first ||
+	    ctx->rc_head >= ctx->rc_maxlen))) {
 		printf("ext4fs: invalid journal geometry: first=%u start=%u "
 		    "maxlen=%u inode-blocks=%llu\n", ctx->rc_first,
 		    ctx->rc_start, ctx->rc_maxlen,
@@ -1607,6 +1621,7 @@ clear:
 	jsb->s_start = htobe32(0);
 	/* Advance sequence past what we replayed */
 	jsb->s_sequence = htobe32(ctx.rc_end_sequence);
+	jsb->s_head = htobe32(ctx.rc_first);
 	jbd2_superblock_csum_set(&ctx, jsb);
 	error = bwrite(bp);
 	bp = NULL;

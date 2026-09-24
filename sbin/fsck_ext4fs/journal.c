@@ -89,7 +89,7 @@ jwrite(u_int64_t fsblock, char *buf, long size)
 }
 
 static int
-jbd2_flush_device(void)
+fsck_jbd2_flush_device(void)
 {
 	struct stat st;
 	int force;
@@ -395,7 +395,7 @@ jbd2_is_journal_block(struct fsck_jbd2_ctx *ctx, u_int64_t fsblock)
 }
 
 static int
-jbd2_has_csum_v2or3(struct fsck_jbd2_ctx *ctx)
+fsck_jbd2_has_csum_v2or3(struct fsck_jbd2_ctx *ctx)
 {
 	return ((ctx->features_incompat &
 	    (JBD2_FEATURE_INCOMPAT_CSUM_V2 |
@@ -403,7 +403,7 @@ jbd2_has_csum_v2or3(struct fsck_jbd2_ctx *ctx)
 }
 
 static u_int32_t
-jbd2_block_checksum(struct fsck_jbd2_ctx *ctx, const void *data, size_t len)
+fsck_jbd2_block_checksum(struct fsck_jbd2_ctx *ctx, const void *data, size_t len)
 {
 	return (~crc32c(ctx->checksum_seed, data, len));
 }
@@ -414,13 +414,13 @@ jbd2_metadata_block_csum_verify(struct fsck_jbd2_ctx *ctx, void *data)
 	struct jbd2_block_tail *tail;
 	u_int32_t provided, calculated;
 
-	if (!jbd2_has_csum_v2or3(ctx))
+	if (!fsck_jbd2_has_csum_v2or3(ctx))
 		return (1);
 	tail = (struct jbd2_block_tail *)((char *)data + ctx->blocksize -
 	    sizeof(*tail));
 	provided = tail->t_checksum;
 	tail->t_checksum = 0;
-	calculated = jbd2_block_checksum(ctx, data, ctx->blocksize);
+	calculated = fsck_jbd2_block_checksum(ctx, data, ctx->blocksize);
 	tail->t_checksum = provided;
 	return (betoh32(provided) == calculated);
 }
@@ -431,7 +431,7 @@ jbd2_commit_block_csum_verify(struct fsck_jbd2_ctx *ctx, void *data)
 	struct jbd2_commit_header *commit;
 	u_int32_t provided, calculated;
 
-	if (!jbd2_has_csum_v2or3(ctx))
+	if (!fsck_jbd2_has_csum_v2or3(ctx))
 		return (1);
 	commit = data;
 	/*
@@ -445,7 +445,7 @@ jbd2_commit_block_csum_verify(struct fsck_jbd2_ctx *ctx, void *data)
 		return (0);
 	provided = commit->h_checksum[0];
 	commit->h_checksum[0] = 0;
-	calculated = jbd2_block_checksum(ctx, data, ctx->blocksize);
+	calculated = fsck_jbd2_block_checksum(ctx, data, ctx->blocksize);
 	commit->h_checksum[0] = provided;
 	return (betoh32(provided) == calculated);
 }
@@ -456,7 +456,7 @@ jbd2_data_block_csum_verify(struct fsck_jbd2_ctx *ctx, void *data,
 {
 	u_int32_t crc, sequence_be;
 
-	if (!jbd2_has_csum_v2or3(ctx))
+	if (!fsck_jbd2_has_csum_v2or3(ctx))
 		return (1);
 	sequence_be = htobe32(sequence);
 	crc = crc32c(ctx->checksum_seed, (const uint8_t *)&sequence_be,
@@ -468,11 +468,11 @@ jbd2_data_block_csum_verify(struct fsck_jbd2_ctx *ctx, void *data,
 }
 
 static u_int32_t
-jbd2_descriptor_limit(struct fsck_jbd2_ctx *ctx)
+fsck_jbd2_descriptor_limit(struct fsck_jbd2_ctx *ctx)
 {
 	u_int32_t limit = ctx->blocksize;
 
-	if (jbd2_has_csum_v2or3(ctx))
+	if (fsck_jbd2_has_csum_v2or3(ctx))
 		limit -= sizeof(struct jbd2_block_tail);
 	return (limit);
 }
@@ -575,7 +575,7 @@ jbd2_count_tags(struct fsck_jbd2_ctx *ctx, char *buf, u_int32_t *count)
 
 	*count = 0;
 	uuid_seen = 0;
-	limit = jbd2_descriptor_limit(ctx);
+	limit = fsck_jbd2_descriptor_limit(ctx);
 	while (offset < limit) {
 		error = jbd2_parse_tag(ctx, buf, limit, &offset,
 		    &target, &flags, &checksum, &uuid_seen);
@@ -605,7 +605,7 @@ jbd2_revoke_block_check(struct fsck_jbd2_ctx *ctx, char *buf,
 		return (EINVAL);
 	rh = (struct jbd2_revoke_header *)buf;
 	bytes = betoh32(rh->r_count);
-	limit = jbd2_descriptor_limit(ctx);
+	limit = fsck_jbd2_descriptor_limit(ctx);
 	record_size = (ctx->features_incompat &
 	    JBD2_FEATURE_INCOMPAT_64BIT) ? 8 : 4;
 	if (bytes < sizeof(*rh) || bytes > limit ||
@@ -692,8 +692,9 @@ jbd2_pass_scan(struct fsck_jbd2_ctx *ctx, char *buf)
 		}
 		consumed++;
 		hdr = (struct jbd2_header *)buf;
-		if (betoh32(hdr->h_magic) != JBD2_MAGIC ||
-		    betoh32(hdr->h_sequence) != seq) {
+		if (betoh32(hdr->h_magic) != JBD2_MAGIC)
+			break;
+		if (betoh32(hdr->h_sequence) != seq) {
 			if (in_transaction)
 				return (EINVAL);
 			break;
@@ -748,8 +749,7 @@ jbd2_pass_scan(struct fsck_jbd2_ctx *ctx, char *buf)
 			return (EINVAL);
 		}
 	}
-	if (in_transaction)
-		return (EINVAL);
+	/* A transaction becomes replayable only after its verified commit. */
 	printf("journal scan: end sequence %u (%u transactions)\n",
 	    ctx->end_sequence, ctx->end_sequence - ctx->sequence);
 	return 0;
@@ -866,7 +866,7 @@ jbd2_pass_replay(struct fsck_jbd2_ctx *ctx, char *buf, int apply)
 	seq = ctx->sequence;
 	consumed = 0;
 	loglen = ctx->maxlen - ctx->first;
-	limit = jbd2_descriptor_limit(ctx);
+	limit = fsck_jbd2_descriptor_limit(ctx);
 
 	while (seq != ctx->end_sequence && consumed < loglen) {
 		if (jbd2_read_jblock(ctx, block, buf) != 0) {
@@ -969,12 +969,12 @@ jbd2_pass_replay(struct fsck_jbd2_ctx *ctx, char *buf, int apply)
 }
 
 static int
-jbd2_superblock_csum_verify(struct fsck_jbd2_ctx *ctx,
+fsck_jbd2_superblock_csum_verify(struct fsck_jbd2_ctx *ctx,
     struct jbd2_superblock *jsb)
 {
 	u_int32_t provided, calculated;
 
-	if (!jbd2_has_csum_v2or3(ctx))
+	if (!fsck_jbd2_has_csum_v2or3(ctx))
 		return (1);
 	provided = jsb->s_checksum;
 	jsb->s_checksum = 0;
@@ -984,12 +984,12 @@ jbd2_superblock_csum_verify(struct fsck_jbd2_ctx *ctx,
 }
 
 static void
-jbd2_superblock_csum_set(struct fsck_jbd2_ctx *ctx,
+fsck_jbd2_superblock_csum_set(struct fsck_jbd2_ctx *ctx,
     struct jbd2_superblock *jsb)
 {
 	u_int32_t checksum;
 
-	if (!jbd2_has_csum_v2or3(ctx))
+	if (!fsck_jbd2_has_csum_v2or3(ctx))
 		return;
 	jsb->s_checksum = 0;
 	checksum = ~crc32c(0, (const uint8_t *)jsb, sizeof(*jsb));
@@ -1255,14 +1255,14 @@ fsck_journal_replay(int apply)
 	memcpy(ctx.uuid, jsb->s_uuid, sizeof(ctx.uuid));
 	ctx.checksum_seed = crc32c(0, jsb->s_uuid,
 	    sizeof(jsb->s_uuid));
-	if (jbd2_has_csum_v2or3(&ctx) &&
+	if (fsck_jbd2_has_csum_v2or3(&ctx) &&
 	    jsb->s_checksum_type != JBD2_CHECKSUM_CRC32C) {
 		pfatal("UNSUPPORTED JOURNAL CHECKSUM TYPE %u\n",
 		    jsb->s_checksum_type);
 		error = EINVAL;
 		goto out;
 	}
-	if (!jbd2_superblock_csum_verify(&ctx, jsb)) {
+	if (!fsck_jbd2_superblock_csum_verify(&ctx, jsb)) {
 		pfatal("BAD JOURNAL SUPERBLOCK CHECKSUM\n");
 		error = EINVAL;
 		goto out;
@@ -1328,7 +1328,7 @@ fsck_journal_replay(int apply)
 	error = jbd2_pass_replay(&ctx, buf, 1);
 	if (error)
 		goto out;
-	error = jbd2_flush_device();
+	error = fsck_jbd2_flush_device();
 	if (error)
 		goto out;
 	error = jbd2_recovered_super_check();
@@ -1345,11 +1345,11 @@ clear:
 	jsb = (struct jbd2_superblock *)buf;
 	jsb->s_start = htobe32(0);
 	jsb->s_sequence = htobe32(ctx.end_sequence);
-	jbd2_superblock_csum_set(&ctx, jsb);
+	fsck_jbd2_superblock_csum_set(&ctx, jsb);
 	error = jwrite(jblock0, buf, ctx.blocksize);
 	if (error)
 		goto out;
-	error = jbd2_flush_device();
+	error = fsck_jbd2_flush_device();
 	if (error)
 		goto out;
 
@@ -1392,7 +1392,7 @@ clear_recover:
 		}
 		fsmodified = 1;
 		free(sbbuf);
-		error = jbd2_flush_device();
+		error = fsck_jbd2_flush_device();
 		if (error)
 			goto out;
 	}
