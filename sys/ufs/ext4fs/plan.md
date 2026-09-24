@@ -139,21 +139,72 @@ Add journal state to `struct m_ext4fs`, including:
 Introduce an interface along these lines:
 
 ```c
-int  ext4fs_journal_begin(struct mount *, unsigned int,
+int  ext4fs_journal_begin (struct mount *, unsigned int,
     struct ext4fs_journal_handle **);
-int  ext4fs_journal_get_write_access(struct ext4fs_journal_handle *,
+int  ext4fs_journal_add_ordered (struct ext4fs_journal_handle *,
+    struct vnode *);
+int  ext4fs_journal_get_write_access (struct ext4fs_journal_handle *,
     struct buf *, u_int64_t);
-int  ext4fs_journal_dirty_metadata(struct ext4fs_journal_handle *,
+int  ext4fs_journal_dirty_metadata (struct ext4fs_journal_handle *,
     struct buf *);
-int  ext4fs_journal_revoke(struct ext4fs_journal_handle *, u_int64_t);
-int  ext4fs_journal_end(struct ext4fs_journal_handle *);
-int  ext4fs_journal_force_commit(struct mount *);
-void ext4fs_journal_abort(struct mount *, int);
+int  ext4fs_journal_revoke (struct ext4fs_journal_handle *, u_int64_t);
+int  ext4fs_journal_end (struct ext4fs_journal_handle *);
+int  ext4fs_journal_force_commit (struct mount *);
+void ext4fs_journal_abort (struct mount *, int);
 ```
 
 Each operation must reserve enough journal credits before modifying metadata.
 Initial credit estimates can be conservative while the implementation is
 serialized.
+
+### Phase 2 implementation status (updated 2026-09-24)
+
+The first runtime-core slice is present.  Mount-time recovery and runtime
+initialization share one journal-superblock validator and one complete
+logical-to-physical journal block map.  A mounted filesystem now owns an
+opaque journal object with serialized handles, conservative credit
+reservation, owned metadata buffers, ordered-data dependencies, revoke
+tracking, journal-block exclusion, and a sticky abort error.  Mount failure
+and unmount paths tear this state down.
+
+No live metadata writer uses these handles yet.  In particular, the core does
+not claim that a transaction has committed: `ext4fs_journal_force_commit()`
+returns `EOPNOTSUPP` when tracked work exists until Phase 3 supplies the
+ordered on-disk writer.
+
+On 2026-09-24, the root-only journal mount suite passed in full against the
+rebuilt and booted production `GENERIC.MP` kernel.  This exercised runtime
+journal initialization and teardown after successful recovery across all
+supported checksum formats and block sizes, as well as the existing
+non-mutating corruption and restartable orphan-recovery cases.
+
+The non-root `regress/sys/ext4fs` suite builds a separate
+`journal_core_test` program and exercises the same side-effect-free state
+policy implementation compiled into the kernel core.  This keeps test-only
+entry points and configuration out of the production kernel.
+
+- [x] Share validated journal geometry, features, checksum state, block map,
+      and journal-block membership with recovery.
+- [x] Add per-mount running/committing state, locking, wait channels, journal
+      position/free-space fields, and sticky abort state.
+- [x] Add serialized handles with overflow-safe conservative credit
+      reservation.
+- [x] Track unique metadata buffers and revokes, rejecting aliases, conflicts,
+      out-of-range blocks, and journal blocks.
+- [x] Initialize and destroy runtime journal state in the mount lifecycle.
+- [x] Define ownership and lifetime rules for metadata buffers after a handle
+      ends.  Successful write-access registration transfers a busy buffer to
+      the handle; dirtying transfers it to the transaction; ending releases
+      unused access, while abort teardown invalidates uncheckpointed contents.
+- [x] Add transaction-owned ordered-data dependencies.  Dependencies are
+      deduplicated regular-file vnodes held by reference until commit or
+      teardown; the initial ordered mode will conservatively flush the whole
+      vnode.
+- [x] Add focused shared-state regression tests for serialized handle
+      admission, credit reservation/exhaustion/release, duplicate and alias
+      decisions, revoke conflicts, sticky aborts, and sequence wraparound.
+- [x] Rebuild, boot, and run the root-only kernel mount regression suite
+      against the production `GENERIC.MP` kernel.
 
 ## Phase 3: Implement ordered commits
 
@@ -184,6 +235,9 @@ Additional requirements:
 - [ ] Keep `EXT4FS_STATE_VALID` clear throughout a writable mount.
 - [ ] On clean unmount, commit and checkpoint everything, mark the journal
       empty, clear `RECOVER`, and finally set `EXT4FS_STATE_VALID`.
+- [ ] Exercise actual handle wait/wakeup, owned-buffer teardown, ordered-vnode
+      lifetime, abort teardown, and commit wakeups through the first
+      production journaled metadata path.
 
 ## Phase 4: Convert metadata writers
 
