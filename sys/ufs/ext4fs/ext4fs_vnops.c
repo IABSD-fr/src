@@ -1536,17 +1536,18 @@ const struct vops ext4fs_vops = {
 	.vop_symlink	= ext4fs_symlink,
 	.vop_readdir	= ext4fs_readdir,
 	.vop_readlink	= ext4fs_readlink,
-	.vop_abortop	= NULL,
+	.vop_abortop	= vop_generic_abortop,
 	.vop_inactive	= ext4fs_inactive,
 	.vop_reclaim	= ext4fs_reclaim,
 	.vop_lock	= ufs_lock,
 	.vop_unlock	= ufs_unlock,
+	.vop_islocked	= ufs_islocked,
 	.vop_bmap	= ext4fs_bmap,
 	.vop_strategy	= ext4fs_strategy,
 	.vop_print	= ext4fs_print,
 	.vop_pathconf	= ext4fs_pathconf,
 	.vop_advlock	= ext4fs_advlock,
-	.vop_bwrite	= NULL,
+	.vop_bwrite	= vop_generic_bwrite,
 };
 
 /* Stub implementations */
