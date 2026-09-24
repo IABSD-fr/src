@@ -3155,6 +3155,8 @@ ext4fs_symlink (void *v)
 
 	if (len <= EXT4FS_SYMLINK_LEN_MAX) {
 		/* Fast symlink: store inline in i_block[] */
+		memset(ip->i_e4din->dinode.i_block, 0,
+		    sizeof(ip->i_e4din->dinode.i_block));
 		memcpy(ip->i_e4din->dinode.i_block, ap->a_target, len);
 		ext4fs_setsize(ip, len);
 		/* Clear EXTENTS flag for fast symlinks */
