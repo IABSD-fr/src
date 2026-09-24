@@ -10,13 +10,15 @@ concurrency can be added after recovery and crash consistency are proven.
 ## Current state
 
 The tree contains mount-time and `fsck_ext4fs` JBD2 recovery using a bounded,
-three-pass scan, revoke, and replay flow. Runtime filesystem operations do not
-write JBD2 transactions, however; metadata buffers still reach their home
-locations directly through `bwrite()`, `bdwrite()`, and `bawrite()`.
+three-pass scan, revoke, and replay flow.  It also contains a serialized
+runtime core and an ordered on-disk commit/checkpoint writer.  Runtime
+filesystem operations do not use journal handles yet, however; metadata
+buffers still reach their home locations directly through `bwrite()`,
+`bdwrite()`, and `bawrite()`.
 
 Recovery hardening and its production-kernel regression gate are complete.
-The reader is ready to serve as the recovery side of the journal writer
-planned in Phase 2.
+The Phase 3 writer is implemented but cannot be considered activated or
+production-tested until the first Phase 4 metadata path uses it.
 
 ### Phase 1 implementation status (2026-09-23)
 
@@ -77,8 +79,9 @@ accepted every successfully recovered image.
 - [x] Handle journal inode extent trees up to `EXT4FS_EXTENT_DEPTH_MAX`, or
       reject unsupported depths explicitly without modifying the filesystem.
 - [x] Treat malformed tags, missing `LAST_TAG` in a non-full descriptor,
-      invalid flag combinations, invalid revoke lengths, and incomplete
-      transactions as errors.
+      invalid flag combinations, and invalid revoke lengths as errors.  A
+      structurally valid transaction tail without a commit record is instead
+      discarded without replay because that is the normal power-loss case.
 - [x] Flush replayed home blocks before marking the journal clean.
 - [x] Clear `EXT4FS_FEATURE_INCOMPAT_RECOVER` only after replay and all required
       flushes have succeeded.
@@ -159,7 +162,7 @@ serialized.
 
 ### Phase 2 implementation status (updated 2026-09-24)
 
-The first runtime-core slice is present.  Mount-time recovery and runtime
+The runtime core is present.  Mount-time recovery and runtime
 initialization share one journal-superblock validator and one complete
 logical-to-physical journal block map.  A mounted filesystem now owns an
 opaque journal object with serialized handles, conservative credit
@@ -167,10 +170,10 @@ reservation, owned metadata buffers, ordered-data dependencies, revoke
 tracking, journal-block exclusion, and a sticky abort error.  Mount failure
 and unmount paths tear this state down.
 
-No live metadata writer uses these handles yet.  In particular, the core does
-not claim that a transaction has committed: `ext4fs_journal_force_commit()`
-returns `EOPNOTSUPP` when tracked work exists until Phase 3 supplies the
-ordered on-disk writer.
+No live metadata writer uses these handles yet.  Phase 3 now supplies the
+ordered on-disk writer used by `ext4fs_journal_force_commit()`, but normal
+filesystem operations will not generate runtime transactions until Phase 4
+converts their metadata writes.
 
 On 2026-09-24, the root-only journal mount suite passed in full against the
 rebuilt and booted production `GENERIC.MP` kernel.  This exercised runtime
@@ -223,21 +226,47 @@ flush affected regular-file data to home locations
 
 Additional requirements:
 
-- [ ] Escape payload blocks beginning with `JBD2_MAGIC` and set `ESCAPE`.
-- [ ] Generate descriptor tags and checksum tails for the selected format.
-- [ ] Split transactions across as many descriptor blocks as necessary.
-- [ ] Prevent the head from overwriting uncheckpointed transactions.
-- [ ] Block or force a checkpoint when journal space is exhausted.
-- [ ] Abort the journal and force the filesystem read-only after an I/O or
+- [x] Escape payload blocks beginning with `JBD2_MAGIC` and set `ESCAPE`.
+- [x] Generate descriptor tags and checksum tails for the selected format.
+- [x] Split transactions across as many descriptor blocks as necessary.
+- [x] Prevent the head from overwriting uncheckpointed transactions.
+- [x] Block or force a checkpoint when journal space is exhausted.
+- [x] Abort the journal and force the filesystem read-only after an I/O or
       invariant failure.
-- [ ] Set `EXT4FS_FEATURE_INCOMPAT_RECOVER` before the first live transaction
+- [x] Set `EXT4FS_FEATURE_INCOMPAT_RECOVER` before the first live transaction
       can become durable.
-- [ ] Keep `EXT4FS_STATE_VALID` clear throughout a writable mount.
-- [ ] On clean unmount, commit and checkpoint everything, mark the journal
+- [x] Keep `EXT4FS_STATE_VALID` clear throughout a writable mount.
+- [x] On clean unmount, commit and checkpoint everything, mark the journal
       empty, clear `RECOVER`, and finally set `EXT4FS_STATE_VALID`.
 - [ ] Exercise actual handle wait/wakeup, owned-buffer teardown, ordered-vnode
       lifetime, abort teardown, and commit wakeups through the first
       production journaled metadata path.
+
+### Phase 3 implementation status (2026-09-24)
+
+The serialized writer now emits bounded descriptor and revoke records,
+checksum-v2/v3 tails, escaped metadata payloads, and a checksummed commit
+record.  It flushes ordered regular-file buffers before journal metadata,
+persists `s_start` before the commit can become durable, checkpoints home
+metadata only after the commit flush, and advances the clean journal head only
+after the checkpoint flush.  A zeroed future commit slot makes a crash during
+record construction an unambiguous incomplete tail.
+
+Every successful commit checkpoints synchronously, so the next commit cannot
+overwrite live log records.  Credit exhaustion commits and checkpoints the
+current running transaction before retrying admission.  I/O and invariant
+failures are sticky, leave `RECOVER` set, force the mount read-only, and retain
+uncheckpointed buffers for invalidating teardown.  Teardown separately waits
+for in-flight commit I/O, including the aborted-transaction case.
+
+Writable initialization persists `RECOVER` before transaction data can become
+durable.  Clean unmount forces all work through the writer, verifies that the
+journal is empty, then durably clears `RECOVER` and sets `VALID`.  The kernel
+objects compile with production `-Werror` flags on amd64 and i386, and the
+non-root journal recovery and journal-core regression suites pass.  The final
+Phase 3 item remains open because no production metadata path invokes the
+writer yet; that activation and its root-only production-kernel tests begin
+with Phase 4.
 
 ## Phase 4: Convert metadata writers
 

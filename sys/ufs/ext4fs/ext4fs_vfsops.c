@@ -1258,10 +1258,10 @@ ext4fs_unmount (struct mount *mp, int mntflags, struct proc *p)
 		return (error);
 	ump = VFSTOUFS(mp);
 	mfs = ump->um_e4fs;
-	if ((error = ext4fs_journal_force_commit(mp)) != 0)
-		return (error);
-
-	if (!mfs->m_read_only && mfs->m_fs_was_modified) {
+	if (mfs->m_journal != NULL) {
+		if ((error = ext4fs_journal_mark_clean(mp)) != 0)
+			return (error);
+	} else if (!mfs->m_read_only && mfs->m_fs_was_modified) {
 		mfs->m_state = EXT4FS_STATE_VALID;
 		if ((error = ext4fs_sbwrite(mp)) != 0)
 			return (error);
