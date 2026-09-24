@@ -1881,32 +1881,46 @@ ext4fs_mknod (void *v)
 {
 	struct vop_mknod_args *ap = v;
 	struct vnode **vpp = ap->a_vpp;
-	struct vnode *tvp;
 	struct inode *ip;
+	struct ext4fs_dinode *din;
+	u_int32_t iflags;
 	int error;
 
 	error = ext4fs_makeinode(
 	    MAKEIMODE(ap->a_vap->va_type, ap->a_vap->va_mode),
-	    ap->a_dvp, &tvp, ap->a_cnp);
+	    ap->a_dvp, vpp, ap->a_cnp);
 	if (error)
 		return (error);
 
-	ip = VTOI(tvp);
+	ip = VTOI(*vpp);
+	din = &ip->i_e4din->dinode;
+
+	/* Special inodes use i_block for device data, not an extent tree. */
+	memset(din->i_block, 0, sizeof(din->i_block));
+	iflags = letoh32(din->i_flags);
+	iflags &= ~EXTFS_INODE_FLAG_EXTENTS;
+	din->i_flags = htole32(iflags);
 
 	/* Store device number */
-	if (ap->a_vap->va_rdev != VNOVAL) {
+	if ((ap->a_vap->va_type == VCHR || ap->a_vap->va_type == VBLK) &&
+	    ap->a_vap->va_rdev != VNOVAL) {
 		/* Old format in i_block[0], new format in i_block[1] */
-		ip->i_e4din->dinode.i_block[0] =
-		    htole32(ap->a_vap->va_rdev);
-		ip->i_e4din->dinode.i_block[1] =
-		    htole32(ap->a_vap->va_rdev);
+		din->i_block[0] = htole32(ap->a_vap->va_rdev);
+		din->i_block[1] = htole32(ap->a_vap->va_rdev);
 	}
 
 	ip->i_flag |= IN_CHANGE | IN_UPDATE;
-	ext4fs_update(ip, 1);
+	error = ext4fs_update(ip, 1);
 
-	*vpp = tvp;
-	return (0);
+	/*
+	 * VOP_MKNOD consumes the newly allocated vnode.  Drop it from the
+	 * cache so a later lookup reloads the persisted special-file inode.
+	 */
+	vput(*vpp);
+	(*vpp)->v_type = VNON;
+	vgone(*vpp);
+	*vpp = NULL;
+	return (error);
 }
 
 int
