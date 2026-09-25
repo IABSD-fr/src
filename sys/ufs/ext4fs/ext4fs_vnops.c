@@ -61,6 +61,7 @@
 #include <ufs/ufs/ufs_extern.h>
 
 #include <ufs/ext4fs/ext4fs.h>
+#include <ufs/ext4fs/ext4fs_journal.h>
 
 /* Convert ext4 directory entry file type to BSD dirent type */
 static const u_int8_t ext4fs_type_to_dt[EXT4FS_FT_MAX] = {
@@ -290,13 +291,15 @@ int
 ext4fs_update (struct inode *ip, int waitfor)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
+	struct ext4fs_journal_handle *handle;
 	struct buf *bp;
 	u_int32_t inode_group, inode_index, block_in_table, offset_in_block;
 	struct ext4fs_block_group_descriptor *gd;
-	u_int64_t inode_table_block;
+	u_int64_t fsblock, inode_table_block;
 	daddr_t disk_block;
 	u_int32_t csum;
-	int error;
+	u_int8_t saved_inode[sizeof(struct ext4fs_dinode_256)];
+	int access_owned, end_error, error, journaled, transaction_owned;
 
 	if (ITOV(ip)->v_mount->mnt_flag & MNT_RDONLY)
 		return (0);
@@ -307,7 +310,17 @@ ext4fs_update (struct inode *ip, int waitfor)
 		return (0);
 	}
 
-	ip->i_flag &= ~IN_MODIFIED;
+	bp = NULL;
+	handle = NULL;
+	access_owned = 0;
+	transaction_owned = 0;
+	journaled = fs->m_journal != NULL;
+	error = 0;
+	if (journaled) {
+		error = ext4fs_journal_begin(ITOV(ip)->v_mount, 1, &handle);
+		if (error)
+			goto out;
+	}
 
 	/* Locate inode on disk */
 	inode_group = (ip->i_number - 1) / fs->m_inodes_per_group;
@@ -322,13 +335,19 @@ ext4fs_update (struct inode *ip, int waitfor)
 		inode_table_block |=
 		    (u_int64_t)letoh32(gd->bgd_inode_table_block_hi) << 32;
 
-	disk_block = (inode_table_block + block_in_table) <<
+	fsblock = inode_table_block + block_in_table;
+	disk_block = fsblock <<
 	    fs->m_fs_block_to_disk_block;
 
 	error = bread(ip->i_devvp, disk_block, fs->m_block_size, &bp);
-	if (error) {
-		brelse(bp);
-		return (error);
+	if (error)
+		goto out;
+
+	if (journaled) {
+		error = ext4fs_journal_get_write_access(handle, bp, fsblock);
+		if (error)
+			goto out;
+		access_owned = 1;
 	}
 
 	/*
@@ -348,8 +367,8 @@ ext4fs_update (struct inode *ip, int waitfor)
 			    "with corrupt extent header! "
 			    "magic=0x%x mode=0%o flags=0x%x\n",
 			    ip->i_number, wr_magic, wr_mode, wr_flags);
-			brelse(bp);
-			return (EIO);
+			error = EIO;
+			goto out;
 		}
 	}
 
@@ -361,16 +380,54 @@ ext4fs_update (struct inode *ip, int waitfor)
 		    htole16((csum >> 16) & 0xFFFF);
 
 	/* Copy inode to buffer */
+	if (journaled)
+		memcpy(saved_inode, (char *)bp->b_data + offset_in_block,
+		    fs->m_inode_size);
 	memcpy((char *)bp->b_data + offset_in_block, ip->i_e4din,
 	    fs->m_inode_size);
 
-	if (waitfor) {
+	if (journaled) {
+		error = ext4fs_journal_dirty_metadata(handle, bp);
+		if (error) {
+			memcpy((char *)bp->b_data + offset_in_block, saved_inode,
+			    fs->m_inode_size);
+			goto out;
+		}
+		access_owned = 0;
+		transaction_owned = 1;
+		bp = NULL;
+	} else if (waitfor) {
 		error = bwrite(bp);
-		return (error);
+		bp = NULL;
+	} else {
+		bdwrite(bp);
+		bp = NULL;
 	}
 
-	bdwrite(bp);
-	return (0);
+out:
+	if (bp != NULL && !access_owned) {
+		brelse(bp);
+		bp = NULL;
+	}
+	if (handle != NULL) {
+		end_error = ext4fs_journal_end(handle);
+		if (access_owned)
+			bp = NULL;
+		if (error == 0)
+			error = end_error;
+	}
+	if (error == 0 && transaction_owned) {
+		/*
+		 * Until compound operations pass one handle through all metadata
+		 * writers, commit each standalone inode update.  Besides preserving
+		 * synchronous error reporting, this releases the transaction-owned
+		 * busy inode-table buffer before another update can request it.
+		 */
+		error = ext4fs_journal_force_commit(ITOV(ip)->v_mount);
+	}
+	if (error == 0)
+		ip->i_flag &= ~IN_MODIFIED;
+	return (error);
 }
 
 /*
