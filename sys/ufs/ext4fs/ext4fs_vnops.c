@@ -79,7 +79,7 @@ static const u_int8_t ext4fs_type_to_dt[EXT4FS_FT_MAX] = {
 static int ext4fs_direnter_handle (struct inode *, struct vnode *,
     struct componentname *, struct ext4fs_journal_handle *, int *);
 static int ext4fs_dirremove_handle (struct inode *, struct vnode *,
-    struct componentname *, struct ext4fs_journal_handle *, int *);
+    struct ext4fs_journal_handle *, int *);
 
 static int
 ext4fs_dir_block_check (struct inode *ip, const void *data)
@@ -4311,8 +4311,7 @@ ext4fs_remove (void *v)
 		if (error)
 			goto out;
 
-		error = ext4fs_dirremove_handle(ip, dvp, ap->a_cnp, handle,
-		    &changed);
+		error = ext4fs_dirremove_handle(ip, dvp, handle, &changed);
 		if (error)
 			goto journal_fail;
 		nlink--;
@@ -5360,26 +5359,28 @@ ext4fs_direnter_handle (struct inode *ip, struct vnode *dvp,
  */
 static int
 ext4fs_dirremove_handle (struct inode *ip, struct vnode *dvp,
-    struct componentname *cnp, struct ext4fs_journal_handle *handle,
-    int *changedp)
+    struct ext4fs_journal_handle *handle, int *changedp)
 {
 	struct inode *dp = VTOI(dvp);
 	struct m_ext4fs *fs = dp->i_e4fs;
 	struct ext4fs_directory *ep, *prevep;
 	struct buf *bp;
-	size_t limit;
+	size_t limit, offset;
 	u_int64_t lbn, pblk;
 	off_t filesz;
 	int error, loc, prevloc;
 	u_int16_t prevreclen, reclen;
 
 	if (handle == NULL || changedp == NULL ||
-	    cnp->cn_namelen == 0 || cnp->cn_namelen > EXT4FS_MAXNAMLEN ||
 	    ip->i_number == 0 || ip->i_number > fs->m_inodes_count)
 		return (EINVAL);
+	if (letoh32(dp->i_e4din->dinode.i_flags) &
+	    EXTFS_INODE_FLAG_INDEX)
+		return (EOPNOTSUPP);
 	filesz = (off_t)letoh32(dp->i_e4din->dinode.i_size_lo) |
 	    ((off_t)letoh32(dp->i_e4din->dinode.i_size_hi) << 32);
-	if (filesz < 0 || dp->i_offset < 0 || dp->i_offset >= filesz)
+	if (filesz <= 0 || EXT4FS_BLKOFF(fs, filesz) != 0 ||
+	    dp->i_offset < 0 || dp->i_offset >= filesz)
 		return (EIO);
 	lbn = EXT4FS_LBLKNO(fs, dp->i_offset);
 	error = ext4fs_extent_pblk(dp, lbn, &pblk, NULL);
@@ -5396,28 +5397,30 @@ ext4fs_dirremove_handle (struct inode *ip, struct vnode *dvp,
 	if (fs->m_feature_ro_compat & EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM)
 		limit -= EXT4FS_DIR_TAIL_SIZE;
 	loc = EXT4FS_BLKOFF(fs, dp->i_offset);
-	if (loc < 0 || (size_t)loc > limit || limit - (size_t)loc < 8)
+	if (loc < 0 || (size_t)loc >= limit)
+		return (EIO);
+	prevloc = -1;
+	for (offset = 0; offset < (size_t)loc; offset += reclen) {
+		ep = (struct ext4fs_directory *)
+		    ((char *)bp->b_data + offset);
+		reclen = letoh16(ep->e4d_reclen);
+		prevloc = offset;
+	}
+	if (offset != (size_t)loc)
 		return (EIO);
 	ep = (struct ext4fs_directory *)((char *)bp->b_data + loc);
 	reclen = letoh16(ep->e4d_reclen);
-	if (reclen < 8 || (reclen & 3) != 0 ||
-	    reclen > limit - (size_t)loc ||
-	    letoh32(ep->e4d_ino) != ip->i_number ||
-	    ep->e4d_namlen != cnp->cn_namelen ||
-	    memcmp(ep->e4d_name, cnp->cn_nameptr, cnp->cn_namelen) != 0)
+	if (letoh32(ep->e4d_ino) != ip->i_number)
 		return (EIO);
 
-	if (dp->i_count == 0) {
+	if (prevloc < 0) {
 		*changedp = 1;
 		ep->e4d_ino = htole32(0);
 	} else {
-		if (dp->i_count < 0 || (size_t)dp->i_count > (size_t)loc)
-			return (EIO);
-		prevloc = loc - dp->i_count;
 		prevep = (struct ext4fs_directory *)
 		    ((char *)bp->b_data + prevloc);
 		prevreclen = letoh16(prevep->e4d_reclen);
-		if (prevreclen != dp->i_count ||
+		if ((size_t)prevloc + prevreclen != (size_t)loc ||
 		    (size_t)prevreclen + reclen > limit - (size_t)prevloc)
 			return (EIO);
 		*changedp = 1;
