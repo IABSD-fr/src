@@ -79,35 +79,6 @@ ext4fs_orphan_flush (struct mount *mp)
 	return (error);
 }
 
-static u_int64_t
-ext4fs_orphan_bgd_block (struct m_ext4fs *fs,
-    struct ext4fs_block_group_descriptor *gd, int which)
-{
-	u_int64_t block;
-
-	switch (which) {
-	case 0:
-		block = letoh32(gd->bgd_block_bitmap_block_lo);
-		if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
-			block |= (u_int64_t)
-			    letoh32(gd->bgd_block_bitmap_block_hi) << 32;
-		break;
-	case 1:
-		block = letoh32(gd->bgd_inode_bitmap_block_lo);
-		if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
-			block |= (u_int64_t)
-			    letoh32(gd->bgd_inode_bitmap_block_hi) << 32;
-		break;
-	default:
-		block = letoh32(gd->bgd_inode_table_block_lo);
-		if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
-			block |= (u_int64_t)
-			    letoh32(gd->bgd_inode_table_block_hi) << 32;
-		break;
-	}
-	return (block);
-}
-
 /*
  * Reject fixed filesystem metadata before trusting an orphan extent.  This
  * is deliberately stricter than the normal extent lookup path: recovery is
@@ -132,10 +103,12 @@ ext4fs_orphan_data_block_valid (struct m_ext4fs *fs, u_int64_t block)
 	/* flex_bg may place another group's metadata in this group. */
 	for (i = 0; i < fs->m_block_group_count; i++) {
 		gd = &fs->m_gd[i];
-		if (block == ext4fs_orphan_bgd_block(fs, gd, 0) ||
-		    block == ext4fs_orphan_bgd_block(fs, gd, 1))
+		if (block == ext4fs_bgd_get_block(fs, gd,
+		    EXT4FS_BGD_BLOCK_BITMAP) ||
+		    block == ext4fs_bgd_get_block(fs, gd,
+		    EXT4FS_BGD_INODE_BITMAP))
 			return (0);
-		table = ext4fs_orphan_bgd_block(fs, gd, 2);
+		table = ext4fs_bgd_get_block(fs, gd, EXT4FS_BGD_INODE_TABLE);
 		if (block >= table &&
 		    block - table < fs->m_inode_table_blocks_per_group)
 			return (0);
@@ -171,7 +144,8 @@ ext4fs_orphan_inode_location (struct m_ext4fs *fs, u_int32_t ino,
 	gd = &fs->m_gd[*group];
 	if (letoh16(gd->bgd_flags) & EXT4FS_BGD_FLAG_INODE_UNINIT)
 		return (EINVAL);
-	*block = ext4fs_orphan_bgd_block(fs, gd, 2) + table_index;
+	*block = ext4fs_bgd_get_block(fs, gd, EXT4FS_BGD_INODE_TABLE) +
+	    table_index;
 	if (*block >= fs->m_blocks_count ||
 	    *offset + sizeof(struct ext4fs_dinode_256) > fs->m_block_size)
 		return (EINVAL);
@@ -273,7 +247,7 @@ ext4fs_orphan_count_dirs (struct m_ext4fs *fs, struct vnode *devvp,
 	int error;
 
 	gd = &fs->m_gd[group];
-	table = ext4fs_orphan_bgd_block(fs, gd, 2);
+	table = ext4fs_bgd_get_block(fs, gd, EXT4FS_BGD_INODE_TABLE);
 	*dirsp = 0;
 	base = 0;
 	for (block = 0; base < valid; block++, base += slots) {
@@ -345,7 +319,8 @@ ext4fs_orphan_recount (struct mount *mp, int64_t dir_group)
 				free_count |= (u_int32_t)letoh16(
 				    gd->bgd_free_blocks_count_hi) << 16;
 		} else {
-			bitmap_block = ext4fs_orphan_bgd_block(fs, gd, 0);
+			bitmap_block = ext4fs_bgd_get_block(fs, gd,
+			    EXT4FS_BGD_BLOCK_BITMAP);
 			error = bread(ump->um_devvp,
 			    (daddr_t)EXT4FS_FSBTODB(fs, bitmap_block),
 			    fs->m_block_size, &bp);
@@ -395,7 +370,8 @@ ext4fs_orphan_recount (struct mount *mp, int64_t dir_group)
 				free_count |= (u_int32_t)letoh16(
 				    gd->bgd_free_inodes_count_hi) << 16;
 		} else {
-			bitmap_block = ext4fs_orphan_bgd_block(fs, gd, 1);
+			bitmap_block = ext4fs_bgd_get_block(fs, gd,
+			    EXT4FS_BGD_INODE_BITMAP);
 			error = bread(ump->um_devvp,
 			    (daddr_t)EXT4FS_FSBTODB(fs, bitmap_block),
 			    fs->m_block_size, &bp);
@@ -487,7 +463,8 @@ ext4fs_orphan_bitmap_clear (struct m_ext4fs *fs, struct vnode *devvp,
 	gd = &fs->m_gd[group];
 	if (letoh16(gd->bgd_flags) & flag)
 		return (EINVAL);
-	bitmap_block = ext4fs_orphan_bgd_block(fs, gd, inode ? 1 : 0);
+	bitmap_block = ext4fs_bgd_get_block(fs, gd, inode ?
+	    EXT4FS_BGD_INODE_BITMAP : EXT4FS_BGD_BLOCK_BITMAP);
 	error = bread(devvp, (daddr_t)EXT4FS_FSBTODB(fs, bitmap_block),
 	    fs->m_block_size, &bp);
 	if (error) {
@@ -616,14 +593,16 @@ ext4fs_orphan_xattr_references (struct ext4fs_orphan_extent_ctx *ctx,
 			valid = ctx->fs->m_inodes_per_group;
 		error = bread(ctx->devvp,
 		    (daddr_t)EXT4FS_FSBTODB(ctx->fs,
-		    ext4fs_orphan_bgd_block(ctx->fs, gd, 1)),
+		    ext4fs_bgd_get_block(ctx->fs, gd,
+		    EXT4FS_BGD_INODE_BITMAP)),
 		    ctx->fs->m_block_size, &bitmap_bp);
 		if (error) {
 			if (bitmap_bp != NULL)
 				brelse(bitmap_bp);
 			return (error);
 		}
-		table = ext4fs_orphan_bgd_block(ctx->fs, gd, 2);
+		table = ext4fs_bgd_get_block(ctx->fs, gd,
+		    EXT4FS_BGD_INODE_TABLE);
 		base = 0;
 		while (base < valid) {
 			slots = ctx->fs->m_inodes_per_block;

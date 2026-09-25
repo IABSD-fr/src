@@ -104,6 +104,38 @@ ext4fs_block_group_has_super_block (int group)
 	return 0;
 }
 
+u_int64_t
+ext4fs_bgd_get_block (struct m_ext4fs *fs,
+    struct ext4fs_block_group_descriptor *gd, unsigned int which)
+{
+	u_int64_t block;
+
+	switch (which) {
+	case EXT4FS_BGD_BLOCK_BITMAP:
+		block = letoh32(gd->bgd_block_bitmap_block_lo);
+		if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+			block |= (u_int64_t)
+			    letoh32(gd->bgd_block_bitmap_block_hi) << 32;
+		break;
+	case EXT4FS_BGD_INODE_BITMAP:
+		block = letoh32(gd->bgd_inode_bitmap_block_lo);
+		if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+			block |= (u_int64_t)
+			    letoh32(gd->bgd_inode_bitmap_block_hi) << 32;
+		break;
+	case EXT4FS_BGD_INODE_TABLE:
+		block = letoh32(gd->bgd_inode_table_block_lo);
+		if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+			block |= (u_int64_t)
+			    letoh32(gd->bgd_inode_table_block_hi) << 32;
+		break;
+	default:
+		block = 0;
+		break;
+	}
+	return (block);
+}
+
 int
 ext4fs_fhtovp (struct mount *mp, struct fid *fhp, struct vnode **vpp)
 {
@@ -811,6 +843,61 @@ ext4fs_bgd_write (struct m_ext4fs *fs, struct vnode *devvp, u_int32_t group)
 	return (0);
 }
 
+int
+ext4fs_bgd_write_handle (struct m_ext4fs *fs, struct vnode *devvp,
+    u_int32_t group, struct ext4fs_journal_handle *handle)
+{
+	struct ext4fs_block_group_descriptor saved, *gd;
+	struct buf *bp;
+	u_int64_t fsblock;
+	u_int32_t bgds_per_block, bgd_block, bgd_off;
+	u_int16_t saved_checksum;
+	int error;
+
+	if (handle == NULL || group >= fs->m_block_group_count)
+		return (EINVAL);
+	bgds_per_block = fs->m_block_size /
+	    sizeof(struct ext4fs_block_group_descriptor);
+	if (bgds_per_block == 0)
+		return (EINVAL);
+	bgd_block = group / bgds_per_block;
+	bgd_off = (group % bgds_per_block) *
+	    sizeof(struct ext4fs_block_group_descriptor);
+	fsblock = (u_int64_t)fs->m_first_data_block + 1 + bgd_block;
+
+	error = ext4fs_journal_get_metadata(handle, devvp, fsblock, &bp);
+	if (error)
+		return (error);
+	memcpy(&saved, (char *)bp->b_data + bgd_off, sizeof(saved));
+	gd = &fs->m_gd[group];
+	saved_checksum = gd->bgd_checksum;
+	gd->bgd_checksum = htole16(ext4fs_bgd_csum(fs, gd, group));
+	memcpy((char *)bp->b_data + bgd_off, gd, sizeof(*gd));
+	error = ext4fs_journal_dirty_metadata(handle, bp);
+	if (error) {
+		memcpy((char *)bp->b_data + bgd_off, &saved, sizeof(saved));
+		gd->bgd_checksum = saved_checksum;
+	}
+	return (error);
+}
+
+static void
+ext4fs_sbprepare (struct m_ext4fs *fs)
+{
+	struct ext4fs *sble = &fs->m_sble;
+	struct timespec ts;
+
+	sble->sb_free_blocks_count_lo =
+	    htole32((u_int32_t)fs->m_free_blocks_count);
+	sble->sb_free_blocks_count_hi =
+	    htole32((u_int32_t)(fs->m_free_blocks_count >> 32));
+	sble->sb_free_inodes_count = htole32(fs->m_free_inodes_count);
+	getnanotime(&ts);
+	sble->sb_write_time_lo = htole32((u_int32_t)ts.tv_sec);
+	sble->sb_state = htole16(fs->m_state);
+	sble->sb_checksum = htole32(ext4fs_sb_csum(sble));
+}
+
 /*
  * Write the superblock to disk with updated counters and checksum.
  */
@@ -821,23 +908,9 @@ ext4fs_sbwrite (struct mount *mp)
 	struct m_ext4fs *fs = ump->um_e4fs;
 	struct ext4fs *sble = &fs->m_sble;
 	struct buf *bp;
-	struct timespec ts;
 	int error;
 
-	/* Update counters in on-disk superblock */
-	sble->sb_free_blocks_count_lo =
-	    htole32((u_int32_t)fs->m_free_blocks_count);
-	sble->sb_free_blocks_count_hi =
-	    htole32((u_int32_t)(fs->m_free_blocks_count >> 32));
-	sble->sb_free_inodes_count = htole32(fs->m_free_inodes_count);
-
-	getnanotime(&ts);
-	sble->sb_write_time_lo = htole32((u_int32_t)ts.tv_sec);
-
-	sble->sb_state = htole16(fs->m_state);
-
-	/* Recompute checksum */
-	sble->sb_checksum = htole32(ext4fs_sb_csum(sble));
+	ext4fs_sbprepare(fs);
 
 	/* Write to disk at the fixed superblock offset */
 	error = bread(ump->um_devvp,
@@ -850,6 +923,39 @@ ext4fs_sbwrite (struct mount *mp)
 
 	memcpy(bp->b_data, sble, sizeof(struct ext4fs));
 	return (bwrite(bp));
+}
+
+int
+ext4fs_sbwrite_handle (struct mount *mp,
+    struct ext4fs_journal_handle *handle)
+{
+	struct ufsmount *ump = VFSTOUFS(mp);
+	struct m_ext4fs *fs = ump->um_e4fs;
+	struct ext4fs saved;
+	struct buf *bp;
+	u_int64_t fsblock;
+	u_int32_t offset;
+	int error;
+
+	if (handle == NULL)
+		return (EINVAL);
+	fsblock = EXT4FS_SUPER_BLOCK_OFFSET / fs->m_block_size;
+	offset = EXT4FS_SUPER_BLOCK_OFFSET % fs->m_block_size;
+	if (offset > fs->m_block_size ||
+	    sizeof(struct ext4fs) > fs->m_block_size - offset)
+		return (EINVAL);
+	error = ext4fs_journal_get_metadata(handle, ump->um_devvp, fsblock,
+	    &bp);
+	if (error)
+		return (error);
+	memcpy(&saved, (char *)bp->b_data + offset, sizeof(saved));
+	ext4fs_sbprepare(fs);
+	memcpy((char *)bp->b_data + offset, &fs->m_sble,
+	    sizeof(fs->m_sble));
+	error = ext4fs_journal_dirty_metadata(handle, bp);
+	if (error)
+		memcpy((char *)bp->b_data + offset, &saved, sizeof(saved));
+	return (error);
 }
 
 static u_long ext4fs_gennumber;

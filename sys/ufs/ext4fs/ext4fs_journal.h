@@ -233,7 +233,9 @@ void	ext4fs_journal_abort (struct mount *, int);
 /*
  * A buffer passed to get_write_access() must be B_BUSY.  On success, the
  * handle owns it and the caller must not bwrite(), bdwrite(), bawrite(), or
- * brelse() it.  dirty_metadata() transfers that ownership to the transaction;
+ * brelse() it.  get_metadata() combines a filesystem-block read with this
+ * registration and reuses a busy buffer already owned by the same running
+ * transaction.  dirty_metadata() transfers ownership to the transaction;
  * otherwise journal_end() releases it.  A transaction keeps every dirtied
  * buffer busy until the commit/checkpoint path writes it, or abort teardown
  * invalidates and releases it.
@@ -247,6 +249,8 @@ int	ext4fs_journal_dirty_metadata (struct ext4fs_journal_handle *,
 int	ext4fs_journal_end (struct ext4fs_journal_handle *);
 int	ext4fs_journal_force_commit (struct mount *);
 int	ext4fs_journal_mark_clean (struct mount *);
+int	ext4fs_journal_get_metadata (struct ext4fs_journal_handle *,
+    struct vnode *, u_int64_t, struct buf **);
 int	ext4fs_journal_get_write_access (struct ext4fs_journal_handle *,
     struct buf *, u_int64_t);
 int	ext4fs_journal_revoke (struct ext4fs_journal_handle *, u_int64_t);

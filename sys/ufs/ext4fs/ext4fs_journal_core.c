@@ -1065,6 +1065,75 @@ out:
 }
 
 int
+ext4fs_journal_get_metadata (struct ext4fs_journal_handle *handle,
+    struct vnode *devvp, u_int64_t fsblock, struct buf **bpp)
+{
+	struct ext4fs_journal_metadata *metadata;
+	struct ext4fs_journal *journal;
+	struct m_ext4fs *fs;
+	struct buf *bp;
+	int error;
+
+	if (handle == NULL || devvp == NULL || bpp == NULL ||
+	    handle->jh_journal == NULL)
+		return (EINVAL);
+	*bpp = NULL;
+	journal = handle->jh_journal;
+	fs = VFSTOUFS(journal->j_mp)->um_e4fs;
+	if (devvp != VFSTOUFS(journal->j_mp)->um_devvp ||
+	    fsblock >= fs->m_blocks_count ||
+	    ext4fs_journal_block_member(journal, fsblock))
+		return (EINVAL);
+	if (fsblock > 0xffffffffULL && !(journal->j_features_incompat &
+	    JBD2_FEATURE_INCOMPAT_64BIT))
+		return (EFBIG);
+
+	mtx_enter(&journal->j_lock);
+	error = ext4fs_journal_handle_error(handle);
+	if (error)
+		goto out;
+	TAILQ_FOREACH(metadata, &handle->jh_transaction->jt_metadata,
+	    jm_entry) {
+		if (metadata->jm_fsblock != fsblock)
+			continue;
+		if (metadata->jm_buf == NULL ||
+		    metadata->jm_buf->b_vp != devvp ||
+		    !ISSET(metadata->jm_buf->b_flags, B_BUSY)) {
+			error = EINVAL;
+			goto out;
+		}
+		if (metadata->jm_owner != NULL &&
+		    metadata->jm_owner != handle) {
+			error = EBUSY;
+			goto out;
+		}
+		*bpp = metadata->jm_buf;
+		error = 0;
+		goto out;
+	}
+	mtx_leave(&journal->j_lock);
+
+	error = bread(devvp, (daddr_t)EXT4FS_FSBTODB(fs, fsblock),
+	    fs->m_block_size, &bp);
+	if (error) {
+		if (bp != NULL)
+			brelse(bp);
+		return (error);
+	}
+	error = ext4fs_journal_get_write_access(handle, bp, fsblock);
+	if (error) {
+		brelse(bp);
+		return (error);
+	}
+	*bpp = bp;
+	return (0);
+
+out:
+	mtx_leave(&journal->j_lock);
+	return (error);
+}
+
+int
 ext4fs_journal_get_write_access (struct ext4fs_journal_handle *handle,
     struct buf *bp, u_int64_t fsblock)
 {
