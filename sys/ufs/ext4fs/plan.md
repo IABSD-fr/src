@@ -490,18 +490,40 @@ each mutation stage.  The broad bitmap, descriptor, counter, superblock, and
 extent checklist entries remain open until every metadata writer using those
 structures has been converted.
 
+Hard-link creation is the first journaled compound namespace operation.
+Linear directory blocks are structurally validated and checksum-verified
+before mutation, and in-block insertion or directory growth is committed with
+the parent inode and target inode link count in one transaction.  Indexed
+directory mutation remains explicitly unsupported.  On 2026-09-25, the
+production-kernel `ext4fsops` matrix passed on 1 KiB, 2 KiB, and 4 KiB
+filesystems with both ordinary hard-link insertion and a packed-directory
+fixture which forces the hard link itself to allocate a second directory
+block.  Remount verification and `e2fsck -fn` accepted every image, and the
+FLEX_BG/BLOCK_UNINIT allocation control continued to pass.
+
+Non-final unlink is the next namespace slice.  When the target has more than
+one name, removal now validates and checksum-verifies the linear directory
+block, then journals its edit with the parent inode and decremented target
+link count in one transaction.  The regression covers both merging a removed
+entry into its predecessor and zeroing the first entry in a directory block.
+Final-link unlink remains on the legacy path pending runtime orphan updates,
+journaled truncation, and journaled inode freeing; therefore the overall
+unlink checklist item remains open.
+
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only for
 regular-file data, the journal's own I/O, recovery, checkpointing, or another
 explicitly documented exception.
 
 Wrap each compound namespace operation in one transaction:
 
-- create and mknod;
-- link and unlink;
-- mkdir and rmdir;
-- rename;
-- symlink;
-- truncate and extent allocation/free.
+- [ ] create and mknod;
+- [x] link;
+- [ ] unlink;
+- [ ] mkdir and rmdir;
+- [ ] rename;
+- [ ] symlink;
+- [x] truncate and extent allocation/free for supported depth-0 and depth-1
+      regular-file extent trees.
 
 ## Phase 5: VFS semantics
 
