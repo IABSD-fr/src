@@ -854,14 +854,25 @@ ext4fs_blkalloc_handle (struct inode *ip,
 				    fs->m_first_data_block) %
 				    fs->m_blocks_per_group);
 		}
-		for (blk = start; blk < blocks && isset(scan, blk); blk++)
-			;
-		if (blk == blocks && start != 0)
-			for (blk = 0; blk < start && isset(scan, blk); blk++)
-				;
-		if (blk == blocks || (start != 0 && blk == start)) {
-			bp = NULL;
-			continue;
+		blk = blocks;
+		for (k = start; k < blocks; k++) {
+			if (isclr(scan, k)) {
+				blk = k;
+				break;
+			}
+		}
+		if (blk == blocks && start != 0) {
+			for (k = 0; k < start; k++) {
+				if (isclr(scan, k)) {
+					blk = k;
+					break;
+				}
+			}
+		}
+		if (blk == blocks) {
+			/* The descriptor promised free blocks in this group. */
+			error = EIO;
+			goto out;
 		}
 
 		nalloced = 1;
@@ -949,6 +960,11 @@ ext4fs_blkalloc (struct inode *ip, u_int64_t goal, u_int32_t count,
 	if (error)
 		return (error);
 	error = ext4fs_blkalloc_handle(ip, handle, goal, count, bnp, countp);
+	if (error == 0 && (*countp == 0 ||
+	    *bnp < fs->m_first_data_block || *bnp >= fs->m_blocks_count)) {
+		error = EIO;
+		ext4fs_journal_abort(ITOV(ip)->v_mount, error);
+	}
 	end_error = ext4fs_journal_end(handle);
 	if (error == 0)
 		error = end_error;
@@ -966,8 +982,8 @@ ext4fs_blkalloc (struct inode *ip, u_int64_t goal, u_int32_t count,
 /*
  * Free a filesystem block.
  */
-void
-ext4fs_blkfree (struct inode *ip, u_int64_t bno)
+static void
+ext4fs_blkfree_direct (struct inode *ip, u_int64_t bno)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_block_group_descriptor *gd;
@@ -1036,6 +1052,141 @@ ext4fs_blkfree (struct inode *ip, u_int64_t bno)
 	fs->m_sble.sb_free_blocks_count_hi =
 	    htole32((u_int32_t)(fs->m_free_blocks_count >> 32));
 	fs->m_fs_was_modified = 1;
+}
+
+int
+ext4fs_blkfree_handle (struct inode *ip,
+    struct ext4fs_journal_handle *handle, u_int64_t bno)
+{
+	struct m_ext4fs *fs = ip->i_e4fs;
+	struct ext4fs_block_group_descriptor saved_gd, *gd;
+	struct ext4fs saved_sb;
+	struct buf *bp;
+	u_int8_t *saved_bitmap;
+	u_int64_t bitmap_block, saved_free_blocks;
+	u_int32_t bitmap_csum, bit, blocks, free_blocks, group;
+	int error, saved_modified, transaction_changed;
+
+	if (handle == NULL || bno < fs->m_first_data_block ||
+	    bno >= fs->m_blocks_count || fs->m_block_group_count == 0 ||
+	    fs->m_block_group_count > UINT32_MAX ||
+	    fs->m_blocks_per_group == 0 ||
+	    fs->m_blocks_per_group > fs->m_block_size * NBBY)
+		return (EINVAL);
+	group = (u_int32_t)((bno - fs->m_first_data_block) /
+	    fs->m_blocks_per_group);
+	if (group >= fs->m_block_group_count)
+		return (EINVAL);
+	bit = (u_int32_t)((bno - fs->m_first_data_block) %
+	    fs->m_blocks_per_group);
+	blocks = ext4fs_group_block_count(fs, group);
+	if (bit >= blocks)
+		return (EINVAL);
+
+	gd = &fs->m_gd[group];
+	if (letoh16(gd->bgd_flags) & EXT4FS_BGD_FLAG_BLOCK_UNINIT)
+		return (EINVAL);
+	bitmap_block = ext4fs_bgd_get_block(fs, gd,
+	    EXT4FS_BGD_BLOCK_BITMAP);
+	if (bitmap_block < fs->m_first_data_block ||
+	    bitmap_block >= fs->m_blocks_count)
+		return (EIO);
+	error = ext4fs_journal_get_metadata(handle, ip->i_devvp,
+	    bitmap_block, &bp);
+	if (error)
+		return (error);
+	error = ext4fs_block_bitmap_csum_verify(fs, group, gd, bp->b_data);
+	if (error)
+		return (error);
+	if (isclr((u_int8_t *)bp->b_data, bit))
+		return (EINVAL);
+
+	free_blocks = letoh16(gd->bgd_free_blocks_count_lo);
+	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+		free_blocks |= (u_int32_t)
+		    letoh16(gd->bgd_free_blocks_count_hi) << 16;
+	if (free_blocks >= blocks ||
+	    fs->m_free_blocks_count >= fs->m_blocks_count)
+		return (EIO);
+
+	saved_bitmap = malloc(fs->m_block_size, M_UFSMNT, M_WAITOK);
+	memcpy(saved_bitmap, bp->b_data, fs->m_block_size);
+	saved_gd = *gd;
+	saved_sb = fs->m_sble;
+	saved_free_blocks = fs->m_free_blocks_count;
+	saved_modified = fs->m_fs_was_modified;
+	transaction_changed = 0;
+
+	clrbit((u_int8_t *)bp->b_data, bit);
+	bitmap_csum = ext4fs_bitmap_csum(fs, group, bp->b_data,
+	    fs->m_block_size);
+	gd->bgd_block_bitmap_checksum_lo = htole16(bitmap_csum & 0xffff);
+	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+		gd->bgd_block_bitmap_checksum_hi = htole16(bitmap_csum >> 16);
+	free_blocks++;
+	gd->bgd_free_blocks_count_lo = htole16(free_blocks & 0xffff);
+	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+		gd->bgd_free_blocks_count_hi = htole16(free_blocks >> 16);
+	fs->m_free_blocks_count++;
+	fs->m_fs_was_modified = 1;
+
+	error = ext4fs_journal_dirty_metadata(handle, bp);
+	if (error)
+		goto restore;
+	transaction_changed = 1;
+	error = ext4fs_journal_revoke(handle, bno);
+	if (error)
+		goto restore;
+	error = ext4fs_bgd_write_handle(fs, ip->i_devvp, group, handle);
+	if (error)
+		goto restore;
+	error = ext4fs_sbwrite_handle(ITOV(ip)->v_mount, handle);
+	if (error)
+		goto restore;
+	free(saved_bitmap, M_UFSMNT, fs->m_block_size);
+	return (0);
+
+restore:
+	memcpy(bp->b_data, saved_bitmap, fs->m_block_size);
+	*gd = saved_gd;
+	fs->m_sble = saved_sb;
+	fs->m_free_blocks_count = saved_free_blocks;
+	fs->m_fs_was_modified = saved_modified;
+	free(saved_bitmap, M_UFSMNT, fs->m_block_size);
+	if (transaction_changed)
+		ext4fs_journal_abort(ITOV(ip)->v_mount, error);
+	return (error);
+}
+
+void
+ext4fs_blkfree (struct inode *ip, u_int64_t bno)
+{
+	struct m_ext4fs *fs = ip->i_e4fs;
+	struct ext4fs_journal_handle *handle;
+	int end_error, error;
+
+	if (fs->m_journal == NULL) {
+		ext4fs_blkfree_direct(ip, bno);
+		return;
+	}
+	handle = NULL;
+	error = ext4fs_journal_begin(ITOV(ip)->v_mount, 4, &handle);
+	if (error)
+		goto fail;
+	error = ext4fs_blkfree_handle(ip, handle, bno);
+	end_error = ext4fs_journal_end(handle);
+	if (error == 0)
+		error = end_error;
+	if (error == 0)
+		error = ext4fs_journal_force_commit(ITOV(ip)->v_mount);
+	else
+		ext4fs_journal_abort(ITOV(ip)->v_mount, error);
+	if (error == 0)
+		return;
+
+fail:
+	printf("ext4fs_blkfree: block %llu: error %d\n",
+	    (unsigned long long)bno, error);
 }
 
 /*

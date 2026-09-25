@@ -643,6 +643,8 @@ int ext4fs_blkalloc (struct inode *, u_int64_t, u_int32_t, u_int64_t *,
     u_int32_t *);
 int ext4fs_blkalloc_handle (struct inode *, struct ext4fs_journal_handle *,
     u_int64_t, u_int32_t, u_int64_t *, u_int32_t *);
+int ext4fs_blkfree_handle (struct inode *, struct ext4fs_journal_handle *,
+    u_int64_t);
 void ext4fs_blkfree (struct inode *, u_int64_t);
 
 /* Inode allocation / free */

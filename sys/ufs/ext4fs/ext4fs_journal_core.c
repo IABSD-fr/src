@@ -1245,39 +1245,54 @@ ext4fs_journal_revoke (struct ext4fs_journal_handle *handle,
 	struct ext4fs_journal_revoke *candidate, *revoke;
 	struct ext4fs_journal *journal;
 	struct m_ext4fs *fs;
-	int error;
+	int error, has_revoke;
 
 	if (handle == NULL || handle->jh_journal == NULL)
 		return (EINVAL);
 	journal = handle->jh_journal;
 	fs = VFSTOUFS(journal->j_mp)->um_e4fs;
-	if (!(journal->j_features_incompat & JBD2_FEATURE_INCOMPAT_REVOKE))
-		return (EOPNOTSUPP);
+	has_revoke = journal->j_features_incompat &
+	    JBD2_FEATURE_INCOMPAT_REVOKE;
 	if (fsblock >= fs->m_blocks_count ||
 	    ext4fs_journal_block_member(journal, fsblock))
 		return (EINVAL);
-	if (fsblock > 0xffffffffULL && !(journal->j_features_incompat &
+	if (has_revoke && fsblock > 0xffffffffULL &&
+	    !(journal->j_features_incompat &
 	    JBD2_FEATURE_INCOMPAT_64BIT))
 		return (EFBIG);
-	candidate = malloc(sizeof(*candidate), M_UFSMNT, M_WAITOK | M_ZERO);
-	candidate->jr_fsblock = fsblock;
+	candidate = NULL;
+	if (has_revoke) {
+		candidate = malloc(sizeof(*candidate), M_UFSMNT,
+		    M_WAITOK | M_ZERO);
+		candidate->jr_fsblock = fsblock;
+	}
 
 	mtx_enter(&journal->j_lock);
 	error = ext4fs_journal_handle_error(handle);
 	if (error)
 		goto out;
-	TAILQ_FOREACH(revoke, &handle->jh_transaction->jt_revokes, jr_entry) {
-		if (ext4fs_journal_state_block_relation(revoke->jr_fsblock,
-		    fsblock) == 0) {
-			error = 0;
-			goto out;
-		}
-	}
 	TAILQ_FOREACH(metadata, &handle->jh_transaction->jt_metadata,
 	    jm_entry) {
 		if (ext4fs_journal_state_block_relation(metadata->jm_fsblock,
 		    fsblock) == 0) {
 			error = EBUSY;
+			goto out;
+		}
+	}
+	/*
+	 * The serialized runtime writer checkpoints each committed transaction
+	 * before admitting block reuse.  A journal without the optional revoke
+	 * feature therefore needs no on-disk revoke record, but freeing metadata
+	 * already enlisted in this transaction remains invalid.
+	 */
+	if (!has_revoke) {
+		error = 0;
+		goto out;
+	}
+	TAILQ_FOREACH(revoke, &handle->jh_transaction->jt_revokes, jr_entry) {
+		if (ext4fs_journal_state_block_relation(revoke->jr_fsblock,
+		    fsblock) == 0) {
+			error = 0;
 			goto out;
 		}
 	}

@@ -8,6 +8,8 @@ set -eu
 
 MKE2FS=${MKE2FS:-mke2fs}
 E2FSCK=${E2FSCK:-e2fsck}
+DEBUGFS=${DEBUGFS:-debugfs}
+DUMPE2FS=${DUMPE2FS:-dumpe2fs}
 VNCONFIG=${VNCONFIG:-vnconfig}
 MOUNT_EXT4FS=${MOUNT_EXT4FS:-mount_ext4fs}
 UMOUNT=${UMOUNT:-umount}
@@ -16,8 +18,10 @@ TIMEOUT=${TIMEOUT:-timeout}
 EXT4FSOPS=${EXT4FSOPS:-./ext4fsops}
 EXT4FS_TIMEOUT=${EXT4FS_TIMEOUT:-60}
 EXT4FS_IMAGE_MB=${EXT4FS_IMAGE_MB:-128}
+EXT4FS_BLOCK_SIZES=${EXT4FS_BLOCK_SIZES:-"1024 2048 4096"}
 
-for tool in "$MKE2FS" "$E2FSCK" "$VNCONFIG" "$MOUNT_EXT4FS" \
+for tool in "$MKE2FS" "$E2FSCK" "$DEBUGFS" "$DUMPE2FS" \
+    "$VNCONFIG" "$MOUNT_EXT4FS" \
     "$UMOUNT" "$TIMEOUT" "$EXT4FSOPS" dd id sha256; do
 	if ! command -v "$tool" >/dev/null 2>&1; then
 		echo "SKIPPED: ext4fs operations regress requires $tool"
@@ -98,11 +102,21 @@ fail()
 run_step()
 {
 	mode=$1
+	step_root=${2:-$mountpoint/tree}
 	if ! "$TIMEOUT" -k 2 "$EXT4FS_TIMEOUT" "$EXT4FSOPS" "$mode" \
-	    "$mountpoint/tree" >"$case_dir/$mode.log" 2>&1; then
+	    "$step_root" >"$case_dir/$mode.log" 2>&1; then
 		cat "$case_dir/$mode.log" >&2
 		fail "$mode workload failed"
 	fi
+}
+
+group_free_blocks()
+{
+	group_number=$1
+	"$DUMPE2FS" "$image" 2>/dev/null | awk -v group="$group_number:" '
+	    $1 == "Group" && $2 == group { selected = 1; next }
+	    selected && /free blocks,/ { print $1; exit }
+	'
 }
 
 attach_image()
@@ -220,6 +234,103 @@ run_case()
 	echo " ok"
 }
 
-for block_size in 1024 2048 4096; do
+run_flex_uninit_case()
+{
+	case_dir=$work/flex-bg-block-uninit
+	image=$case_dir/ext4.img
+	empty=$case_dir/empty
+	mkdir "$case_dir"
+	: >"$empty"
+
+	test_name="FLEX_BG BLOCK_UNINIT allocation"
+	printf '%-44s' "kernel: FLEX_BG BLOCK_UNINIT allocation"
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b 1024 \
+	    -O '^orphan_file' "$image" >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs failed"
+	fi
+	"$DUMPE2FS" "$image" >"$case_dir/dumpe2fs-before.log" 2>&1 ||
+	    fail "dumpe2fs rejected the fresh image"
+	grep -q '^Filesystem features:.*flex_bg' \
+	    "$case_dir/dumpe2fs-before.log" ||
+	    fail "fixture does not enable FLEX_BG"
+	grep -q '^Group 2:.*BLOCK_UNINIT' \
+	    "$case_dir/dumpe2fs-before.log" ||
+	    fail "fixture group 2 is not BLOCK_UNINIT"
+
+	free0=$(group_free_blocks 0)
+	free1=$(group_free_blocks 1)
+	case "$free0:$free1" in
+	*[!0-9:]*) fail "could not read group free-block counts" ;;
+	esac
+	reserve_count=$((free0 + free1))
+	[ "$reserve_count" -gt 0 ] || fail "fixture has no blocks to reserve"
+	{
+		printf 'write %s /reservoir\n' "$empty"
+		printf 'fallocate /reservoir 0 %s\n' $((reserve_count - 1))
+	} >"$case_dir/debugfs.cmd"
+	if ! "$DEBUGFS" -w -f "$case_dir/debugfs.cmd" "$image" \
+	    >"$case_dir/debugfs.log" 2>&1; then
+		cat "$case_dir/debugfs.log" >&2
+		fail "could not exhaust block groups 0 and 1"
+	fi
+	[ "$(group_free_blocks 0)" -eq 0 ] ||
+	    fail "block group 0 was not exhausted"
+	[ "$(group_free_blocks 1)" -eq 0 ] ||
+	    fail "block group 1 was not exhausted"
+	"$DUMPE2FS" "$image" >"$case_dir/dumpe2fs-filled.log" 2>&1 ||
+	    fail "dumpe2fs rejected the filled image"
+	grep -q '^Group 2:.*BLOCK_UNINIT' \
+	    "$case_dir/dumpe2fs-filled.log" ||
+	    fail "offline preparation initialized block group 2"
+
+	attach_image
+	mount_image ""
+	run_step create-allocation-probe "$mountpoint"
+	unmount_image allocation-probe
+	detach_image
+	check_image allocation-probe
+
+	"$DUMPE2FS" "$image" >"$case_dir/dumpe2fs-after.log" 2>&1 ||
+	    fail "dumpe2fs rejected the allocated image"
+	if grep -q '^Group 2:.*BLOCK_UNINIT' \
+	    "$case_dir/dumpe2fs-after.log"; then
+		fail "kernel did not initialize block group 2"
+	fi
+	probe_blocks=$($DEBUGFS -R 'blocks /allocation-probe' "$image" \
+	    2>/dev/null) || fail "could not locate allocation probe blocks"
+	set -- $probe_blocks
+	[ "$#" -eq 2 ] || fail "allocation probe does not use two blocks"
+	for probe_block in "$@"; do
+		case "$probe_block" in
+		*[!0-9]*|'') fail "invalid allocation probe block" ;;
+		esac
+		[ "$probe_block" -ge 16385 ] && [ "$probe_block" -le 24576 ] ||
+		    fail "allocation probe block is outside block group 2"
+	done
+
+	attach_image
+	mount_image ""
+	run_step verify-allocation-probe "$mountpoint"
+	unmount_image allocation-probe-remount
+	detach_image
+	check_image allocation-probe-remount
+	echo " ok"
+}
+
+for block_size in $EXT4FS_BLOCK_SIZES; do
+	case "$block_size" in
+	1024|2048|4096) ;;
+	*)
+		echo "unsupported filesystem block size: $block_size" >&2
+		exit 1
+		;;
+	esac
 	run_case "$block_size"
 done
+
+case " $EXT4FS_BLOCK_SIZES " in
+*' 1024 '*) run_flex_uninit_case ;;
+esac
