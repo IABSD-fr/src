@@ -149,29 +149,8 @@ jbd2_extent_header_check (struct ext4fs_extent_header *eh, size_t bytes,
 int
 jbd2_extent_block_csum_verify (struct jbd2_replay_ctx *ctx, void *buf)
 {
-	struct m_ext4fs *fs = ctx->rc_fs;
-	struct ext4fs_extent_header *eh = buf;
-	u_int32_t crc, ino_le, provided, *tail;
-	size_t tail_offset;
-
-	if (!(fs->m_feature_ro_compat &
-	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
-		return (1);
-	tail_offset = sizeof(*eh) +
-	    (size_t)letoh16(eh->eh_max) * sizeof(struct ext4fs_extent);
-	if (tail_offset > fs->m_block_size - sizeof(*tail))
-		return (0);
-	tail = (u_int32_t *)((char *)buf + tail_offset);
-	provided = *tail;
-	*tail = 0;
-	ino_le = htole32(ctx->rc_journal_ino);
-	crc = crc32c(ext4fs_csum_seed(fs), (const uint8_t *)&ino_le,
-	    sizeof(ino_le));
-	crc = crc32c(crc, (const uint8_t *)&ctx->rc_journal_gen,
-	    sizeof(ctx->rc_journal_gen));
-	crc = crc32c(crc, buf, tail_offset);
-	*tail = provided;
-	return (letoh32(provided) == ~crc);
+	return (ext4fs_extent_block_csum_verify(ctx->rc_fs,
+	    ctx->rc_journal_ino, ctx->rc_journal_gen, buf) == 0);
 }
 
 /* Map one logical journal block through an extent tree of arbitrary depth. */

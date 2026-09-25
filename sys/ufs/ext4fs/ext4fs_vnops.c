@@ -75,6 +75,94 @@ static const u_int8_t ext4fs_type_to_dt[EXT4FS_FT_MAX] = {
 };
 
 /*
+ * Validate an extent node header before using its entries.  bytes is the
+ * complete storage available to the node: the inode i_block area for a root,
+ * or one filesystem block for an external node.
+ */
+static int
+ext4fs_extent_header_check (struct ext4fs_extent_header *eh, size_t bytes,
+    int expected_depth)
+{
+	size_t capacity;
+	u_int16_t depth, entries, max;
+
+	if (bytes < sizeof(*eh))
+		return (EIO);
+	if (letoh16(eh->eh_magic) != EXT4FS_EXTENT_HEADER_MAGIC)
+		return (EIO);
+	depth = letoh16(eh->eh_depth);
+	entries = letoh16(eh->eh_entries);
+	max = letoh16(eh->eh_max);
+	capacity = (bytes - sizeof(*eh)) / sizeof(struct ext4fs_extent);
+	if (depth > EXT4FS_EXTENT_DEPTH_MAX ||
+	    (expected_depth >= 0 && depth != expected_depth) ||
+	    max == 0 || max > capacity || entries > max)
+		return (EIO);
+	return (0);
+}
+
+static int
+ext4fs_extent_index_check (struct m_ext4fs *fs,
+    struct ext4fs_extent_header *eh)
+{
+	struct ext4fs_extent_idx *idx;
+	u_int64_t child;
+	u_int32_t logical, previous;
+	u_int16_t entries, i;
+
+	entries = letoh16(eh->eh_entries);
+	if (entries == 0)
+		return (EIO);
+	idx = (struct ext4fs_extent_idx *)(eh + 1);
+	previous = 0;
+	for (i = 0; i < entries; i++) {
+		logical = letoh32(idx[i].ei_block);
+		if (i > 0 && logical <= previous)
+			return (EIO);
+		child = letoh32(idx[i].ei_leaf_lo);
+		child |= (u_int64_t)letoh16(idx[i].ei_leaf_hi) << 32;
+		if (child == 0 || child >= fs->m_blocks_count ||
+		    letoh16(idx[i].ei_unused) != 0)
+			return (EIO);
+		previous = logical;
+	}
+	return (0);
+}
+
+static int
+ext4fs_extent_leaf_check (struct m_ext4fs *fs,
+    struct ext4fs_extent_header *eh)
+{
+	struct ext4fs_extent *ext;
+	u_int64_t logical_end, physical, previous_end;
+	u_int32_t length, logical;
+	u_int16_t entries, i, raw_length;
+
+	entries = letoh16(eh->eh_entries);
+	ext = (struct ext4fs_extent *)(eh + 1);
+	previous_end = 0;
+	for (i = 0; i < entries; i++) {
+		logical = letoh32(ext[i].e_block);
+		raw_length = letoh16(ext[i].e_len);
+		if (raw_length == 0)
+			return (EIO);
+		length = raw_length > 0x8000 ? raw_length - 0x8000 :
+		    raw_length;
+		logical_end = (u_int64_t)logical + length;
+		if (logical_end > (1ULL << 32) ||
+		    (i > 0 && logical < previous_end))
+			return (EIO);
+		physical = letoh32(ext[i].e_start_lo);
+		physical |= (u_int64_t)letoh16(ext[i].e_start_hi) << 32;
+		if (physical == 0 || physical >= fs->m_blocks_count ||
+		    length > fs->m_blocks_count - physical)
+			return (EIO);
+		previous_end = logical_end;
+	}
+	return (0);
+}
+
+/*
  * Look up the physical block number for a given logical block number
  * using the extent tree in the inode.
  * Returns 0 on success with the physical block stored in *pblk.
@@ -92,8 +180,9 @@ ext4fs_extent_pblk (struct inode *ip, u_int64_t lbn, u_int64_t *pblk,
 
 	/* Start with the extent header in the inode */
 	eh = &din->i_extent_header;
-	if (letoh16(eh->eh_magic) != EXT4FS_EXTENT_HEADER_MAGIC)
-		return (EIO);
+	error = ext4fs_extent_header_check(eh, sizeof(din->i_block), -1);
+	if (error)
+		return (error);
 
 	depth = letoh16(eh->eh_depth);
 	entries = letoh16(eh->eh_entries);
@@ -102,6 +191,10 @@ ext4fs_extent_pblk (struct inode *ip, u_int64_t lbn, u_int64_t *pblk,
 	while (depth > 0) {
 		struct ext4fs_extent_idx *idx;
 		u_int64_t child_blk;
+
+		error = ext4fs_extent_index_check(fs, eh);
+		if (error)
+			goto out;
 
 		/* Index node: find the child that covers lbn */
 		idx = (struct ext4fs_extent_idx *)(eh + 1);
@@ -113,17 +206,18 @@ ext4fs_extent_pblk (struct inode *ip, u_int64_t lbn, u_int64_t *pblk,
 				break;
 		}
 		if (found < 0) {
-			if (bp != NULL)
-				brelse(bp);
-			return (EIO);
+			error = 0;
+			goto hole;
 		}
 
 		/* Read the child node block */
 		child_blk = letoh32(idx[found].ei_leaf_lo);
 		child_blk |= (u_int64_t)letoh16(idx[found].ei_leaf_hi) << 32;
 
-		if (bp != NULL)
+		if (bp != NULL) {
 			brelse(bp);
+			bp = NULL;
+		}
 
 		error = bread(ip->i_devvp,
 		    (daddr_t)EXT4FS_FSBTODB(fs, child_blk),
@@ -135,48 +229,58 @@ ext4fs_extent_pblk (struct inode *ip, u_int64_t lbn, u_int64_t *pblk,
 		}
 
 		eh = (struct ext4fs_extent_header *)bp->b_data;
-		if (letoh16(eh->eh_magic) != EXT4FS_EXTENT_HEADER_MAGIC) {
-			brelse(bp);
-			return (EIO);
-		}
-		depth = letoh16(eh->eh_depth);
+		error = ext4fs_extent_header_check(eh, fs->m_block_size,
+		    depth - 1);
+		if (error)
+			goto out;
+		error = ext4fs_extent_block_csum_verify(fs, ip->i_number,
+		    din->i_nfs_generation, bp->b_data);
+		if (error)
+			goto out;
+		depth--;
 		entries = letoh16(eh->eh_entries);
 	}
 
 	/* Leaf node: search for the extent containing lbn */
 	{
 		struct ext4fs_extent *ext;
+
+		error = ext4fs_extent_leaf_check(fs, eh);
+		if (error)
+			goto out;
 		ext = (struct ext4fs_extent *)(eh + 1);
 		for (i = 0; i < (int)entries; i++) {
 			u_int32_t e_block = letoh32(ext[i].e_block);
 			u_int16_t e_len = letoh16(ext[i].e_len);
 
 			/* High bit of e_len marks uninitialized extents */
-			if (e_len > 32768)
-				e_len -= 32768;
+			if (e_len > 0x8000)
+				e_len -= 0x8000;
 
-			if (lbn >= e_block && lbn < e_block + e_len) {
+			if (lbn < e_block)
+				break;
+			if (lbn - e_block < e_len) {
 				u_int64_t start = letoh32(ext[i].e_start_lo);
 				start |=
 				    (u_int64_t)letoh16(ext[i].e_start_hi) << 32;
 				*pblk = start + (lbn - e_block);
 				if (ncontig != NULL)
 					*ncontig = e_len - (lbn - e_block);
-				if (bp != NULL)
-					brelse(bp);
-				return (0);
+				error = 0;
+				goto out;
 			}
 		}
 	}
 
-	if (bp != NULL)
-		brelse(bp);
-
 	/* Block not covered by any extent — hole */
+hole:
 	*pblk = 0;
 	if (ncontig != NULL)
 		*ncontig = 1;
-	return (0);
+out:
+	if (bp != NULL)
+		brelse(bp);
+	return (error);
 }
 
 /*
@@ -987,7 +1091,9 @@ ext4fs_buf_alloc (struct inode *ip, u_int64_t lbn, int size,
 
 	/* Check if already mapped */
 	error = ext4fs_extent_pblk(ip, lbn, &pblk, &ncontig);
-	if (error == 0 && pblk != 0) {
+	if (error)
+		return (error);
+	if (pblk != 0) {
 		if (bpp == NULL)
 			return (0);
 		/* Already mapped, just read */
@@ -998,8 +1104,6 @@ ext4fs_buf_alloc (struct inode *ip, u_int64_t lbn, int size,
 			brelse(*bpp);
 		return (error);
 	}
-	error = 0;
-
 	/* Not mapped - allocate a new block */
 	/* Goal: try to be contiguous with last extent */
 	goal = 0;
@@ -1012,36 +1116,6 @@ ext4fs_buf_alloc (struct inode *ip, u_int64_t lbn, int size,
 			u_int64_t last_start = letoh32(last->e_start_lo) |
 			    ((u_int64_t)letoh16(last->e_start_hi) << 32);
 			goal = last_start + letoh16(last->e_len);
-		} else {
-			/* Walk to last leaf to find last extent */
-			u_int16_t ent = letoh16(din->i_extent_header.eh_entries);
-			struct ext4fs_extent_idx *idx = din->i_extent_idx;
-			u_int64_t leaf_blk;
-			struct buf *gbp;
-
-			leaf_blk = letoh32(idx[ent - 1].ei_leaf_lo) |
-			    ((u_int64_t)letoh16(idx[ent - 1].ei_leaf_hi) << 32);
-			error = bread(ip->i_devvp,
-			    (daddr_t)EXT4FS_FSBTODB(fs, leaf_blk),
-			    fs->m_block_size, &gbp);
-			if (error == 0) {
-				struct ext4fs_extent_header *leh =
-				    (struct ext4fs_extent_header *)gbp->b_data;
-				u_int16_t lent = letoh16(leh->eh_entries);
-				if (lent > 0 && letoh16(leh->eh_magic) ==
-				    EXT4FS_EXTENT_HEADER_MAGIC) {
-					struct ext4fs_extent *le =
-					    (struct ext4fs_extent *)(leh + 1);
-					u_int64_t ls =
-					    letoh32(le[lent - 1].e_start_lo) |
-					    ((u_int64_t)letoh16(
-					    le[lent - 1].e_start_hi) << 32);
-					goal = ls + letoh16(le[lent - 1].e_len);
-				}
-				brelse(gbp);
-			} else {
-				brelse(gbp);
-			}
 		}
 	}
 
