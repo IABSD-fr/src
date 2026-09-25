@@ -501,14 +501,17 @@ fixture which forces the hard link itself to allocate a second directory
 block.  Remount verification and `e2fsck -fn` accepted every image, and the
 FLEX_BG/BLOCK_UNINIT allocation control continued to pass.
 
-Non-final unlink is the next namespace slice.  When the target has more than
-one name, removal now validates and checksum-verifies the linear directory
-block, then journals its edit with the parent inode and decremented target
-link count in one transaction.  The regression covers both merging a removed
-entry into its predecessor and zeroing the first entry in a directory block.
-Final-link unlink remains on the legacy path pending runtime orphan updates,
-journaled truncation, and journaled inode freeing; therefore the overall
-unlink checklist item remains open.
+Non-final unlink is now journaled.  When the target has more than one name,
+removal validates and checksum-verifies the linear directory block, then
+commits its edit with the parent inode and decremented target link count in one
+transaction.  The regression covers both merging a removed entry into its
+predecessor and zeroing the first entry in a directory block.  On 2026-09-26,
+both cases passed against the booted production kernel on 1 KiB, 2 KiB, and
+4 KiB filesystems; remount verification, `e2fsck -fn`, and the
+FLEX_BG/BLOCK_UNINIT control also passed.  Final-link unlink remains on the
+legacy path pending runtime orphan updates, journaled truncation, and
+journaled inode freeing; therefore the overall unlink checklist item remains
+open.
 
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only for
 regular-file data, the journal's own I/O, recovery, checkpointing, or another

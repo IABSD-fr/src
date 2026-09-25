@@ -795,6 +795,12 @@ mutate_filesystem_tree (void)
 	off_t marker, overwrite;
 	int fd, i;
 
+	/* Isolate non-final unlink from the legacy rename path below. */
+	make_path(path, sizeof(path),
+	    "link-grow/journal-growth-link");
+	if (unlink(path) == -1)
+		err(1, "unlink journal-growth-link");
+
 	make_path(path, sizeof(path), "data");
 	make_path(other, sizeof(other), "a/renamed");
 	if (rename(path, other) == -1)
@@ -802,10 +808,6 @@ mutate_filesystem_tree (void)
 	make_path(path, sizeof(path), "data.link");
 	if (unlink(path) == -1)
 		err(1, "unlink data.link");
-	make_path(path, sizeof(path),
-	    "link-grow/journal-growth-link");
-	if (unlink(path) == -1)
-		err(1, "unlink journal-growth-link");
 	make_path(path, sizeof(path), "a/renamed");
 	fd = open(path, O_RDWR);
 	if (fd == -1)
