@@ -35,6 +35,7 @@
 #define EXTENT_WRITES	12
 #define SHRINK_EXTENT_LBN	10
 #define SHRINK_EXTENT_BYTES	37
+#define DIR_TAIL_BYTES	12
 #define IO_CHUNK	4096
 
 #define DATA_SEED	0x31U
@@ -64,6 +65,8 @@ static void	check_large_sparse (const char *, int);
 static void	check_extent_file (const char *);
 static void	check_shrunk_extent_file (const char *);
 static void	check_empty_file (const char *);
+static void	create_link_growth_tree (void);
+static void	check_link_growth_tree (void);
 static void	check_grow_directory (const char *, int);
 static void	fsync_path (const char *);
 static void	expect_ro_failure (const char *, int);
@@ -430,6 +433,93 @@ check_empty_file (const char *path)
 }
 
 static void
+create_link_growth_tree (void)
+{
+	struct stat st;
+	char directory[PATH_MAX], linkpath[PATH_MAX], name[256];
+	char suffix[320], target[PATH_MAX];
+	size_t consume, namelen, record;
+	int fd, index, n;
+
+	make_path(directory, sizeof(directory), "link-grow");
+	if (mkdir(directory, 0755) == -1)
+		err(1, "mkdir %s", directory);
+	make_path(target, sizeof(target), "link-target");
+	write_text_file(target, "journaled-link-data");
+
+	/*
+	 * The regression images use metadata_csum.  Leave eight bytes of slack
+	 * in the first linear directory block, less than any valid dirent, so
+	 * the hard link below must allocate the next block itself.
+	 */
+	consume = block_size - DIR_TAIL_BYTES - 24 - 8;
+	index = 0;
+	while (consume != 0) {
+		record = consume > 264 ? 264 : consume;
+		if (consume > record && consume - record < 12)
+			record -= 12 - (consume - record);
+		if (record < 12 || (record & 3) != 0)
+			errx(1, "invalid directory packing record");
+		namelen = record == 264 ? 255 : record - 8;
+		memset(name, 'f', namelen);
+		n = snprintf(name, namelen + 1, "%03d-", index);
+		if (n < 0 || (size_t)n >= namelen)
+			errx(1, "directory filler name too short");
+		memset(name + n, 'f', namelen - (size_t)n);
+		name[namelen] = '\0';
+		n = snprintf(suffix, sizeof(suffix), "link-grow/%s", name);
+		if (n < 0 || (size_t)n >= sizeof(suffix))
+			errx(1, "directory filler path too long");
+		make_path(linkpath, sizeof(linkpath), suffix);
+		fd = open(linkpath, O_WRONLY | O_CREAT | O_EXCL, 0644);
+		if (fd == -1)
+			err(1, "open %s", linkpath);
+		if (close(fd) == -1)
+			err(1, "close %s", linkpath);
+		consume -= record;
+		index++;
+	}
+	if (stat(directory, &st) == -1)
+		err(1, "stat %s", directory);
+	if (st.st_size != (off_t)block_size)
+		errx(1, "directory packing unexpectedly grew the directory");
+	make_path(linkpath, sizeof(linkpath),
+	    "link-grow/journal-growth-link");
+	if (link(target, linkpath) == -1)
+		err(1, "link %s", linkpath);
+	if (stat(directory, &st) == -1)
+		err(1, "stat %s", directory);
+	if (st.st_size != (off_t)(2 * block_size))
+		errx(1, "hard link did not grow its directory");
+}
+
+static void
+check_link_growth_tree (void)
+{
+	struct stat directory_st, link_st, target_st;
+	char directory[PATH_MAX], linkpath[PATH_MAX], target[PATH_MAX];
+
+	make_path(directory, sizeof(directory), "link-grow");
+	make_path(target, sizeof(target), "link-target");
+	make_path(linkpath, sizeof(linkpath),
+	    "link-grow/journal-growth-link");
+	if (stat(directory, &directory_st) == -1)
+		err(1, "stat %s", directory);
+	if (!S_ISDIR(directory_st.st_mode) ||
+	    directory_st.st_size != (off_t)(2 * block_size))
+		errx(1, "link-growth directory has wrong type or size");
+	if (stat(target, &target_st) == -1)
+		err(1, "stat %s", target);
+	if (stat(linkpath, &link_st) == -1)
+		err(1, "stat %s", linkpath);
+	if (target_st.st_ino != link_st.st_ino || target_st.st_nlink != 2 ||
+	    link_st.st_nlink != 2)
+		errx(1, "journaled growth link identity or count mismatch");
+	check_text_file(target, "journaled-link-data");
+	check_text_file(linkpath, "journaled-link-data");
+}
+
+static void
 create_extent_file (const char *path)
 {
 	int fd, i;
@@ -585,6 +675,7 @@ create_filesystem_tree (void)
 	create_extent_file(path);
 	make_path(path, sizeof(path), "shrink-extents");
 	create_extent_file(path);
+	create_link_growth_tree();
 
 	make_path(path, sizeof(path), "empty");
 	write_text_file(path, "");
@@ -665,6 +756,7 @@ verify_created_tree (void)
 	check_extent_file(path);
 	make_path(path, sizeof(path), "shrink-extents");
 	check_extent_file(path);
+	check_link_growth_tree();
 	make_path(path, sizeof(path), "empty");
 	check_regular(path);
 
@@ -903,6 +995,7 @@ verify_final_tree (void)
 	check_empty_file(path);
 	make_path(path, sizeof(path), "shrink-extents");
 	check_shrunk_extent_file(path);
+	check_link_growth_tree();
 	make_path(path, sizeof(path), "growdir");
 	check_grow_directory(path, 1);
 

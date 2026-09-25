@@ -266,6 +266,39 @@ ext4fs_dir_set_csum (struct m_ext4fs *fs, u_int32_t ino, u_int32_t gen_le,
 }
 
 /*
+ * Verify a linear directory block checksum and its fixed tail.  Indexed
+ * directory blocks are not writable until their separate layout is
+ * implemented and validated.
+ */
+int
+ext4fs_dir_csum_verify (struct m_ext4fs *fs, u_int32_t ino,
+    u_int32_t gen_le, const void *buf)
+{
+	const struct ext4fs_directory_tail *tail;
+	u_int32_t crc, ino_le, provided;
+
+	if (!(fs->m_feature_ro_compat &
+	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
+		return (0);
+	tail = (const struct ext4fs_directory_tail *)
+	    ((const char *)buf + fs->m_block_size - EXT4FS_DIR_TAIL_SIZE);
+	if (tail->det_reserved_zero1 != 0 ||
+	    letoh16(tail->det_rec_len) != EXT4FS_DIR_TAIL_SIZE ||
+	    tail->det_reserved_zero2 != 0 ||
+	    tail->det_reserved_ft != EXT4FS_DIR_TAIL_FT)
+		return (EINVAL);
+	provided = letoh32(tail->det_checksum);
+	ino_le = htole32(ino);
+	crc = crc32c(ext4fs_csum_seed(fs), (const uint8_t *)&ino_le,
+	    sizeof(ino_le));
+	crc = crc32c(crc, (const uint8_t *)&gen_le, sizeof(gen_le));
+	crc = crc32c(crc, buf, fs->m_block_size - EXT4FS_DIR_TAIL_SIZE);
+	if (provided != ~crc)
+		return (EINVAL);
+	return (0);
+}
+
+/*
  * Verify the superblock checksum.
  *
  * Returns 0 if the checksum is valid, or EINVAL if it doesn't match.
