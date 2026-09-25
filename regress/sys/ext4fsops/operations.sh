@@ -194,7 +194,8 @@ run_case()
 	dd if=/dev/zero of="$image" bs=1m count=0 \
 	    seek="$EXT4FS_IMAGE_MB" status=none
 	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
-	    -O '^orphan_file' "$image" >"$case_dir/mke2fs.log" 2>&1; then
+	    -O 'metadata_csum,^orphan_file' "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
 		cat "$case_dir/mke2fs.log" >&2
 		fail "mke2fs failed"
 	fi

@@ -76,6 +76,48 @@ static const u_int8_t ext4fs_type_to_dt[EXT4FS_FT_MAX] = {
 	[EXT4FS_FT_SYMLINK]	= DT_LNK,
 };
 
+static int ext4fs_direnter_handle (struct inode *, struct vnode *,
+    struct componentname *, struct ext4fs_journal_handle *, int *);
+
+static int
+ext4fs_dir_block_check (struct inode *ip, const void *data)
+{
+	struct m_ext4fs *fs = ip->i_e4fs;
+	const struct ext4fs_directory *ep;
+	size_t limit, offset;
+	u_int32_t ino;
+	u_int16_t reclen;
+	int error;
+
+	if (letoh32(ip->i_e4din->dinode.i_flags) &
+	    EXTFS_INODE_FLAG_INDEX)
+		return (EOPNOTSUPP);
+	error = ext4fs_dir_csum_verify(fs, ip->i_number,
+	    ip->i_e4din->dinode.i_nfs_generation, data);
+	if (error)
+		return (error);
+	limit = fs->m_block_size;
+	if (fs->m_feature_ro_compat & EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM)
+		limit -= EXT4FS_DIR_TAIL_SIZE;
+	for (offset = 0; offset < limit; offset += reclen) {
+		if (limit - offset < 8)
+			return (EIO);
+		ep = (const struct ext4fs_directory *)
+		    ((const char *)data + offset);
+		reclen = letoh16(ep->e4d_reclen);
+		if (reclen < 8 || (reclen & 3) != 0 || reclen > limit - offset ||
+		    EXT4FS_DIRSIZ(ep->e4d_namlen) > reclen)
+			return (EIO);
+		ino = letoh32(ep->e4d_ino);
+		if (ino > fs->m_inodes_count ||
+		    (ino != 0 && ep->e4d_type >= EXT4FS_FT_MAX))
+			return (EIO);
+	}
+	if (offset != limit)
+		return (EIO);
+	return (0);
+}
+
 /*
  * Validate an extent node header before using its entries.  bytes is the
  * complete storage available to the node: the inode i_block area for a root,
@@ -1696,6 +1738,36 @@ ext4fs_extent_insert (struct inode *ip, u_int32_t lbn, u_int64_t pblk,
 	return (ext4fs_extent_insert_handle(ip, NULL, lbn, pblk, len));
 }
 
+static int
+ext4fs_inode_blocks_add (struct inode *ip, u_int64_t blocks)
+{
+	struct m_ext4fs *fs = ip->i_e4fs;
+	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
+	u_int64_t increment, units;
+	u_int32_t inode_flags;
+
+	units = letoh32(din->i_blocks_lo) |
+	    ((u_int64_t)letoh16(din->i_blocks_hi) << 32);
+	inode_flags = letoh32(din->i_flags);
+	if (inode_flags & EXTFS_INODE_FLAG_HUGE_FILE) {
+		if (!(fs->m_feature_ro_compat &
+		    EXT4FS_FEATURE_RO_COMPAT_HUGE_FILE))
+			return (EIO);
+		increment = blocks;
+	} else {
+		if (blocks > UINT64_MAX / (fs->m_block_size / DEV_BSIZE))
+			return (EFBIG);
+		increment = blocks * (fs->m_block_size / DEV_BSIZE);
+	}
+	if (increment > 0xffffffffffffULL ||
+	    units > 0xffffffffffffULL - increment)
+		return (EFBIG);
+	units += increment;
+	din->i_blocks_lo = htole32((u_int32_t)units);
+	din->i_blocks_hi = htole16((u_int16_t)(units >> 32));
+	return (0);
+}
+
 /*
  * Allocate a buffer for a logical block.
  * If the block is already mapped, just read it.
@@ -1773,6 +1845,74 @@ ext4fs_buf_alloc (struct inode *ip, u_int64_t lbn, int size,
 			clrbuf(*bpp);
 	}
 
+	return (0);
+}
+
+/*
+ * Handle-aware directory-block allocation.  Existing directory blocks are
+ * enlisted as journal metadata.  A new block, its extent mapping, allocation
+ * accounting, and the directory inode remain owned by the caller's compound
+ * transaction.
+ */
+static int
+ext4fs_buf_alloc_handle (struct inode *ip,
+    struct ext4fs_journal_handle *handle, u_int64_t lbn, struct buf **bpp,
+    int flags, int *changedp)
+{
+	struct m_ext4fs *fs = ip->i_e4fs;
+	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
+	struct buf *bp;
+	u_int64_t goal, pblk;
+	u_int32_t got;
+	int error;
+
+	if (handle == NULL || bpp == NULL || changedp == NULL ||
+	    lbn > UINT32_MAX)
+		return (EINVAL);
+	*bpp = NULL;
+	error = ext4fs_extent_pblk(ip, lbn, &pblk, NULL);
+	if (error)
+		return (error);
+	if (pblk != 0)
+		return (ext4fs_journal_get_metadata(handle, ip->i_devvp,
+		    pblk, bpp));
+
+	goal = 0;
+	if (lbn > 0) {
+		error = ext4fs_extent_pblk(ip, lbn - 1, &pblk, NULL);
+		if (error)
+			return (error);
+		if (pblk != 0)
+			goal = pblk + 1;
+	}
+	error = ext4fs_blkalloc_handle(ip, handle, goal, 1, &pblk, &got);
+	if (error)
+		return (error);
+	*changedp = 1;
+	if (got != 1)
+		return (EIO);
+	error = ext4fs_extent_insert_handle(ip, handle, (u_int32_t)lbn,
+	    pblk, 1);
+	if (error)
+		return (error);
+	error = ext4fs_inode_blocks_add(ip, 1);
+	if (error)
+		return (error);
+	din->i_flags = htole32(letoh32(din->i_flags) |
+	    EXTFS_INODE_FLAG_EXTENTS);
+	ip->i_flag |= IN_CHANGE | IN_UPDATE;
+
+	bp = getblk(ip->i_devvp,
+	    (daddr_t)EXT4FS_FSBTODB(fs, pblk), fs->m_block_size, 0,
+	    INFSLP);
+	error = ext4fs_journal_get_write_access(handle, bp, pblk);
+	if (error) {
+		brelse(bp);
+		return (error);
+	}
+	if (flags & B_CLRBUF)
+		clrbuf(bp);
+	*bpp = bp;
 	return (0);
 }
 
@@ -4166,10 +4306,15 @@ ext4fs_link (void *v)
 	struct vnode *dvp = ap->a_dvp;
 	struct vnode *vp = ap->a_vp;
 	struct componentname *cnp = ap->a_cnp;
+	struct inode *dp = VTOI(dvp);
 	struct inode *ip = VTOI(vp);
+	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
+	struct ext4fs_dinode_256 saved_dir_inode, saved_inode;
+	struct ext4fs_journal_handle *handle;
 	u_int16_t nlink;
-	int error;
+	int changed, end_error, error, saved_dir_flags, saved_effnlink;
+	int saved_flags;
 
 	if (vp->v_type == VDIR) {
 		error = EPERM;
@@ -4188,6 +4333,63 @@ ext4fs_link (void *v)
 
 	if ((error = vn_lock(vp, LK_EXCLUSIVE)) != 0)
 		goto out2;
+	if (fs->m_journal != NULL) {
+		memcpy(&saved_inode, ip->i_e4din, sizeof(saved_inode));
+		memcpy(&saved_dir_inode, dp->i_e4din,
+		    sizeof(saved_dir_inode));
+		saved_flags = ip->i_flag;
+		saved_dir_flags = dp->i_flag;
+		saved_effnlink = ip->i_effnlink;
+		handle = NULL;
+		changed = 0;
+		error = ext4fs_journal_begin(vp->v_mount, 16, &handle);
+		if (error)
+			goto out1;
+
+		nlink++;
+		din->i_links_count = htole16(nlink);
+		ip->i_effnlink = nlink;
+		ip->i_flag |= IN_CHANGE;
+		error = ext4fs_direnter_handle(ip, dvp, cnp, handle,
+		    &changed);
+		if (error)
+			goto journal_fail;
+		error = ext4fs_update_handle(ip, handle);
+		if (error)
+			goto journal_fail;
+		changed = 1;
+		end_error = ext4fs_journal_end(handle);
+		handle = NULL;
+		if (end_error) {
+			error = end_error;
+			ext4fs_journal_abort(vp->v_mount, error);
+			goto journal_restore;
+		}
+		error = ext4fs_journal_force_commit(vp->v_mount);
+		if (error) {
+			ext4fs_journal_abort(vp->v_mount, error);
+			goto journal_restore;
+		}
+		ip->i_flag &= ~IN_MODIFIED;
+		dp->i_flag &= ~IN_MODIFIED;
+		goto out1;
+
+journal_fail:
+		if (changed)
+			ext4fs_journal_abort(vp->v_mount, error);
+		end_error = ext4fs_journal_end(handle);
+		handle = NULL;
+		if (error == 0)
+			error = end_error;
+journal_restore:
+		memcpy(ip->i_e4din, &saved_inode, sizeof(saved_inode));
+		memcpy(dp->i_e4din, &saved_dir_inode,
+		    sizeof(saved_dir_inode));
+		ip->i_flag = saved_flags;
+		dp->i_flag = saved_dir_flags;
+		ip->i_effnlink = saved_effnlink;
+		goto out1;
+	}
 
 	nlink++;
 	din->i_links_count = htole16(nlink);
@@ -4966,6 +5168,123 @@ ext4fs_readlink (void *v)
 /*
  * Enter a directory entry for inode ip into directory dvp.
  */
+static int
+ext4fs_direnter_handle (struct inode *ip, struct vnode *dvp,
+    struct componentname *cnp, struct ext4fs_journal_handle *handle,
+    int *changedp)
+{
+	struct inode *dp = VTOI(dvp);
+	struct m_ext4fs *fs = dp->i_e4fs;
+	struct ext4fs_dinode *ddin = &dp->i_e4din->dinode;
+	struct ext4fs_directory *ep, *nep;
+	struct buf *bp;
+	u_int64_t blkoff, lbn, pblk;
+	off_t filesz;
+	int entrysize, error, loc, oldentsz, tail;
+	u_int16_t mode, reclen;
+
+	if (handle == NULL || changedp == NULL || cnp->cn_namelen == 0 ||
+	    cnp->cn_namelen > EXT4FS_MAXNAMLEN ||
+	    ip->i_number == 0 || ip->i_number > fs->m_inodes_count)
+		return (EINVAL);
+	if (letoh32(ddin->i_flags) & EXTFS_INODE_FLAG_INDEX)
+		return (EOPNOTSUPP);
+	entrysize = EXT4FS_DIRSIZ(cnp->cn_namelen);
+	mode = letoh16(ip->i_e4din->dinode.i_mode);
+	filesz = (off_t)letoh32(ddin->i_size_lo) |
+	    ((off_t)letoh32(ddin->i_size_hi) << 32);
+	if (filesz < 0)
+		return (EIO);
+	bp = NULL;
+
+	if (dp->i_count == 0) {
+		lbn = EXT4FS_LBLKNO(fs, filesz);
+		blkoff = EXT4FS_BLKOFF(fs, filesz);
+		if (blkoff != 0)
+			return (EIO);
+		error = ext4fs_buf_alloc_handle(dp, handle, lbn, &bp,
+		    B_CLRBUF, changedp);
+		if (error)
+			return (error);
+		*changedp = 1;
+		ep = (struct ext4fs_directory *)bp->b_data;
+		tail = (fs->m_feature_ro_compat &
+		    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM) ?
+		    EXT4FS_DIR_TAIL_SIZE : 0;
+		ep->e4d_ino = htole32((u_int32_t)ip->i_number);
+		ep->e4d_reclen = htole16(fs->m_block_size - tail);
+		ep->e4d_namlen = cnp->cn_namelen;
+		ep->e4d_type = ext4fs_mode_to_ft(mode);
+		memcpy(ep->e4d_name, cnp->cn_nameptr, cnp->cn_namelen);
+		ext4fs_dir_set_csum(fs, dp->i_number,
+		    ddin->i_nfs_generation, bp->b_data);
+		error = ext4fs_dir_block_check(dp, bp->b_data);
+		if (error)
+			return (error);
+		error = ext4fs_journal_dirty_metadata(handle, bp);
+		if (error)
+			return (error);
+		ext4fs_setsize(dp, filesz + fs->m_block_size);
+	} else {
+		if (dp->i_offset < 0 || dp->i_offset >= filesz)
+			return (EIO);
+		lbn = EXT4FS_LBLKNO(fs, dp->i_offset);
+		error = ext4fs_extent_pblk(dp, lbn, &pblk, NULL);
+		if (error || pblk == 0)
+			return (error ? error : EIO);
+		error = ext4fs_journal_get_metadata(handle, dp->i_devvp,
+		    pblk, &bp);
+		if (error)
+			return (error);
+		error = ext4fs_dir_block_check(dp, bp->b_data);
+		if (error)
+			return (error);
+		loc = EXT4FS_BLKOFF(fs, dp->i_offset);
+		ep = (struct ext4fs_directory *)((char *)bp->b_data + loc);
+		reclen = letoh16(ep->e4d_reclen);
+		if (dp->i_count != reclen)
+			return (EIO);
+		if (letoh32(ep->e4d_ino) == 0) {
+			if (entrysize > reclen)
+				return (EIO);
+			*changedp = 1;
+			memset(ep, 0, reclen);
+			ep->e4d_ino = htole32((u_int32_t)ip->i_number);
+			ep->e4d_reclen = htole16(reclen);
+			ep->e4d_namlen = cnp->cn_namelen;
+			ep->e4d_type = ext4fs_mode_to_ft(mode);
+			memcpy(ep->e4d_name, cnp->cn_nameptr,
+			    cnp->cn_namelen);
+		} else {
+			oldentsz = EXT4FS_DIRSIZ(ep->e4d_namlen);
+			if (oldentsz > reclen || entrysize > reclen - oldentsz)
+				return (EIO);
+			*changedp = 1;
+			nep = (struct ext4fs_directory *)
+			    ((char *)ep + oldentsz);
+			memset(nep, 0, reclen - oldentsz);
+			nep->e4d_ino = htole32((u_int32_t)ip->i_number);
+			nep->e4d_reclen = htole16(reclen - oldentsz);
+			nep->e4d_namlen = cnp->cn_namelen;
+			nep->e4d_type = ext4fs_mode_to_ft(mode);
+			memcpy(nep->e4d_name, cnp->cn_nameptr,
+			    cnp->cn_namelen);
+			ep->e4d_reclen = htole16(oldentsz);
+		}
+		ext4fs_dir_set_csum(fs, dp->i_number,
+		    ddin->i_nfs_generation, bp->b_data);
+		error = ext4fs_dir_block_check(dp, bp->b_data);
+		if (error)
+			return (error);
+		error = ext4fs_journal_dirty_metadata(handle, bp);
+		if (error)
+			return (error);
+	}
+
+	dp->i_flag |= IN_CHANGE | IN_UPDATE;
+	return (ext4fs_update_handle(dp, handle));
+}
+
 int
 ext4fs_direnter (struct inode *ip, struct vnode *dvp,
     struct componentname *cnp)

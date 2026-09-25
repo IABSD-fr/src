@@ -47,6 +47,8 @@ int ext4fs_inode_csum_verify (struct m_ext4fs *,
  */
 void ext4fs_dir_set_csum (struct m_ext4fs *fs, u_int32_t ino,
     u_int32_t gen_le, void *buf);
+int ext4fs_dir_csum_verify (struct m_ext4fs *, u_int32_t, u_int32_t,
+    const void *);
 
 /*
  * Write the extent tree block checksum tail.
