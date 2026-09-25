@@ -60,6 +60,7 @@ static void	check_data_file (const char *, int);
 static void	check_sparse_file (const char *, int);
 static void	check_large_sparse (const char *, int);
 static void	check_extent_file (const char *);
+static void	check_empty_file (const char *);
 static void	check_grow_directory (const char *, int);
 static void	fsync_path (const char *);
 static void	expect_ro_failure (const char *, int);
@@ -68,6 +69,9 @@ static void	verify_created_tree (void);
 static void	mutate_filesystem_tree (void);
 static void	verify_final_tree (void);
 static void	verify_readonly_tree (void);
+static void	create_allocation_probe (void);
+static void	verify_allocation_probe (void);
+static void	create_extent_file (const char *);
 
 static void
 make_path (char *path, size_t pathlen, const char *suffix)
@@ -129,7 +133,8 @@ write_pattern_fd (int fd, off_t offset, size_t len, unsigned int seed)
 		fill_pattern(buf, chunk, offset + (off_t)done, seed);
 		n = pwrite(fd, buf, chunk, offset + (off_t)done);
 		if (n == -1)
-			err(1, "pwrite");
+			err(1, "pwrite at offset %lld",
+			    (long long)(offset + (off_t)done));
 		if ((size_t)n != chunk)
 			errx(1, "short pwrite: %zd of %zu", n, chunk);
 	}
@@ -382,6 +387,34 @@ check_extent_file (const char *path)
 }
 
 static void
+check_empty_file (const char *path)
+{
+	struct stat st;
+
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (!S_ISREG(st.st_mode) || st.st_size != 0 || st.st_blocks != 0)
+		errx(1, "%s retained data or allocated blocks", path);
+}
+
+static void
+create_extent_file (const char *path)
+{
+	int fd, i;
+
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	for (i = 0; i < EXTENT_WRITES; i++)
+		write_pattern_fd(fd, (off_t)i * 2 * (off_t)block_size,
+		    block_size, EXTENT_SEED + i);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
 check_grow_directory (const char *path, int mutated)
 {
 	struct dirent *de;
@@ -515,16 +548,9 @@ create_filesystem_tree (void)
 		err(1, "close %s", path);
 
 	make_path(path, sizeof(path), "extents");
-	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
-	if (fd == -1)
-		err(1, "open %s", path);
-	for (i = 0; i < EXTENT_WRITES; i++)
-		write_pattern_fd(fd, (off_t)i * 2 * (off_t)block_size,
-		    block_size, EXTENT_SEED + i);
-	if (fsync(fd) == -1)
-		err(1, "fsync %s", path);
-	if (close(fd) == -1)
-		err(1, "close %s", path);
+	create_extent_file(path);
+	make_path(path, sizeof(path), "free-extents");
+	create_extent_file(path);
 
 	make_path(path, sizeof(path), "empty");
 	write_text_file(path, "");
@@ -600,6 +626,8 @@ verify_created_tree (void)
 	make_path(path, sizeof(path), "large-sparse");
 	check_large_sparse(path, 0);
 	make_path(path, sizeof(path), "extents");
+	check_extent_file(path);
+	make_path(path, sizeof(path), "free-extents");
 	check_extent_file(path);
 	make_path(path, sizeof(path), "empty");
 	check_regular(path);
@@ -729,6 +757,18 @@ mutate_filesystem_tree (void)
 	if (close(fd) == -1)
 		err(1, "close %s", path);
 
+	/* Free all data extents and the external depth-1 extent block. */
+	make_path(path, sizeof(path), "free-extents");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (ftruncate(fd, 0) == -1)
+		err(1, "truncate %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+
 	if (statfs(root, &before) == -1)
 		err(1, "statfs before directory reuse");
 	for (i = 0; i < GROW_FILES; i += 2) {
@@ -804,6 +844,8 @@ verify_final_tree (void)
 	check_large_sparse(path, 1);
 	make_path(path, sizeof(path), "extents");
 	check_extent_file(path);
+	make_path(path, sizeof(path), "free-extents");
+	check_empty_file(path);
 	make_path(path, sizeof(path), "growdir");
 	check_grow_directory(path, 1);
 
@@ -860,6 +902,43 @@ verify_readonly_tree (void)
 	check_text_file(path, "replacement-data");
 }
 
+static void
+create_allocation_probe (void)
+{
+	char path[PATH_MAX];
+	int fd;
+
+	make_path(path, sizeof(path), "allocation-probe");
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	write_pattern_fd(fd, 0, block_size + 31, 0xa7U);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+verify_allocation_probe (void)
+{
+	char path[PATH_MAX];
+	struct stat st;
+	int fd;
+
+	make_path(path, sizeof(path), "allocation-probe");
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (!S_ISREG(st.st_mode) || st.st_size != (off_t)block_size + 31)
+		errx(1, "allocation probe has wrong type or size");
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	check_pattern_fd(fd, 0, block_size + 31, 0xa7U);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -893,6 +972,10 @@ main (int argc, char **argv)
 			verify_final_tree();
 		else if (strcmp(argv[1], "verify-readonly") == 0)
 			verify_readonly_tree();
+		else if (strcmp(argv[1], "create-allocation-probe") == 0)
+			create_allocation_probe();
+		else if (strcmp(argv[1], "verify-allocation-probe") == 0)
+			verify_allocation_probe();
 		else
 			errx(1, "unknown mode: %s", argv[1]);
 	}
