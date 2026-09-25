@@ -48,6 +48,7 @@ struct nameidata;
 struct statfs;
 struct vfsconf;
 struct ext4fs_journal;
+struct ext4fs_journal_handle;
 
 #define EXT4FS_EXTENT_DEPTH_MAX		5
 #define EXT4FS_FUNCTION_MAX		32
@@ -216,6 +217,10 @@ struct ext4fs_journal;
 #define EXT4FS_BGD_FLAG_DIRTY		0x0008
 #define EXT4FS_BGD_FLAG_BLOCK_ZEROED	0x0010
 #define EXT4FS_BGD_FLAG_READ_ONLY	0x0020
+
+#define EXT4FS_BGD_BLOCK_BITMAP	0
+#define EXT4FS_BGD_INODE_BITMAP	1
+#define EXT4FS_BGD_INODE_TABLE	2
 
 struct ext4fs {
 	u_int32_t	sb_inodes_count;
@@ -612,6 +617,7 @@ int ext4fs_pathconf (void *);
 int ext4fs_advlock (void *);
 
 int ext4fs_update (struct inode *, int);
+int ext4fs_update_handle (struct inode *, struct ext4fs_journal_handle *);
 
 /* Directory entry size: 8 bytes header + name, rounded up to 4 */
 #define EXT4FS_DIRSIZ(namlen)	(((8 + (namlen)) + 3) & ~3)
@@ -635,6 +641,8 @@ ext4fs_mode_to_ft (u_int16_t mode)
 /* Block allocation / free */
 int ext4fs_blkalloc (struct inode *, u_int64_t, u_int32_t, u_int64_t *,
     u_int32_t *);
+int ext4fs_blkalloc_handle (struct inode *, struct ext4fs_journal_handle *,
+    u_int64_t, u_int32_t, u_int64_t *, u_int32_t *);
 void ext4fs_blkfree (struct inode *, u_int64_t);
 
 /* Inode allocation / free */
@@ -659,10 +667,15 @@ void	ext4fs_setsize (struct inode *, u_int64_t);
 /* Superblock */
 int	ext4fs_sbcheck (struct ext4fs *, int);
 int	ext4fs_block_group_has_super_block (int);
+u_int64_t ext4fs_bgd_get_block (struct m_ext4fs *,
+    struct ext4fs_block_group_descriptor *, unsigned int);
 int	ext4fs_mountfs (struct vnode *, struct mount *, struct proc *);
 void	ext4fs_sbload (struct ext4fs *, struct m_ext4fs *);
 int	ext4fs_sbfill (struct vnode *, struct m_ext4fs *);
 
 /* Writes */
 int	ext4fs_bgd_write (struct m_ext4fs *, struct vnode *, u_int32_t);
+int	ext4fs_bgd_write_handle (struct m_ext4fs *, struct vnode *, u_int32_t,
+	    struct ext4fs_journal_handle *);
 int	ext4fs_sbwrite (struct mount *);
+int	ext4fs_sbwrite_handle (struct mount *, struct ext4fs_journal_handle *);

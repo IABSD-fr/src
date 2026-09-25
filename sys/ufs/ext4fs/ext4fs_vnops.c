@@ -284,146 +284,157 @@ out:
 	return (error);
 }
 
-/*
- * Write inode back to disk with checksum update.
- */
+static int
+ext4fs_inode_write_check (struct inode *ip)
+{
+	u_int16_t mode, magic;
+	u_int32_t flags;
+
+	mode = letoh16(ip->i_e4din->dinode.i_mode);
+	flags = letoh32(ip->i_e4din->dinode.i_flags);
+	magic = letoh16(ip->i_e4din->dinode.i_extent_header.eh_magic);
+	if (mode != 0 && (flags & EXTFS_INODE_FLAG_EXTENTS) &&
+	    magic != EXT4FS_EXTENT_HEADER_MAGIC) {
+		printf("ext4fs_update: REFUSING to write ino=%u "
+		    "with corrupt extent header! "
+		    "magic=0x%x mode=0%o flags=0x%x\n",
+		    ip->i_number, magic, mode, flags);
+		return (EIO);
+	}
+	return (0);
+}
+
 int
-ext4fs_update (struct inode *ip, int waitfor)
+ext4fs_update_handle (struct inode *ip,
+    struct ext4fs_journal_handle *handle)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
-	struct ext4fs_journal_handle *handle;
-	struct buf *bp;
-	u_int32_t inode_group, inode_index, block_in_table, offset_in_block;
 	struct ext4fs_block_group_descriptor *gd;
+	struct buf *bp;
 	u_int64_t fsblock, inode_table_block;
-	daddr_t disk_block;
-	u_int32_t csum;
+	u_int32_t block_in_table, csum, inode_group, inode_index;
+	u_int32_t offset_in_block;
 	u_int8_t saved_inode[sizeof(struct ext4fs_dinode_256)];
-	int access_owned, end_error, error, journaled, transaction_owned;
+	int error;
 
-	if (ITOV(ip)->v_mount->mnt_flag & MNT_RDONLY)
-		return (0);
-
+	if (handle == NULL)
+		return (EINVAL);
 	EXT4FS_ITIMES(ip);
-
-	if ((ip->i_flag & IN_MODIFIED) == 0) {
+	if ((ip->i_flag & IN_MODIFIED) == 0)
 		return (0);
-	}
 
-	bp = NULL;
-	handle = NULL;
-	access_owned = 0;
-	transaction_owned = 0;
-	journaled = fs->m_journal != NULL;
-	error = 0;
-	if (journaled) {
-		error = ext4fs_journal_begin(ITOV(ip)->v_mount, 1, &handle);
-		if (error)
-			goto out;
-	}
-
-	/* Locate inode on disk */
 	inode_group = (ip->i_number - 1) / fs->m_inodes_per_group;
 	inode_index = (ip->i_number - 1) % fs->m_inodes_per_group;
 	block_in_table = inode_index / fs->m_inodes_per_block;
 	offset_in_block = (inode_index % fs->m_inodes_per_block) *
 	    fs->m_inode_size;
-
 	gd = &fs->m_gd[inode_group];
 	inode_table_block = letoh32(gd->bgd_inode_table_block_lo);
 	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
 		inode_table_block |=
 		    (u_int64_t)letoh32(gd->bgd_inode_table_block_hi) << 32;
-
 	fsblock = inode_table_block + block_in_table;
-	disk_block = fsblock <<
-	    fs->m_fs_block_to_disk_block;
 
-	error = bread(ip->i_devvp, disk_block, fs->m_block_size, &bp);
+	error = ext4fs_journal_get_metadata(handle, ip->i_devvp, fsblock,
+	    &bp);
 	if (error)
-		goto out;
+		return (error);
+	error = ext4fs_inode_write_check(ip);
+	if (error)
+		return (error);
 
-	if (journaled) {
-		error = ext4fs_journal_get_write_access(handle, bp, fsblock);
-		if (error)
-			goto out;
-		access_owned = 1;
-	}
-
-	/*
-	 * Verify extent header integrity before writing.
-	 * If the inode uses extents (not a fast symlink), the magic
-	 * must be valid. Refuse to persist corruption.
-	 */
-	{
-		u_int16_t wr_mode = letoh16(ip->i_e4din->dinode.i_mode);
-		u_int32_t wr_flags = letoh32(ip->i_e4din->dinode.i_flags);
-		u_int16_t wr_magic =
-		    letoh16(ip->i_e4din->dinode.i_extent_header.eh_magic);
-		if (wr_mode != 0 &&
-		    (wr_flags & EXTFS_INODE_FLAG_EXTENTS) &&
-		    wr_magic != EXT4FS_EXTENT_HEADER_MAGIC) {
-			printf("ext4fs_update: REFUSING to write ino=%u "
-			    "with corrupt extent header! "
-			    "magic=0x%x mode=0%o flags=0x%x\n",
-			    ip->i_number, wr_magic, wr_mode, wr_flags);
-			error = EIO;
-			goto out;
-		}
-	}
-
-	/* Recompute inode checksum */
 	csum = ext4fs_inode_csum(fs, ip->i_e4din, ip->i_number);
 	ip->i_e4din->dinode.i_checksum_lo = htole16(csum & 0xFFFF);
 	if (ext4fs_inode_has_csum_hi(ip->i_e4din))
 		ip->i_e4din->dinode.i_checksum_hi =
 		    htole16((csum >> 16) & 0xFFFF);
 
-	/* Copy inode to buffer */
-	if (journaled)
-		memcpy(saved_inode, (char *)bp->b_data + offset_in_block,
-		    fs->m_inode_size);
+	memcpy(saved_inode, (char *)bp->b_data + offset_in_block,
+	    fs->m_inode_size);
 	memcpy((char *)bp->b_data + offset_in_block, ip->i_e4din,
 	    fs->m_inode_size);
+	error = ext4fs_journal_dirty_metadata(handle, bp);
+	if (error)
+		memcpy((char *)bp->b_data + offset_in_block, saved_inode,
+		    fs->m_inode_size);
+	return (error);
+}
 
-	if (journaled) {
-		error = ext4fs_journal_dirty_metadata(handle, bp);
-		if (error) {
-			memcpy((char *)bp->b_data + offset_in_block, saved_inode,
-			    fs->m_inode_size);
-			goto out;
-		}
-		access_owned = 0;
-		transaction_owned = 1;
-		bp = NULL;
-	} else if (waitfor) {
-		error = bwrite(bp);
-		bp = NULL;
-	} else {
-		bdwrite(bp);
-		bp = NULL;
-	}
+/*
+ * Write an inode back to disk.  A journaled standalone update commits
+ * synchronously until callers pass a shared handle through compound metadata
+ * operations.  Journal-less ext4 retains the legacy direct-write path.
+ */
+int
+ext4fs_update (struct inode *ip, int waitfor)
+{
+	struct m_ext4fs *fs = ip->i_e4fs;
+	struct ext4fs_journal_handle *handle;
+	struct ext4fs_block_group_descriptor *gd;
+	struct buf *bp;
+	u_int64_t fsblock, inode_table_block;
+	u_int32_t block_in_table, csum, inode_group, inode_index;
+	u_int32_t offset_in_block;
+	daddr_t disk_block;
+	int end_error, error;
 
-out:
-	if (bp != NULL && !access_owned) {
-		brelse(bp);
-		bp = NULL;
-	}
-	if (handle != NULL) {
+	if (ITOV(ip)->v_mount->mnt_flag & MNT_RDONLY)
+		return (0);
+	if (fs->m_journal != NULL) {
+		handle = NULL;
+		error = ext4fs_journal_begin(ITOV(ip)->v_mount, 1, &handle);
+		if (error)
+			return (error);
+		error = ext4fs_update_handle(ip, handle);
 		end_error = ext4fs_journal_end(handle);
-		if (access_owned)
-			bp = NULL;
 		if (error == 0)
 			error = end_error;
+		if (error == 0)
+			error = ext4fs_journal_force_commit(ITOV(ip)->v_mount);
+		if (error == 0)
+			ip->i_flag &= ~IN_MODIFIED;
+		return (error);
 	}
-	if (error == 0 && transaction_owned) {
-		/*
-		 * Until compound operations pass one handle through all metadata
-		 * writers, commit each standalone inode update.  Besides preserving
-		 * synchronous error reporting, this releases the transaction-owned
-		 * busy inode-table buffer before another update can request it.
-		 */
-		error = ext4fs_journal_force_commit(ITOV(ip)->v_mount);
+
+	EXT4FS_ITIMES(ip);
+	if ((ip->i_flag & IN_MODIFIED) == 0)
+		return (0);
+	error = ext4fs_inode_write_check(ip);
+	if (error)
+		return (error);
+
+	inode_group = (ip->i_number - 1) / fs->m_inodes_per_group;
+	inode_index = (ip->i_number - 1) % fs->m_inodes_per_group;
+	block_in_table = inode_index / fs->m_inodes_per_block;
+	offset_in_block = (inode_index % fs->m_inodes_per_block) *
+	    fs->m_inode_size;
+	gd = &fs->m_gd[inode_group];
+	inode_table_block = letoh32(gd->bgd_inode_table_block_lo);
+	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+		inode_table_block |=
+		    (u_int64_t)letoh32(gd->bgd_inode_table_block_hi) << 32;
+	fsblock = inode_table_block + block_in_table;
+	disk_block = fsblock << fs->m_fs_block_to_disk_block;
+
+	bp = NULL;
+	error = bread(ip->i_devvp, disk_block, fs->m_block_size, &bp);
+	if (error) {
+		if (bp != NULL)
+			brelse(bp);
+		return (error);
+	}
+	csum = ext4fs_inode_csum(fs, ip->i_e4din, ip->i_number);
+	ip->i_e4din->dinode.i_checksum_lo = htole16(csum & 0xFFFF);
+	if (ext4fs_inode_has_csum_hi(ip->i_e4din))
+		ip->i_e4din->dinode.i_checksum_hi =
+		    htole16((csum >> 16) & 0xFFFF);
+	memcpy((char *)bp->b_data + offset_in_block, ip->i_e4din,
+	    fs->m_inode_size);
+	if (waitfor)
+		error = bwrite(bp);
+	else {
+		bdwrite(bp);
+		error = 0;
 	}
 	if (error == 0)
 		ip->i_flag &= ~IN_MODIFIED;
@@ -442,24 +453,170 @@ ext4fs_setsize (struct inode *ip, u_int64_t size)
 	din->i_size_hi = htole32((u_int32_t)(size >> 32));
 }
 
+static u_int32_t
+ext4fs_group_block_count (struct m_ext4fs *fs, u_int32_t group)
+{
+	u_int64_t start, blocks;
+
+	if (group >= fs->m_block_group_count)
+		return (0);
+	start = fs->m_first_data_block +
+	    (u_int64_t)group * fs->m_blocks_per_group;
+	if (start >= fs->m_blocks_count)
+		return (0);
+	blocks = fs->m_blocks_count - start;
+	if (blocks > fs->m_blocks_per_group)
+		blocks = fs->m_blocks_per_group;
+	return ((u_int32_t)blocks);
+}
+
+static void
+ext4fs_block_bitmap_mark (struct m_ext4fs *fs, u_int32_t group,
+    u_int8_t *bitmap, u_int64_t block)
+{
+	u_int64_t start;
+	u_int32_t blocks;
+
+	blocks = ext4fs_group_block_count(fs, group);
+	start = fs->m_first_data_block +
+	    (u_int64_t)group * fs->m_blocks_per_group;
+	if (block >= start && block - start < blocks)
+		setbit(bitmap, (u_int32_t)(block - start));
+}
+
+/*
+ * Construct the initialized form of a block bitmap.  FLEX_BG permits the
+ * bitmaps and inode tables described by one group to reside in another, so
+ * reserve metadata by physical location rather than descriptor ownership.
+ */
+static int
+ext4fs_block_bitmap_init (struct inode *ip, u_int32_t group,
+    u_int8_t *bitmap)
+{
+	struct m_ext4fs *fs = ip->i_e4fs;
+	struct ext4fs_block_group_descriptor *gd;
+	struct buf *bp = NULL;
+	u_int64_t bb, block, ib, overhead, table;
+	u_int32_t bitmap_bits, blocks, i, j, table_blocks;
+	u_int32_t *indirect;
+	int error, has_super;
+
+	if (fs->m_block_group_count > UINT32_MAX ||
+	    fs->m_blocks_per_group > fs->m_block_size * NBBY)
+		return (EFBIG);
+	blocks = ext4fs_group_block_count(fs, group);
+	if (blocks == 0)
+		return (EINVAL);
+	bitmap_bits = fs->m_block_size * NBBY;
+	memset(bitmap, 0, fs->m_block_size);
+
+	has_super = !(fs->m_feature_ro_compat &
+	    EXT4FS_FEATURE_RO_COMPAT_SPARSE_SUPER) ||
+	    ext4fs_block_group_has_super_block(group);
+	if (has_super) {
+		overhead = 1 + fs->m_block_group_descriptor_blocks_count +
+		    fs->m_reserved_bgdt_blocks;
+		if (overhead > blocks)
+			overhead = blocks;
+		for (i = 0; i < overhead; i++)
+			setbit(bitmap, i);
+	}
+
+	table_blocks = fs->m_inode_table_blocks_per_group;
+	for (i = 0; i < fs->m_block_group_count; i++) {
+		gd = &fs->m_gd[i];
+		bb = ext4fs_bgd_get_block(fs, gd, EXT4FS_BGD_BLOCK_BITMAP);
+		ib = ext4fs_bgd_get_block(fs, gd, EXT4FS_BGD_INODE_BITMAP);
+		table = ext4fs_bgd_get_block(fs, gd, EXT4FS_BGD_INODE_TABLE);
+		if (bb < fs->m_first_data_block || bb >= fs->m_blocks_count ||
+		    ib < fs->m_first_data_block || ib >= fs->m_blocks_count ||
+		    table < fs->m_first_data_block ||
+		    table >= fs->m_blocks_count ||
+		    table_blocks > fs->m_blocks_count - table)
+			return (EIO);
+		ext4fs_block_bitmap_mark(fs, group, bitmap, bb);
+		ext4fs_block_bitmap_mark(fs, group, bitmap, ib);
+		for (j = 0; j < table_blocks; j++)
+			ext4fs_block_bitmap_mark(fs, group, bitmap, table + j);
+	}
+
+	for (i = blocks; i < bitmap_bits; i++)
+		setbit(bitmap, i);
+
+	if ((fs->m_feature_compat & EXT4FS_FEATURE_COMPAT_RESIZE_INODE) &&
+	    fs->m_resize_dind_block != 0) {
+		block = fs->m_resize_dind_block;
+		if (block < fs->m_first_data_block ||
+		    block >= fs->m_blocks_count)
+			return (EIO);
+		ext4fs_block_bitmap_mark(fs, group, bitmap, block);
+		error = bread(ip->i_devvp,
+		    (daddr_t)EXT4FS_FSBTODB(fs, block), fs->m_block_size, &bp);
+		if (error) {
+			if (bp != NULL)
+				brelse(bp);
+			return (error);
+		}
+		indirect = (u_int32_t *)bp->b_data;
+		for (i = 0; i < fs->m_block_size / sizeof(*indirect); i++) {
+			block = letoh32(indirect[i]);
+			if (block == 0)
+				continue;
+			if (block < fs->m_first_data_block ||
+			    block >= fs->m_blocks_count) {
+				brelse(bp);
+				return (EIO);
+			}
+			ext4fs_block_bitmap_mark(fs, group, bitmap, block);
+		}
+		brelse(bp);
+	}
+	return (0);
+}
+
+static int
+ext4fs_block_bitmap_csum_verify (struct m_ext4fs *fs, u_int32_t group,
+    struct ext4fs_block_group_descriptor *gd, const void *bitmap)
+{
+	u_int32_t calculated, provided;
+
+	if (!(fs->m_feature_ro_compat &
+	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
+		return (0);
+	provided = letoh16(gd->bgd_block_bitmap_checksum_lo);
+	calculated = ext4fs_bitmap_csum(fs, group, __UNCONST(bitmap),
+	    fs->m_block_size);
+	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+		provided |= (u_int32_t)
+		    letoh16(gd->bgd_block_bitmap_checksum_hi) << 16;
+	else
+		calculated &= 0xffff;
+	if (provided != calculated) {
+		printf("ext4fs: block bitmap %u checksum mismatch: "
+		    "stored=0x%08x calculated=0x%08x\n", group, provided,
+		    calculated);
+		return (EINVAL);
+	}
+	return (0);
+}
+
 /*
  * Allocate a filesystem block.
  * Tries the group of the goal block first, then scans all groups.
  */
-int
-ext4fs_blkalloc (struct inode *ip, u_int64_t goal, u_int32_t count,
+static int
+ext4fs_blkalloc_direct (struct inode *ip, u_int64_t goal, u_int32_t count,
     u_int64_t *bnp, u_int32_t *countp)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_block_group_descriptor *gd;
-	struct buf *bp, *dbp;
-	u_int64_t bitmap_blk, grp_start, bb, ib, itb;
+	struct buf *bp;
+	u_int64_t bitmap_blk;
 	u_int32_t group, ngroups, g, blk_in_group, free_blocks;
-	u_int32_t it_blocks, mb, pbit, rb, bcsum;
+	u_int32_t bcsum;
 	u_int32_t start_bit, nalloced, k;
-	u_int32_t *dind;
 	char *bbp;
-	int error, i, j, has_sb;
+	int error, i, uninit;
 
 	*bnp = 0;
 	*countp = 0;
@@ -505,104 +662,21 @@ ext4fs_blkalloc (struct inode *ip, u_int64_t goal, u_int32_t count,
 		}
 		bbp = (char *)bp->b_data;
 
-		/*
-		 * If BLOCK_UNINIT is set, the on-disk bitmap block
-		 * may contain garbage. Zero it and mark metadata
-		 * blocks (bitmaps, inode table) as used.
-		 */
-		if (letoh16(gd->bgd_flags) &
-		    EXT4FS_BGD_FLAG_BLOCK_UNINIT) {
-			grp_start = (u_int64_t)g *
-			    fs->m_blocks_per_group +
-			    fs->m_first_data_block;
-			memset(bbp, 0, fs->m_block_size);
-			/*
-			 * Mark superblock, GDT, and reserved
-			 * GDT blocks for groups that have them.
-			 */
-			has_sb = 0;
-			if (!(fs->m_feature_ro_compat &
-			    EXT4FS_FEATURE_RO_COMPAT_SPARSE_SUPER))
-				has_sb = 1;
-			else if (g == 0 || g == 1)
-				has_sb = 1;
-			else {
-				u_int64_t n;
-				for (n = 3; n <= g; n *= 3)
-					if (n == g) has_sb = 1;
-				for (n = 5; n <= g; n *= 5)
-					if (n == g) has_sb = 1;
-				for (n = 7; n <= g; n *= 7)
-					if (n == g) has_sb = 1;
+		uninit = letoh16(gd->bgd_flags) &
+		    EXT4FS_BGD_FLAG_BLOCK_UNINIT;
+		if (uninit) {
+			error = ext4fs_block_bitmap_init(ip, g,
+			    (u_int8_t *)bbp);
+			if (error) {
+				brelse(bp);
+				return (error);
 			}
-			if (has_sb) {
-				u_int32_t overhead = 1 +
-				    fs->m_block_group_descriptor_blocks_count +
-				    fs->m_reserved_bgdt_blocks;
-				for (mb = 0; mb < overhead; mb++)
-					setbit(bbp, mb);
+		} else {
+			error = ext4fs_block_bitmap_csum_verify(fs, g, gd, bbp);
+			if (error) {
+				brelse(bp);
+				return (error);
 			}
-			/* Block bitmap */
-			bb = letoh32(gd->bgd_block_bitmap_block_lo);
-			if (bb >= grp_start &&
-			    bb < grp_start + fs->m_blocks_per_group)
-				setbit(bbp, bb - grp_start);
-			/* Inode bitmap */
-			ib = letoh32(gd->bgd_inode_bitmap_block_lo);
-			if (ib >= grp_start &&
-			    ib < grp_start + fs->m_blocks_per_group)
-				setbit(bbp, ib - grp_start);
-			/* Inode table */
-			itb = letoh32(gd->bgd_inode_table_block_lo);
-			it_blocks = (fs->m_inodes_per_group *
-			    fs->m_inode_size + fs->m_block_size - 1) /
-			    fs->m_block_size;
-			for (mb = 0; mb < it_blocks; mb++) {
-				u_int64_t b = itb + mb;
-				if (b >= grp_start &&
-				    b < grp_start +
-				    fs->m_blocks_per_group)
-					setbit(bbp, b - grp_start);
-			}
-			for (pbit = fs->m_blocks_per_group;
-			    pbit < fs->m_block_size * 8; pbit++)
-				setbit(bbp, pbit);
-			/* Mark resize inode (inode 7) blocks */
-			if (fs->m_resize_dind_block != 0) {
-				if (fs->m_resize_dind_block >= grp_start &&
-				    fs->m_resize_dind_block <
-				    grp_start + fs->m_blocks_per_group)
-					setbit(bbp,
-					    fs->m_resize_dind_block -
-					    grp_start);
-
-				error = bread(ip->i_devvp,
-				    (daddr_t)EXT4FS_FSBTODB(fs,
-				    fs->m_resize_dind_block),
-				    fs->m_block_size, &dbp);
-				if (!error) {
-					dind = (u_int32_t *)dbp->b_data;
-					for (j = 0;
-					    j < fs->m_block_size / 4;
-					    j++) {
-						rb = letoh32(dind[j]);
-						if (rb == 0)
-							continue;
-						if (rb >= grp_start &&
-						    rb < grp_start +
-						    fs->m_blocks_per_group)
-							setbit(bbp,
-							    rb - grp_start);
-					}
-					brelse(dbp);
-				} else {
-					brelse(dbp);
-				}
-			}
-			gd->bgd_flags = htole16(letoh16(
-			    gd->bgd_flags) &
-			    ~EXT4FS_BGD_FLAG_BLOCK_UNINIT);
-			ext4fs_bgd_write(fs, ip->i_devvp, g);
 		}
 
 		/* Start scan from goal bit if goal is in this group */
@@ -631,6 +705,10 @@ ext4fs_blkalloc (struct inode *ip, u_int64_t goal, u_int32_t count,
 					nalloced++;
 				}
 
+				if (uninit)
+					gd->bgd_flags = htole16(letoh16(
+					    gd->bgd_flags) &
+					    ~EXT4FS_BGD_FLAG_BLOCK_UNINIT);
 				bcsum = ext4fs_bitmap_csum(fs, g, bbp,
 				    fs->m_block_size);
 				gd->bgd_block_bitmap_checksum_lo =
@@ -677,6 +755,211 @@ ext4fs_blkalloc (struct inode *ip, u_int64_t goal, u_int32_t count,
 	}
 
 	return (ENOSPC);
+}
+
+int
+ext4fs_blkalloc_handle (struct inode *ip,
+    struct ext4fs_journal_handle *handle, u_int64_t goal, u_int32_t count,
+    u_int64_t *bnp, u_int32_t *countp)
+{
+	struct m_ext4fs *fs = ip->i_e4fs;
+	struct ext4fs_block_group_descriptor saved_gd, *gd;
+	struct ext4fs saved_sb;
+	struct buf *bp;
+	u_int8_t *bitmap, *saved_bitmap, *scan;
+	u_int64_t bitmap_block, saved_free_blocks;
+	u_int32_t bitmap_csum, blk, blocks, free_blocks;
+	u_int32_t g, goal_group, group, i, k, nalloced, ngroups;
+	u_int32_t start;
+	int error, saved_modified, transaction_dirty, uninit;
+
+	if (handle == NULL || bnp == NULL || countp == NULL)
+		return (EINVAL);
+	*bnp = 0;
+	*countp = 0;
+	if (count == 0)
+		count = 1;
+	if (fs->m_free_blocks_count == 0)
+		return (ENOSPC);
+	if (fs->m_block_group_count == 0 ||
+	    fs->m_block_group_count > UINT32_MAX ||
+	    fs->m_blocks_per_group == 0 ||
+	    fs->m_blocks_per_group > fs->m_block_size * NBBY)
+		return (EFBIG);
+
+	ngroups = (u_int32_t)fs->m_block_group_count;
+	if (goal >= fs->m_first_data_block && goal < fs->m_blocks_count)
+		group = (u_int32_t)((goal - fs->m_first_data_block) /
+		    fs->m_blocks_per_group);
+	else
+		group = (ip->i_number - 1) / fs->m_inodes_per_group;
+	if (group >= ngroups)
+		return (EINVAL);
+
+	bitmap = malloc(fs->m_block_size, M_UFSMNT, M_WAITOK);
+	saved_bitmap = malloc(fs->m_block_size, M_UFSMNT, M_WAITOK);
+	bp = NULL;
+	transaction_dirty = 0;
+	error = ENOSPC;
+	for (i = 0; i < ngroups; i++) {
+		g = (group + i) % ngroups;
+		gd = &fs->m_gd[g];
+		free_blocks = letoh16(gd->bgd_free_blocks_count_lo);
+		if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+			free_blocks |= (u_int32_t)
+			    letoh16(gd->bgd_free_blocks_count_hi) << 16;
+		if (free_blocks == 0)
+			continue;
+		blocks = ext4fs_group_block_count(fs, g);
+		if (blocks == 0 || free_blocks > blocks) {
+			error = EIO;
+			goto out;
+		}
+
+		bitmap_block = ext4fs_bgd_get_block(fs, gd,
+		    EXT4FS_BGD_BLOCK_BITMAP);
+		if (bitmap_block < fs->m_first_data_block ||
+		    bitmap_block >= fs->m_blocks_count) {
+			error = EIO;
+			goto out;
+		}
+		error = ext4fs_journal_get_metadata(handle, ip->i_devvp,
+		    bitmap_block, &bp);
+		if (error)
+			goto out;
+
+		uninit = letoh16(gd->bgd_flags) &
+		    EXT4FS_BGD_FLAG_BLOCK_UNINIT;
+		if (uninit) {
+			error = ext4fs_block_bitmap_init(ip, g, bitmap);
+			if (error)
+				goto out;
+			scan = bitmap;
+		} else {
+			error = ext4fs_block_bitmap_csum_verify(fs, g, gd,
+			    bp->b_data);
+			if (error)
+				goto out;
+			scan = bp->b_data;
+		}
+
+		start = 0;
+		if (goal >= fs->m_first_data_block &&
+		    goal < fs->m_blocks_count) {
+			goal_group = (u_int32_t)((goal -
+			    fs->m_first_data_block) / fs->m_blocks_per_group);
+			if (goal_group == g)
+				start = (u_int32_t)((goal -
+				    fs->m_first_data_block) %
+				    fs->m_blocks_per_group);
+		}
+		for (blk = start; blk < blocks && isset(scan, blk); blk++)
+			;
+		if (blk == blocks && start != 0)
+			for (blk = 0; blk < start && isset(scan, blk); blk++)
+				;
+		if (blk == blocks || (start != 0 && blk == start)) {
+			bp = NULL;
+			continue;
+		}
+
+		nalloced = 1;
+		for (k = 1; k < count && blk + k < blocks &&
+		    isclr(scan, blk + k); k++)
+			nalloced++;
+		if (nalloced > free_blocks ||
+		    nalloced > fs->m_free_blocks_count) {
+			error = EIO;
+			goto out;
+		}
+
+		memcpy(saved_bitmap, bp->b_data, fs->m_block_size);
+		saved_gd = *gd;
+		saved_sb = fs->m_sble;
+		saved_free_blocks = fs->m_free_blocks_count;
+		saved_modified = fs->m_fs_was_modified;
+		if (uninit)
+			memcpy(bp->b_data, bitmap, fs->m_block_size);
+		for (k = 0; k < nalloced; k++)
+			setbit((u_int8_t *)bp->b_data, blk + k);
+		if (uninit)
+			gd->bgd_flags = htole16(letoh16(gd->bgd_flags) &
+			    ~EXT4FS_BGD_FLAG_BLOCK_UNINIT);
+		bitmap_csum = ext4fs_bitmap_csum(fs, g, bp->b_data,
+		    fs->m_block_size);
+		gd->bgd_block_bitmap_checksum_lo =
+		    htole16(bitmap_csum & 0xffff);
+		if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+			gd->bgd_block_bitmap_checksum_hi =
+			    htole16(bitmap_csum >> 16);
+		free_blocks -= nalloced;
+		gd->bgd_free_blocks_count_lo = htole16(free_blocks & 0xffff);
+		if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+			gd->bgd_free_blocks_count_hi = htole16(free_blocks >> 16);
+		fs->m_free_blocks_count -= nalloced;
+		fs->m_fs_was_modified = 1;
+
+		error = ext4fs_journal_dirty_metadata(handle, bp);
+		if (error)
+			goto restore;
+		transaction_dirty = 1;
+		error = ext4fs_bgd_write_handle(fs, ip->i_devvp, g, handle);
+		if (error)
+			goto restore;
+		error = ext4fs_sbwrite_handle(ITOV(ip)->v_mount, handle);
+		if (error)
+			goto restore;
+
+		*bnp = fs->m_first_data_block +
+		    (u_int64_t)g * fs->m_blocks_per_group + blk;
+		*countp = nalloced;
+		error = 0;
+		goto out;
+
+restore:
+		memcpy(bp->b_data, saved_bitmap, fs->m_block_size);
+		*gd = saved_gd;
+		fs->m_sble = saved_sb;
+		fs->m_free_blocks_count = saved_free_blocks;
+		fs->m_fs_was_modified = saved_modified;
+		if (transaction_dirty)
+			ext4fs_journal_abort(ITOV(ip)->v_mount, error);
+		goto out;
+	}
+
+out:
+	free(saved_bitmap, M_UFSMNT, fs->m_block_size);
+	free(bitmap, M_UFSMNT, fs->m_block_size);
+	return (error);
+}
+
+int
+ext4fs_blkalloc (struct inode *ip, u_int64_t goal, u_int32_t count,
+    u_int64_t *bnp, u_int32_t *countp)
+{
+	struct m_ext4fs *fs = ip->i_e4fs;
+	struct ext4fs_journal_handle *handle;
+	int end_error, error;
+
+	if (fs->m_journal == NULL)
+		return (ext4fs_blkalloc_direct(ip, goal, count, bnp, countp));
+	handle = NULL;
+	error = ext4fs_journal_begin(ITOV(ip)->v_mount, 3, &handle);
+	if (error)
+		return (error);
+	error = ext4fs_blkalloc_handle(ip, handle, goal, count, bnp, countp);
+	end_error = ext4fs_journal_end(handle);
+	if (error == 0)
+		error = end_error;
+	if (error == 0)
+		error = ext4fs_journal_force_commit(ITOV(ip)->v_mount);
+	else if (*countp != 0)
+		ext4fs_journal_abort(ITOV(ip)->v_mount, error);
+	if (error) {
+		*bnp = 0;
+		*countp = 0;
+	}
+	return (error);
 }
 
 /*
