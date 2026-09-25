@@ -7,6 +7,8 @@
 set -eu
 
 MKE2FS=${MKE2FS:-mke2fs}
+DEBUGFS=${DEBUGFS:-debugfs}
+E2FSCK=${E2FSCK:-e2fsck}
 VNCONFIG=${VNCONFIG:-vnconfig}
 MOUNT_EXT4FS=${MOUNT_EXT4FS:-mount_ext4fs}
 MOUNT=${MOUNT:-mount}
@@ -24,7 +26,8 @@ fixtures|kernel) ;;
 	;;
 esac
 
-tools="$MKE2FS $EXT4FS_CORRUPT cp dd id sha256"
+tools="$MKE2FS $DEBUGFS $E2FSCK $TIMEOUT $EXT4FS_CORRUPT awk cat cmp cp \
+dd id sha256 wc"
 if [ "$EXT4FS_CORRUPT_MODE" = kernel ]; then
 	tools="$tools $VNCONFIG $MOUNT_EXT4FS $MOUNT $UMOUNT $TIMEOUT grep"
 fi
@@ -75,6 +78,9 @@ vnd=
 mounted=0
 mountpoint=$work/mnt
 mkdir "$mountpoint"
+payload=$work/extent-payload
+printf 'ext4fs extent payload\n' >"$payload"
+payload_size=$(wc -c <"$payload")
 
 is_mounted()
 {
@@ -117,6 +123,9 @@ create_base()
 	block_size=$2
 	base=$work/base-$profile-$block_size.img
 	log=$work/mke2fs-$profile-$block_size.log
+	commands=$work/debugfs-$profile-$block_size.cmd
+	debuglog=$work/debugfs-$profile-$block_size.log
+	checklog=$work/e2fsck-$profile-$block_size.log
 
 	dd if=/dev/zero of="$base" bs=1m count=0 \
 	    seek="$EXT4FS_CORRUPT_IMAGE_MB" status=none
@@ -130,12 +139,43 @@ create_base()
 		cat "$log" >&2
 		fail "mke2fs failed for $profile profile"
 	fi
+	{
+		printf 'write %s /extent-inline\n' "$payload"
+		printf 'write %s /extent-depth1\n' "$payload"
+		printf 'fallocate /extent-depth1 2 2\n'
+		printf 'fallocate /extent-depth1 4 4\n'
+		printf 'fallocate /extent-depth1 6 6\n'
+		printf 'fallocate /extent-depth1 8 8\n'
+		printf 'fallocate /extent-depth1 10 10\n'
+		printf 'set_inode_field /extent-depth1 size %s\n' \
+		    "$((11 * block_size))"
+	} >"$commands"
+	if ! "$DEBUGFS" -w -f "$commands" "$base" >"$debuglog" 2>&1; then
+		cat "$debuglog" >&2
+		fail "debugfs could not create extent controls"
+	fi
+	inline_inode=$("$DEBUGFS" -R 'stat /extent-inline' "$base" \
+	    2>/dev/null | awk '/^Inode:/ { print $2; exit }')
+	depth1_inode=$("$DEBUGFS" -R 'stat /extent-depth1' "$base" \
+	    2>/dev/null | awk '/^Inode:/ { print $2; exit }')
+	case "$inline_inode:$depth1_inode" in
+	*[!0-9:]*)	fail "debugfs returned an invalid extent inode" ;;
+	:*|*:)		fail "debugfs did not return extent inodes" ;;
+	esac
+	printf '%s\n' "$inline_inode" >"$base.inline-inode"
+	printf '%s\n' "$depth1_inode" >"$base.depth1-inode"
+	if ! "$TIMEOUT" -k 2 "$EXT4FS_CORRUPT_TIMEOUT" \
+	    "$E2FSCK" -fn "$base" >"$checklog" 2>&1; then
+		cat "$checklog" >&2
+		fail "e2fsck rejected an extent control image"
+	fi
 }
 
 fixture_profile()
 {
 	case "$1" in
-	bad-superblock-checksum|bad-group-descriptor-checksum)
+bad-superblock-checksum|bad-group-descriptor-checksum|\
+extent-block-bad-checksum)
 		FIXTURE_PROFILE=checksum
 		;;
 	*)	FIXTURE_PROFILE=no-checksum ;;
@@ -153,7 +193,25 @@ make_fixture()
 	mkdir "$case_dir"
 	cp "$base" "$image"
 	base_hash=$(sha256 -q "$image")
-	if ! "$EXT4FS_CORRUPT" "$image" "$mutation" \
+	target_path=
+	case "$mutation" in
+	extent-root-depth-too-large|extent-index-*|extent-leaf-*|\
+	extent-block-bad-checksum)
+		target_path=extent-depth1
+		inode=$(cat "$base.depth1-inode")
+		;;
+	extent-root-*)
+		target_path=extent-inline
+		inode=$(cat "$base.inline-inode")
+		;;
+	*)	inode= ;;
+	esac
+	if [ -n "$inode" ]; then
+		set -- "$image" "$mutation" "$inode"
+	else
+		set -- "$image" "$mutation"
+	fi
+	if ! "$EXT4FS_CORRUPT" "$@" \
 	    >"$case_dir/mutate.log" 2>&1; then
 		cat "$case_dir/mutate.log" >&2
 		fail "fixture mutation failed"
@@ -205,9 +263,62 @@ mount_control()
 		fail "kernel rejected the valid control"
 	fi
 	mounted=1
+	for target in extent-inline extent-depth1; do
+		if ! "$TIMEOUT" -k 2 "$EXT4FS_CORRUPT_TIMEOUT" dd \
+		    if="$mountpoint/$target" of="$case_dir/$target.data" \
+		    bs=1 count="$payload_size" status=none \
+		    >"$case_dir/$target.log" 2>&1; then
+			cat "$case_dir/$target.log" >&2
+			detach_image
+			fail "could not read valid $target control"
+		fi
+		if ! cmp -s "$case_dir/$target.data" "$payload"; then
+			detach_image
+			fail "$target control data differs"
+		fi
+	done
 	detach_image
 	after=$(sha256 -q "$image")
 	[ "$before" = "$after" ] || fail "read-only control mount changed image"
+	echo " ok"
+}
+
+reject_extent_fixture()
+{
+	mutation=$1
+	block_size=$2
+	test_name="$mutation, $block_size-byte blocks"
+	printf '%-64s' "kernel: $test_name"
+	make_fixture "$mutation" "$block_size"
+	before=$(sha256 -q "$image")
+	attach_image
+	if ! "$TIMEOUT" -k 2 "$EXT4FS_CORRUPT_TIMEOUT" \
+	    "$MOUNT_EXT4FS" -o ro "/dev/${vnd}c" "$mountpoint" \
+	    >"$case_dir/mount.log" 2>&1; then
+		cat "$case_dir/mount.log" >&2
+		detach_image
+		fail "kernel rejected filesystem before extent access"
+	fi
+	mounted=1
+	status=0
+	if "$TIMEOUT" -k 2 "$EXT4FS_CORRUPT_TIMEOUT" dd \
+	    if="$mountpoint/$target_path" of=/dev/null bs=1 count=1 \
+	    status=none >"$case_dir/read.log" 2>&1; then
+		status=0
+	else
+		status=$?
+	fi
+	detach_image
+	after=$(sha256 -q "$image")
+	[ "$before" = "$after" ] ||
+	    fail "failed read-only extent access modified the image"
+	case "$status" in
+	124|137|143)	fail "extent access exceeded timeout" ;;
+	0)		fail "kernel accepted malformed extent metadata" ;;
+	esac
+	if [ "$status" -ge 128 ]; then
+		fail "extent access terminated abnormally (status $status)"
+	fi
 	echo " ok"
 }
 
@@ -261,6 +372,13 @@ checksum_mutations='bad-superblock-checksum bad-group-descriptor-checksum'
 geometry_mutations='block-size-too-large zero-blocks-per-group
 zero-inodes-per-group invalid-inode-size invalid-first-inode
 invalid-descriptor-size unsupported-incompat-feature recover-without-journal'
+extent_mutations='extent-root-bad-magic
+extent-root-physical-out-of-range extent-leaf-bad-magic
+extent-index-out-of-range extent-root-depth-too-large
+extent-root-entries-over-max extent-root-max-too-large
+extent-root-unordered extent-root-overlap extent-root-zero-length
+extent-leaf-entries-over-max extent-leaf-max-too-large
+extent-leaf-unordered extent-leaf-overlap extent-block-bad-checksum'
 
 for block_size in 1024 2048 4096; do
 	test_name="create base images, $block_size-byte blocks"
@@ -278,6 +396,14 @@ for block_size in 1024 2048 4096; do
 			make_fixture "$mutation" "$block_size"
 		else
 			reject_fixture "$mutation" "$block_size"
+		fi
+	done
+	for mutation in $extent_mutations; do
+		if [ "$EXT4FS_CORRUPT_MODE" = fixtures ]; then
+			test_name="$mutation, $block_size-byte blocks"
+			make_fixture "$mutation" "$block_size"
+		else
+			reject_extent_fixture "$mutation" "$block_size"
 		fi
 	done
 done
