@@ -476,6 +476,20 @@ have a regression which proves that `chmod` advances the JBD2 sequence before
 checking the checkpointed inode and the clean journal.  The complete journal
 mount and ordinary-operation suites pass with this path active.
 
+Regular-file extent allocation, single-block and range free, truncate-to-zero,
+and non-zero shrink are now journaled for supported depth-0 and depth-1 extent
+trees.  Allocation bitmap, group-descriptor, counter, superblock, extent-node,
+and inode changes are committed together; freed extent-node blocks are
+revoked, and a retained partial EOF block is synchronously zeroed before the
+metadata commit.  The implementation rejects deeper mutable trees and invalid
+or physically aliased extent metadata before changing the filesystem.  On
+2026-09-25, the production-kernel `ext4fsops` matrix passed on 1 KiB, 2 KiB,
+and 4 KiB filesystems, including depth-1 full release, depth-1 non-zero shrink,
+partial-EOF zeroing and regrowth, remount verification, and `e2fsck -fn` after
+each mutation stage.  The broad bitmap, descriptor, counter, superblock, and
+extent checklist entries remain open until every metadata writer using those
+structures has been converted.
+
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only for
 regular-file data, the journal's own I/O, recovery, checkpointing, or another
 explicitly documented exception.
