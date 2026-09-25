@@ -339,6 +339,15 @@ ext2 and ext3 compatibility is outside this project.
       inode, unsupported incompat features, and `RECOVER` without a journal.
       Each kernel case has a valid read-only control, a timeout, and a complete
       pre/post image hash comparison.
+- [x] Run the initial corruption matrix as root through the booted amd64
+      production kernel; all valid controls and malformed-image cases pass.
+- [x] Add offline inline and depth-1 extent controls plus mutations for header
+      magic, depth, entry capacity, ordering, overlap, zero length, physical
+      and index ranges, external-leaf geometry, and external-block checksums.
+      Valid controls are checked with `e2fsck -fn` before mutation.
+- [ ] Run the extent corruption matrix through the booted production kernel;
+      each malformed target must fail its first read under a timeout, unmount
+      normally, and preserve the complete image hash.
 - [ ] Generate extent fixtures with bad magic, invalid depth, impossible
       `eh_entries`/`eh_max`, unordered or overlapping logical ranges,
       out-of-filesystem physical ranges, bad index targets, invalid unwritten
