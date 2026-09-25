@@ -328,3 +328,39 @@ ext4fs_extent_block_csum_set (struct m_ext4fs *fs, u_int32_t ino,
 	crc = crc32c(crc, buf, tail_offset);
 	*tail = htole32(~crc);
 }
+
+/*
+ * Verify an external extent-tree block checksum.
+ *
+ * Returns 0 when checksums are disabled or the checksum is valid, and
+ * EINVAL when the header cannot contain a checksum tail or it does not match.
+ */
+int
+ext4fs_extent_block_csum_verify (struct m_ext4fs *fs, u_int32_t ino,
+    u_int32_t gen_le, const void *buf)
+{
+	const struct ext4fs_extent_header *eh;
+	const u_int32_t *tail;
+	u_int32_t crc, ino_le, provided;
+	size_t tail_offset;
+
+	if (!(fs->m_feature_ro_compat &
+	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
+		return (0);
+
+	eh = buf;
+	tail_offset = sizeof(*eh) +
+	    (size_t)letoh16(eh->eh_max) * sizeof(struct ext4fs_extent);
+	if (tail_offset > fs->m_block_size - sizeof(*tail))
+		return (EINVAL);
+	tail = (const u_int32_t *)((const char *)buf + tail_offset);
+	provided = letoh32(*tail);
+	ino_le = htole32(ino);
+	crc = crc32c(ext4fs_csum_seed(fs), (const uint8_t *)&ino_le,
+	    sizeof(ino_le));
+	crc = crc32c(crc, (const uint8_t *)&gen_le, sizeof(gen_le));
+	crc = crc32c(crc, buf, tail_offset);
+	if (provided != ~crc)
+		return (EINVAL);
+	return (0);
+}

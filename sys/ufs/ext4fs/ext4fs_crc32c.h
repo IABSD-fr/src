@@ -55,5 +55,7 @@ void ext4fs_dir_set_csum (struct m_ext4fs *fs, u_int32_t ino,
  */
 void ext4fs_extent_block_csum_set (struct m_ext4fs *fs, u_int32_t ino,
     u_int32_t gen_le, void *buf);
+int ext4fs_extent_block_csum_verify (struct m_ext4fs *, u_int32_t,
+    u_int32_t, const void *);
 
 #endif /* _EXT4FS_CRC32C_H_ */
