@@ -66,7 +66,7 @@ static void	check_extent_file (const char *);
 static void	check_shrunk_extent_file (const char *);
 static void	check_empty_file (const char *);
 static void	create_link_growth_tree (void);
-static void	check_link_growth_tree (void);
+static void	check_link_growth_tree (int);
 static void	check_grow_directory (const char *, int);
 static void	fsync_path (const char *);
 static void	expect_ro_failure (const char *, int);
@@ -494,7 +494,7 @@ create_link_growth_tree (void)
 }
 
 static void
-check_link_growth_tree (void)
+check_link_growth_tree (int removed)
 {
 	struct stat directory_st, link_st, target_st;
 	char directory[PATH_MAX], linkpath[PATH_MAX], target[PATH_MAX];
@@ -510,13 +510,19 @@ check_link_growth_tree (void)
 		errx(1, "link-growth directory has wrong type or size");
 	if (stat(target, &target_st) == -1)
 		err(1, "stat %s", target);
-	if (stat(linkpath, &link_st) == -1)
-		err(1, "stat %s", linkpath);
-	if (target_st.st_ino != link_st.st_ino || target_st.st_nlink != 2 ||
-	    link_st.st_nlink != 2)
-		errx(1, "journaled growth link identity or count mismatch");
+	if (removed) {
+		check_absent(linkpath);
+		if (target_st.st_nlink != 1)
+			errx(1, "journaled link removal count mismatch");
+	} else {
+		if (stat(linkpath, &link_st) == -1)
+			err(1, "stat %s", linkpath);
+		if (target_st.st_ino != link_st.st_ino ||
+		    target_st.st_nlink != 2 || link_st.st_nlink != 2)
+			errx(1, "journaled growth link identity or count mismatch");
+		check_text_file(linkpath, "journaled-link-data");
+	}
 	check_text_file(target, "journaled-link-data");
-	check_text_file(linkpath, "journaled-link-data");
 }
 
 static void
@@ -756,7 +762,7 @@ verify_created_tree (void)
 	check_extent_file(path);
 	make_path(path, sizeof(path), "shrink-extents");
 	check_extent_file(path);
-	check_link_growth_tree();
+	check_link_growth_tree(0);
 	make_path(path, sizeof(path), "empty");
 	check_regular(path);
 
@@ -796,6 +802,10 @@ mutate_filesystem_tree (void)
 	make_path(path, sizeof(path), "data.link");
 	if (unlink(path) == -1)
 		err(1, "unlink data.link");
+	make_path(path, sizeof(path),
+	    "link-grow/journal-growth-link");
+	if (unlink(path) == -1)
+		err(1, "unlink journal-growth-link");
 	make_path(path, sizeof(path), "a/renamed");
 	fd = open(path, O_RDWR);
 	if (fd == -1)
@@ -995,7 +1005,7 @@ verify_final_tree (void)
 	check_empty_file(path);
 	make_path(path, sizeof(path), "shrink-extents");
 	check_shrunk_extent_file(path);
-	check_link_growth_tree();
+	check_link_growth_tree(1);
 	make_path(path, sizeof(path), "growdir");
 	check_grow_directory(path, 1);
 

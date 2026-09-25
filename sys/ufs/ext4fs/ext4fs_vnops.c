@@ -78,6 +78,8 @@ static const u_int8_t ext4fs_type_to_dt[EXT4FS_FT_MAX] = {
 
 static int ext4fs_direnter_handle (struct inode *, struct vnode *,
     struct componentname *, struct ext4fs_journal_handle *, int *);
+static int ext4fs_dirremove_handle (struct inode *, struct vnode *,
+    struct componentname *, struct ext4fs_journal_handle *, int *);
 
 static int
 ext4fs_dir_block_check (struct inode *ip, const void *data)
@@ -4267,10 +4269,15 @@ ext4fs_remove (void *v)
 	struct vop_remove_args *ap = v;
 	struct vnode *vp = ap->a_vp;
 	struct vnode *dvp = ap->a_dvp;
+	struct inode *dp = VTOI(dvp);
 	struct inode *ip = VTOI(vp);
+	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
+	struct ext4fs_dinode_256 saved_dir_inode, saved_inode;
+	struct ext4fs_journal_handle *handle;
 	u_int16_t nlink;
-	int error;
+	int changed, end_error, error, saved_dir_flags, saved_effnlink;
+	int saved_flags;
 
 	if (vp->v_type == VDIR) {
 		error = EPERM;
@@ -4284,11 +4291,74 @@ ext4fs_remove (void *v)
 		goto out;
 	}
 
+	nlink = letoh16(din->i_links_count);
+	/*
+	 * Removing a non-final name needs no orphan record.  Commit the
+	 * directory block, parent inode, and target link count together.
+	 * Final-link removal remains on the legacy path until runtime orphan
+	 * insertion, removal, truncation, and inode freeing share a transaction.
+	 */
+	if (fs->m_journal != NULL && nlink > 1) {
+		memcpy(&saved_inode, ip->i_e4din, sizeof(saved_inode));
+		memcpy(&saved_dir_inode, dp->i_e4din,
+		    sizeof(saved_dir_inode));
+		saved_flags = ip->i_flag;
+		saved_dir_flags = dp->i_flag;
+		saved_effnlink = ip->i_effnlink;
+		handle = NULL;
+		changed = 0;
+		error = ext4fs_journal_begin(vp->v_mount, 16, &handle);
+		if (error)
+			goto out;
+
+		error = ext4fs_dirremove_handle(ip, dvp, ap->a_cnp, handle,
+		    &changed);
+		if (error)
+			goto journal_fail;
+		nlink--;
+		din->i_links_count = htole16(nlink);
+		ip->i_effnlink = nlink;
+		ip->i_flag |= IN_CHANGE;
+		error = ext4fs_update_handle(ip, handle);
+		if (error)
+			goto journal_fail;
+		end_error = ext4fs_journal_end(handle);
+		handle = NULL;
+		if (end_error) {
+			error = end_error;
+			ext4fs_journal_abort(vp->v_mount, error);
+			goto journal_restore;
+		}
+		error = ext4fs_journal_force_commit(vp->v_mount);
+		if (error) {
+			ext4fs_journal_abort(vp->v_mount, error);
+			goto journal_restore;
+		}
+		ip->i_flag &= ~IN_MODIFIED;
+		dp->i_flag &= ~IN_MODIFIED;
+		goto out;
+
+journal_fail:
+		if (changed)
+			ext4fs_journal_abort(vp->v_mount, error);
+		end_error = ext4fs_journal_end(handle);
+		handle = NULL;
+		if (error == 0)
+			error = end_error;
+journal_restore:
+		memcpy(ip->i_e4din, &saved_inode, sizeof(saved_inode));
+		memcpy(dp->i_e4din, &saved_dir_inode,
+		    sizeof(saved_dir_inode));
+		ip->i_flag = saved_flags;
+		dp->i_flag = saved_dir_flags;
+		ip->i_effnlink = saved_effnlink;
+		goto out;
+	}
+
 	error = ext4fs_dirremove(dvp, ap->a_cnp);
 	if (error)
 		goto out;
 
-	nlink = letoh16(din->i_links_count);
 	if (nlink > 0)
 		nlink--;
 	din->i_links_count = htole16(nlink);
@@ -5281,6 +5351,87 @@ ext4fs_direnter_handle (struct inode *ip, struct vnode *dvp,
 			return (error);
 	}
 
+	dp->i_flag |= IN_CHANGE | IN_UPDATE;
+	return (ext4fs_update_handle(dp, handle));
+}
+
+/*
+ * Remove one non-directory name under an existing journal handle.
+ */
+static int
+ext4fs_dirremove_handle (struct inode *ip, struct vnode *dvp,
+    struct componentname *cnp, struct ext4fs_journal_handle *handle,
+    int *changedp)
+{
+	struct inode *dp = VTOI(dvp);
+	struct m_ext4fs *fs = dp->i_e4fs;
+	struct ext4fs_directory *ep, *prevep;
+	struct buf *bp;
+	size_t limit;
+	u_int64_t lbn, pblk;
+	off_t filesz;
+	int error, loc, prevloc;
+	u_int16_t prevreclen, reclen;
+
+	if (handle == NULL || changedp == NULL ||
+	    cnp->cn_namelen == 0 || cnp->cn_namelen > EXT4FS_MAXNAMLEN ||
+	    ip->i_number == 0 || ip->i_number > fs->m_inodes_count)
+		return (EINVAL);
+	filesz = (off_t)letoh32(dp->i_e4din->dinode.i_size_lo) |
+	    ((off_t)letoh32(dp->i_e4din->dinode.i_size_hi) << 32);
+	if (filesz < 0 || dp->i_offset < 0 || dp->i_offset >= filesz)
+		return (EIO);
+	lbn = EXT4FS_LBLKNO(fs, dp->i_offset);
+	error = ext4fs_extent_pblk(dp, lbn, &pblk, NULL);
+	if (error || pblk == 0)
+		return (error ? error : EIO);
+	error = ext4fs_journal_get_metadata(handle, dp->i_devvp, pblk, &bp);
+	if (error)
+		return (error);
+	error = ext4fs_dir_block_check(dp, bp->b_data);
+	if (error)
+		return (error);
+
+	limit = fs->m_block_size;
+	if (fs->m_feature_ro_compat & EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM)
+		limit -= EXT4FS_DIR_TAIL_SIZE;
+	loc = EXT4FS_BLKOFF(fs, dp->i_offset);
+	if (loc < 0 || (size_t)loc > limit || limit - (size_t)loc < 8)
+		return (EIO);
+	ep = (struct ext4fs_directory *)((char *)bp->b_data + loc);
+	reclen = letoh16(ep->e4d_reclen);
+	if (reclen < 8 || (reclen & 3) != 0 ||
+	    reclen > limit - (size_t)loc ||
+	    letoh32(ep->e4d_ino) != ip->i_number ||
+	    ep->e4d_namlen != cnp->cn_namelen ||
+	    memcmp(ep->e4d_name, cnp->cn_nameptr, cnp->cn_namelen) != 0)
+		return (EIO);
+
+	if (dp->i_count == 0) {
+		*changedp = 1;
+		ep->e4d_ino = htole32(0);
+	} else {
+		if (dp->i_count < 0 || (size_t)dp->i_count > (size_t)loc)
+			return (EIO);
+		prevloc = loc - dp->i_count;
+		prevep = (struct ext4fs_directory *)
+		    ((char *)bp->b_data + prevloc);
+		prevreclen = letoh16(prevep->e4d_reclen);
+		if (prevreclen != dp->i_count ||
+		    (size_t)prevreclen + reclen > limit - (size_t)prevloc)
+			return (EIO);
+		*changedp = 1;
+		prevep->e4d_reclen = htole16(prevreclen + reclen);
+	}
+
+	ext4fs_dir_set_csum(fs, dp->i_number,
+	    dp->i_e4din->dinode.i_nfs_generation, bp->b_data);
+	error = ext4fs_dir_block_check(dp, bp->b_data);
+	if (error)
+		return (error);
+	error = ext4fs_journal_dirty_metadata(handle, bp);
+	if (error)
+		return (error);
 	dp->i_flag |= IN_CHANGE | IN_UPDATE;
 	return (ext4fs_update_handle(dp, handle));
 }
