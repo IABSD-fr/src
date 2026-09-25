@@ -33,6 +33,8 @@
 #define GROW_FILES	180
 #define REFILL_FILES	60
 #define EXTENT_WRITES	12
+#define SHRINK_EXTENT_LBN	10
+#define SHRINK_EXTENT_BYTES	37
 #define IO_CHUNK	4096
 
 #define DATA_SEED	0x31U
@@ -60,6 +62,7 @@ static void	check_data_file (const char *, int);
 static void	check_sparse_file (const char *, int);
 static void	check_large_sparse (const char *, int);
 static void	check_extent_file (const char *);
+static void	check_shrunk_extent_file (const char *);
 static void	check_empty_file (const char *);
 static void	check_grow_directory (const char *, int);
 static void	fsync_path (const char *);
@@ -387,6 +390,35 @@ check_extent_file (const char *path)
 }
 
 static void
+check_shrunk_extent_file (const char *path)
+{
+	struct stat st;
+	off_t offset;
+	int fd, i;
+
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (st.st_size != (off_t)(SHRINK_EXTENT_LBN + 1) *
+	    (off_t)block_size)
+		errx(1, "wrong shrunk extent-file size");
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	for (i = 0; i < SHRINK_EXTENT_LBN / 2; i++) {
+		offset = (off_t)i * 2 * (off_t)block_size;
+		check_pattern_fd(fd, offset, block_size, EXTENT_SEED + i);
+		check_zero_fd(fd, offset + (off_t)block_size, block_size);
+	}
+	offset = (off_t)SHRINK_EXTENT_LBN * (off_t)block_size;
+	check_pattern_fd(fd, offset, SHRINK_EXTENT_BYTES,
+	    EXTENT_SEED + SHRINK_EXTENT_LBN / 2);
+	check_zero_fd(fd, offset + SHRINK_EXTENT_BYTES,
+	    block_size - SHRINK_EXTENT_BYTES);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
 check_empty_file (const char *path)
 {
 	struct stat st;
@@ -551,6 +583,8 @@ create_filesystem_tree (void)
 	create_extent_file(path);
 	make_path(path, sizeof(path), "free-extents");
 	create_extent_file(path);
+	make_path(path, sizeof(path), "shrink-extents");
+	create_extent_file(path);
 
 	make_path(path, sizeof(path), "empty");
 	write_text_file(path, "");
@@ -628,6 +662,8 @@ verify_created_tree (void)
 	make_path(path, sizeof(path), "extents");
 	check_extent_file(path);
 	make_path(path, sizeof(path), "free-extents");
+	check_extent_file(path);
+	make_path(path, sizeof(path), "shrink-extents");
 	check_extent_file(path);
 	make_path(path, sizeof(path), "empty");
 	check_regular(path);
@@ -769,6 +805,25 @@ mutate_filesystem_tree (void)
 	if (close(fd) == -1)
 		err(1, "close %s", path);
 
+	/* Keep the depth-1 tree while freeing its tail and zeroing partial EOF. */
+	make_path(path, sizeof(path), "shrink-extents");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	marker = (off_t)SHRINK_EXTENT_LBN * (off_t)block_size +
+	    SHRINK_EXTENT_BYTES;
+	if (ftruncate(fd, marker) == -1)
+		err(1, "shrink %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync shrunk %s", path);
+	marker = (off_t)(SHRINK_EXTENT_LBN + 1) * (off_t)block_size;
+	if (ftruncate(fd, marker) == -1)
+		err(1, "regrow %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync regrown %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+
 	if (statfs(root, &before) == -1)
 		err(1, "statfs before directory reuse");
 	for (i = 0; i < GROW_FILES; i += 2) {
@@ -846,6 +901,8 @@ verify_final_tree (void)
 	check_extent_file(path);
 	make_path(path, sizeof(path), "free-extents");
 	check_empty_file(path);
+	make_path(path, sizeof(path), "shrink-extents");
+	check_shrunk_extent_file(path);
 	make_path(path, sizeof(path), "growdir");
 	check_grow_directory(path, 1);
 
