@@ -459,7 +459,7 @@ ext2 and ext3 compatibility is outside this project.
 Audit every metadata write in `sys/ufs/ext4fs` and route it through a journal
 handle. This includes:
 
-- [ ] inode-table blocks and inode timestamps;
+- [x] inode-table blocks and inode timestamps;
 - [ ] block bitmaps;
 - [ ] inode bitmaps;
 - [ ] block-group descriptors;
@@ -468,6 +468,13 @@ handle. This includes:
 - [ ] orphan-list and orphan-file updates;
 - [ ] allocation and free counters;
 - [ ] the ext4 superblock.
+
+The first Phase 4 path was validated on 2026-09-25 against the booted amd64
+production kernel.  Inode-table updates now use a runtime journal handle,
+commit and checkpoint synchronously, retain dirty inode state on failure, and
+have a regression which proves that `chmod` advances the JBD2 sequence before
+checking the checkpointed inode and the clean journal.  The complete journal
+mount and ordinary-operation suites pass with this path active.
 
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only for
 regular-file data, the journal's own I/O, recovery, checkpointing, or another
