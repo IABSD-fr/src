@@ -218,7 +218,7 @@ ext4fs_inode_csum_verify (struct m_ext4fs *fs,
 
 u_int32_t
 ext4fs_bitmap_csum (struct m_ext4fs *fs, u_int32_t group,
-    void *bitmap, size_t size)
+    const void *bitmap, size_t size)
 {
 	u_int32_t crc, seed;
 

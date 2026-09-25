@@ -40,6 +40,7 @@
 #include <sys/systm.h>
 #include <sys/namei.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>
 #include <sys/stat.h>
 #include <sys/buf.h>
 #include <sys/proc.h>
@@ -584,7 +585,7 @@ ext4fs_block_bitmap_csum_verify (struct m_ext4fs *fs, u_int32_t group,
 	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
 		return (0);
 	provided = letoh16(gd->bgd_block_bitmap_checksum_lo);
-	calculated = ext4fs_bitmap_csum(fs, group, __UNCONST(bitmap),
+	calculated = ext4fs_bitmap_csum(fs, group, bitmap,
 	    fs->m_block_size);
 	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
 		provided |= (u_int32_t)
