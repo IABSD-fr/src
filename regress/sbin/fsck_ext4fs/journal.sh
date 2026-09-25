@@ -40,7 +40,7 @@ for tool in "$MKE2FS" "$DEBUGFS" "$E2FSCK" "$TIMEOUT" \
 done
 
 if [ "$JOURNAL_TEST_MODE" = kernel ]; then
-	for tool in "$VNCONFIG" "$MOUNT_EXT4FS" "$UMOUNT" "$CC" id; do
+	for tool in "$VNCONFIG" "$MOUNT_EXT4FS" "$UMOUNT" "$CC" chmod id; do
 		if ! command -v "$tool" >/dev/null 2>&1; then
 			echo "SKIPPED: kernel journal regress requires $tool"
 			exit 0
@@ -1424,6 +1424,53 @@ kernel_expect_mount_failure_unchanged()
 	    fail "failed kernel recovery modified the image"
 }
 
+test_runtime_inode_transaction()
+{
+	case_dir=$work/runtime-inode-transaction
+	mkdir "$case_dir"
+	create_image "$case_dir/image" 4096
+	printf '%s\n' runtime-inode >"$case_dir/payload"
+	{
+		printf 'write %s /runtime-inode\n' "$case_dir/payload"
+	} >"$case_dir/debugfs.cmd"
+	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
+
+	read_be32_journal "$case_dir/image" 0 24
+	sequence_before=$JOURNAL_WORD
+
+	KERNEL_MOUNTPOINT=$case_dir/mnt
+	mkdir "$KERNEL_MOUNTPOINT"
+	kernel_vnd_attach "$case_dir/image"
+	runtime_device=/dev/${KERNEL_VND}c
+	if ! run_privileged "$TIMEOUT" -k 2 "$FSCK_TIMEOUT" \
+	    "$MOUNT_EXT4FS" "$runtime_device" "$KERNEL_MOUNTPOINT" \
+	    >"$case_dir/kernel-mount.log" 2>&1; then
+		cat "$case_dir/kernel-mount.log" >&2
+		kernel_vnd_detach
+		fail "kernel rejected the runtime-journal fixture"
+	fi
+	KERNEL_MOUNTED=1
+	if ! run_privileged "$TIMEOUT" -k 2 "$FSCK_TIMEOUT" chmod 0600 \
+	    "$KERNEL_MOUNTPOINT/runtime-inode" \
+	    >"$case_dir/chmod.log" 2>&1; then
+		cat "$case_dir/chmod.log" >&2
+		fail "journaled inode update failed"
+	fi
+	kernel_vnd_detach
+
+	read_be32_journal "$case_dir/image" 0 24
+	sequence_after=$JOURNAL_WORD
+	[ "$sequence_after" -ne "$sequence_before" ] ||
+	    fail "inode update did not commit a runtime journal transaction"
+	read_be32_journal "$case_dir/image" 0 28
+	[ "$JOURNAL_WORD" -eq 0 ] ||
+	    fail "clean unmount left the runtime journal non-empty"
+	"$DEBUGFS" -R 'stat /runtime-inode' "$case_dir/image" 2>&1 |
+	    grep -q 'Mode:[[:space:]]*0600' ||
+	    fail "journaled inode mode did not reach its home block"
+	verify_e2fsck "$case_dir/image"
+}
+
 test_classic_orphan_recovery()
 {
 	case_dir=$work/classic-orphan-recovery
@@ -1780,6 +1827,8 @@ if [ "$JOURNAL_TEST_MODE" = all ]; then
 	run_test 'seeded replay matrix' test_randomized_replay
 	run_test 'seeded checksum mutation sweep' test_randomized_mutations
 else
+	run_test 'kernel: runtime inode transaction' \
+	    test_runtime_inode_transaction
 	run_test 'kernel: journal without checksums' test_nocsum
 	run_test 'kernel: checksum v2' test_csum_v2
 	run_test 'kernel: checksum v2 multiple tags' \

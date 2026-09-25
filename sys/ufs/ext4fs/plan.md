@@ -345,9 +345,10 @@ ext2 and ext3 compatibility is outside this project.
       magic, depth, entry capacity, ordering, overlap, zero length, physical
       and index ranges, external-leaf geometry, and external-block checksums.
       Valid controls are checked with `e2fsck -fn` before mutation.
-- [ ] Run the extent corruption matrix through the booted production kernel;
+- [x] Run the extent corruption matrix through the booted production kernel;
       each malformed target must fail its first read under a timeout, unmount
-      normally, and preserve the complete image hash.
+      normally, and preserve the complete image hash.  The amd64 production
+      kernel matrix passed on 2026-09-25.
 - [ ] Generate extent fixtures with bad magic, invalid depth, impossible
       `eh_entries`/`eh_max`, unordered or overlapping logical ranges,
       out-of-filesystem physical ranges, bad index targets, invalid unwritten
