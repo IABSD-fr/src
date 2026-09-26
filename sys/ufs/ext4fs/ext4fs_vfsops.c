@@ -306,6 +306,7 @@ ext4fs_mountfs (struct vnode *devvp, struct mount *mp, struct proc *p)
 	ump = malloc(sizeof *ump, M_UFSMNT, M_WAITOK | M_ZERO);
 	mfs = ump->um_e4fs = malloc(sizeof(struct m_ext4fs), M_UFSMNT,
 	    M_WAITOK | M_ZERO);
+	rw_init(&mfs->m_runtime_orphan_lock, "e4orphan");
 
 	/*
 	 * Copy in the superblock, compute in-memory values
@@ -1189,6 +1190,149 @@ ext4fs_inode_alloc (struct inode *pip, mode_t mode, struct ucred *cred,
 	return (ENOSPC);
 }
 
+static int
+ext4fs_inode_bitmap_csum_verify (struct m_ext4fs *fs, u_int32_t group,
+    struct ext4fs_block_group_descriptor *gd, const void *bitmap)
+{
+	u_int32_t calculated, provided;
+
+	if (!(fs->m_feature_ro_compat &
+	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
+		return (0);
+	provided = letoh16(gd->bgd_inode_bitmap_checksum_lo);
+	calculated = ext4fs_bitmap_csum(fs, group, bitmap,
+	    howmany(fs->m_inodes_per_group, NBBY));
+	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+		provided |= (u_int32_t)
+		    letoh16(gd->bgd_inode_bitmap_checksum_hi) << 16;
+	else
+		calculated &= 0xffff;
+	if (provided != calculated) {
+		printf("ext4fs: inode bitmap %u checksum mismatch: "
+		    "stored=0x%08x calculated=0x%08x\n", group, provided,
+		    calculated);
+		return (EINVAL);
+	}
+	return (0);
+}
+
+int
+ext4fs_inode_free_handle (struct inode *pip, ufsino_t ino, mode_t mode,
+    struct ext4fs_journal_handle *handle)
+{
+	struct m_ext4fs *fs = pip->i_e4fs;
+	struct ext4fs_block_group_descriptor saved_gd, *gd;
+	struct ext4fs saved_sb;
+	struct buf *bp;
+	u_int8_t *saved_bitmap;
+	u_int64_t bitmap_blk, inode_start;
+	u_int32_t bitmap_csum, dirs, free_inodes, group, ino_in_group;
+	u_int32_t saved_free_inodes, valid;
+	int error, saved_modified, transaction_changed;
+
+	if (handle == NULL || ino < fs->m_first_non_reserved_inode ||
+	    ino > fs->m_inodes_count || fs->m_inodes_per_group == 0 ||
+	    fs->m_inodes_per_group > fs->m_block_size * NBBY ||
+	    fs->m_block_group_count == 0 ||
+	    fs->m_block_group_count > UINT32_MAX)
+		return (EINVAL);
+	group = (ino - 1) / fs->m_inodes_per_group;
+	ino_in_group = (ino - 1) % fs->m_inodes_per_group;
+	if (group >= fs->m_block_group_count)
+		return (EINVAL);
+	inode_start = (u_int64_t)group * fs->m_inodes_per_group;
+	if (inode_start >= fs->m_inodes_count)
+		return (EINVAL);
+	valid = fs->m_inodes_count - inode_start;
+	if (valid > fs->m_inodes_per_group)
+		valid = fs->m_inodes_per_group;
+	if (ino_in_group >= valid)
+		return (EINVAL);
+
+	gd = &fs->m_gd[group];
+	if (letoh16(gd->bgd_flags) & EXT4FS_BGD_FLAG_INODE_UNINIT)
+		return (EINVAL);
+	bitmap_blk = ext4fs_bgd_get_block(fs, gd,
+	    EXT4FS_BGD_INODE_BITMAP);
+	if (bitmap_blk < fs->m_first_data_block ||
+	    bitmap_blk >= fs->m_blocks_count)
+		return (EIO);
+	error = ext4fs_journal_get_metadata(handle, pip->i_devvp, bitmap_blk,
+	    &bp);
+	if (error)
+		return (error);
+	error = ext4fs_inode_bitmap_csum_verify(fs, group, gd, bp->b_data);
+	if (error)
+		return (error);
+	if (isclr((u_int8_t *)bp->b_data, ino_in_group))
+		return (EINVAL);
+
+	free_inodes = letoh16(gd->bgd_free_inodes_count_lo);
+	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+		free_inodes |= (u_int32_t)
+		    letoh16(gd->bgd_free_inodes_count_hi) << 16;
+	if (free_inodes >= valid ||
+	    fs->m_free_inodes_count >= fs->m_inodes_count)
+		return (EIO);
+	dirs = letoh16(gd->bgd_used_dirs_count_lo);
+	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+		dirs |= (u_int32_t)letoh16(gd->bgd_used_dirs_count_hi) << 16;
+	if ((mode & S_IFMT) == S_IFDIR && dirs == 0)
+		return (EIO);
+
+	saved_bitmap = malloc(fs->m_block_size, M_UFSMNT, M_WAITOK);
+	memcpy(saved_bitmap, bp->b_data, fs->m_block_size);
+	saved_gd = *gd;
+	saved_sb = fs->m_sble;
+	saved_free_inodes = fs->m_free_inodes_count;
+	saved_modified = fs->m_fs_was_modified;
+	transaction_changed = 0;
+
+	clrbit((u_int8_t *)bp->b_data, ino_in_group);
+	bitmap_csum = ext4fs_bitmap_csum(fs, group, bp->b_data,
+	    howmany(fs->m_inodes_per_group, NBBY));
+	gd->bgd_inode_bitmap_checksum_lo =
+	    htole16(bitmap_csum & 0xffff);
+	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+		gd->bgd_inode_bitmap_checksum_hi = htole16(bitmap_csum >> 16);
+	free_inodes++;
+	gd->bgd_free_inodes_count_lo = htole16(free_inodes & 0xffff);
+	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+		gd->bgd_free_inodes_count_hi = htole16(free_inodes >> 16);
+	if ((mode & S_IFMT) == S_IFDIR) {
+		dirs--;
+		gd->bgd_used_dirs_count_lo = htole16(dirs & 0xffff);
+		if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+			gd->bgd_used_dirs_count_hi = htole16(dirs >> 16);
+	}
+	fs->m_free_inodes_count++;
+	fs->m_fs_was_modified = 1;
+
+	error = ext4fs_journal_dirty_metadata(handle, bp);
+	if (error)
+		goto restore;
+	transaction_changed = 1;
+	error = ext4fs_bgd_write_handle(fs, pip->i_devvp, group, handle);
+	if (error)
+		goto restore;
+	error = ext4fs_sbwrite_handle(ITOV(pip)->v_mount, handle);
+	if (error)
+		goto restore;
+	free(saved_bitmap, M_UFSMNT, fs->m_block_size);
+	return (0);
+
+restore:
+	memcpy(bp->b_data, saved_bitmap, fs->m_block_size);
+	*gd = saved_gd;
+	fs->m_sble = saved_sb;
+	fs->m_free_inodes_count = saved_free_inodes;
+	fs->m_fs_was_modified = saved_modified;
+	free(saved_bitmap, M_UFSMNT, fs->m_block_size);
+	if (transaction_changed)
+		ext4fs_journal_abort(ITOV(pip)->v_mount, error);
+	return (error);
+}
+
 /*
  * Free an inode.
  */
@@ -1362,6 +1506,8 @@ ext4fs_unmount (struct mount *mp, int mntflags, struct proc *p)
 		flags |= FORCECLOSE;
 	if ((error = ext4fs_flushfiles(mp, flags, p)) != 0)
 		return (error);
+	if (ext4fs_orphan_pending(mp))
+		return (EBUSY);
 	ump = VFSTOUFS(mp);
 	mfs = ump->um_e4fs;
 	if (mfs->m_journal != NULL) {

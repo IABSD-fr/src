@@ -22,5 +22,13 @@ struct ext4fs_orphan_block_tail {
 } __attribute__((packed));
 
 struct mount;
+struct inode;
+struct ext4fs_journal_handle;
 
 int	ext4fs_orphan_cleanup (struct mount *);
+int	ext4fs_orphan_add_handle (struct inode *,
+	    struct ext4fs_journal_handle *);
+void	ext4fs_orphan_add_rollback (struct inode *);
+int	ext4fs_orphan_is_tracked (struct inode *);
+int	ext4fs_orphan_pending (struct mount *);
+int	ext4fs_orphan_retire (struct inode *, mode_t);

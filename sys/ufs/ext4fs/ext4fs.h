@@ -34,6 +34,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
+#include <sys/rwlock.h>
 #include <sys/vnode.h>
 #include <sys/proc.h>
 #include <sys/ucred.h>
@@ -49,6 +50,7 @@ struct statfs;
 struct vfsconf;
 struct ext4fs_journal;
 struct ext4fs_journal_handle;
+struct ext4fs_runtime_orphan;
 
 #define EXT4FS_EXTENT_DEPTH_MAX		5
 #define EXT4FS_FUNCTION_MAX		32
@@ -431,6 +433,8 @@ struct m_ext4fs {
 	u_int32_t	m_resize_dind_block;
 	struct ext4fs_block_group_descriptor *m_gd;
 	struct ext4fs_journal *m_journal;
+	struct rwlock	m_runtime_orphan_lock;
+	struct ext4fs_runtime_orphan *m_runtime_orphans;
 };
 
 struct ext4fs_block_group_descriptor {
@@ -650,6 +654,8 @@ void ext4fs_blkfree (struct inode *, u_int64_t);
 /* Inode allocation / free */
 int ext4fs_inode_alloc (struct inode *, mode_t, struct ucred *,
 	struct vnode **);
+int ext4fs_inode_free_handle (struct inode *, ufsino_t, mode_t,
+	struct ext4fs_journal_handle *);
 void ext4fs_inode_free (struct inode *, ufsino_t, mode_t);
 
 /* Directory operations */
