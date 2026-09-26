@@ -1191,6 +1191,256 @@ ext4fs_inode_alloc (struct inode *pip, mode_t mode, struct ucred *cred,
 }
 
 int
+ext4fs_inode_alloc_handle (struct inode *pip, mode_t mode,
+    struct ext4fs_journal_handle *handle, struct vnode **vpp)
+{
+	struct m_ext4fs *fs = pip->i_e4fs;
+	struct vnode *pvp = ITOV(pip);
+	struct ext4fs_block_group_descriptor saved_gd, *gd;
+	struct ext4fs saved_sb;
+	struct buf *bp;
+	struct inode *ip;
+	u_int8_t *bitmap, *saved_bitmap, *scan;
+	u_int64_t bitmap_blk, inode_start;
+	u_int32_t best, best_free, bitmap_csum, dirs, first_unused;
+	u_int32_t free_bits, free_inodes, g, group, i, ino_in_group;
+	u_int32_t itu, ngroups, pbit, saved_free_inodes, valid;
+	ufsino_t ino;
+	int error, saved_modified, transaction_dirty, uninit;
+
+	if (handle == NULL || vpp == NULL)
+		return (EINVAL);
+	*vpp = NULL;
+	if (fs->m_free_inodes_count == 0)
+		return (ENOSPC);
+	if (fs->m_block_group_count == 0 ||
+	    fs->m_block_group_count > UINT32_MAX ||
+	    fs->m_inodes_per_group == 0 ||
+	    fs->m_inodes_per_group > fs->m_block_size * NBBY)
+		return (EFBIG);
+
+	ngroups = (u_int32_t)fs->m_block_group_count;
+	if ((mode & S_IFMT) == S_IFDIR) {
+		best = 0;
+		best_free = 0;
+		for (i = 0; i < ngroups; i++) {
+			gd = &fs->m_gd[i];
+			free_inodes = letoh16(gd->bgd_free_inodes_count_lo);
+			if (fs->m_feature_incompat &
+			    EXT4FS_FEATURE_INCOMPAT_64BIT)
+				free_inodes |= (u_int32_t)letoh16(
+				    gd->bgd_free_inodes_count_hi) << 16;
+			if (free_inodes > best_free) {
+				best_free = free_inodes;
+				best = i;
+			}
+		}
+		group = best;
+	} else
+		group = (pip->i_number - 1) / fs->m_inodes_per_group;
+	if (group >= ngroups)
+		return (EINVAL);
+
+	bitmap = malloc(fs->m_block_size, M_UFSMNT, M_WAITOK);
+	saved_bitmap = malloc(fs->m_block_size, M_UFSMNT, M_WAITOK);
+	bp = NULL;
+	error = ENOSPC;
+	for (i = 0; i < ngroups; i++) {
+		g = (group + i) % ngroups;
+		gd = &fs->m_gd[g];
+		inode_start = (u_int64_t)g * fs->m_inodes_per_group;
+		if (inode_start >= fs->m_inodes_count)
+			continue;
+		valid = fs->m_inodes_count - inode_start;
+		if (valid > fs->m_inodes_per_group)
+			valid = fs->m_inodes_per_group;
+		free_inodes = letoh16(gd->bgd_free_inodes_count_lo);
+		if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+			free_inodes |= (u_int32_t)letoh16(
+			    gd->bgd_free_inodes_count_hi) << 16;
+		if (free_inodes == 0)
+			continue;
+		if (free_inodes > valid ||
+		    free_inodes > fs->m_free_inodes_count) {
+			error = EIO;
+			goto out;
+		}
+
+		bitmap_blk = ext4fs_bgd_get_block(fs, gd,
+		    EXT4FS_BGD_INODE_BITMAP);
+		if (bitmap_blk < fs->m_first_data_block ||
+		    bitmap_blk >= fs->m_blocks_count) {
+			error = EIO;
+			goto out;
+		}
+		error = ext4fs_journal_get_metadata(handle, pip->i_devvp,
+		    bitmap_blk, &bp);
+		if (error)
+			goto out;
+		uninit = letoh16(gd->bgd_flags) &
+		    EXT4FS_BGD_FLAG_INODE_UNINIT;
+		if (uninit) {
+			memset(bitmap, 0, fs->m_block_size);
+			for (pbit = valid; pbit < fs->m_block_size * NBBY;
+			    pbit++)
+				setbit(bitmap, pbit);
+			for (pbit = 0; pbit < valid &&
+			    inode_start + pbit + 1 <
+			    fs->m_first_non_reserved_inode; pbit++)
+				setbit(bitmap, pbit);
+			scan = bitmap;
+		} else {
+			error = ext4fs_inode_bitmap_csum_verify(fs, g, gd,
+			    bp->b_data);
+			if (error)
+				goto out;
+			scan = bp->b_data;
+		}
+
+		free_bits = 0;
+		ino_in_group = valid;
+		for (pbit = 0; pbit < valid; pbit++) {
+			if (isclr(scan, pbit)) {
+				if (ino_in_group == valid)
+					ino_in_group = pbit;
+				free_bits++;
+			}
+		}
+		if (free_bits != free_inodes || ino_in_group == valid) {
+			error = EIO;
+			goto out;
+		}
+		ino = inode_start + ino_in_group + 1;
+		if (ino < fs->m_first_non_reserved_inode) {
+			error = EIO;
+			goto out;
+		}
+
+		memcpy(saved_bitmap, bp->b_data, fs->m_block_size);
+		saved_gd = *gd;
+		saved_sb = fs->m_sble;
+		saved_free_inodes = fs->m_free_inodes_count;
+		saved_modified = fs->m_fs_was_modified;
+		transaction_dirty = 0;
+		if (uninit)
+			memcpy(bp->b_data, bitmap, fs->m_block_size);
+		setbit((u_int8_t *)bp->b_data, ino_in_group);
+
+		/*
+		 * Load the vnode while the old unused-table boundary still makes
+		 * VFS_VGET return a zeroed in-memory inode.  It must not write the
+		 * unused inode-table slot outside this transaction.
+		 */
+		error = VFS_VGET(pvp->v_mount, ino, vpp);
+		if (error) {
+			memcpy(bp->b_data, saved_bitmap, fs->m_block_size);
+			goto out;
+		}
+
+		if (uninit)
+			gd->bgd_flags = htole16(letoh16(gd->bgd_flags) &
+			    ~EXT4FS_BGD_FLAG_INODE_UNINIT);
+		bitmap_csum = ext4fs_bitmap_csum(fs, g, bp->b_data,
+		    howmany(fs->m_inodes_per_group, NBBY));
+		gd->bgd_inode_bitmap_checksum_lo =
+		    htole16(bitmap_csum & 0xffff);
+		if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+			gd->bgd_inode_bitmap_checksum_hi =
+			    htole16(bitmap_csum >> 16);
+		free_inodes--;
+		gd->bgd_free_inodes_count_lo =
+		    htole16(free_inodes & 0xffff);
+		if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+			gd->bgd_free_inodes_count_hi = htole16(free_inodes >> 16);
+		dirs = letoh16(gd->bgd_used_dirs_count_lo);
+		if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+			dirs |= (u_int32_t)letoh16(
+			    gd->bgd_used_dirs_count_hi) << 16;
+		if ((mode & S_IFMT) == S_IFDIR) {
+			if (dirs == UINT32_MAX) {
+				error = EIO;
+				goto restore;
+			}
+			dirs++;
+			gd->bgd_used_dirs_count_lo = htole16(dirs & 0xffff);
+			if (fs->m_feature_incompat &
+			    EXT4FS_FEATURE_INCOMPAT_64BIT)
+				gd->bgd_used_dirs_count_hi = htole16(dirs >> 16);
+		}
+		itu = letoh16(gd->bgd_inode_table_unused_lo);
+		if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+			itu |= (u_int32_t)letoh16(
+			    gd->bgd_inode_table_unused_hi) << 16;
+		if (itu > fs->m_inodes_per_group) {
+			error = EIO;
+			goto restore;
+		}
+		first_unused = fs->m_inodes_per_group - itu;
+		if (ino_in_group >= first_unused) {
+			itu = fs->m_inodes_per_group - ino_in_group - 1;
+			gd->bgd_inode_table_unused_lo = htole16(itu & 0xffff);
+			if (fs->m_feature_incompat &
+			    EXT4FS_FEATURE_INCOMPAT_64BIT)
+				gd->bgd_inode_table_unused_hi = htole16(itu >> 16);
+		}
+		fs->m_free_inodes_count--;
+		fs->m_fs_was_modified = 1;
+
+		error = ext4fs_journal_dirty_metadata(handle, bp);
+		if (error)
+			goto restore;
+		transaction_dirty = 1;
+		error = ext4fs_bgd_write_handle(fs, pip->i_devvp, g, handle);
+		if (error)
+			goto restore;
+		error = ext4fs_sbwrite_handle(pvp->v_mount, handle);
+		if (error)
+			goto restore;
+
+		ip = VTOI(*vpp);
+		memset(ip->i_e4din, 0, sizeof(struct ext4fs_dinode_256));
+		ip->i_e4din->dinode.i_extent_header.eh_magic =
+		    htole16(EXT4FS_EXTENT_HEADER_MAGIC);
+		ip->i_e4din->dinode.i_extent_header.eh_max = htole16(4);
+		ip->i_e4din->dinode.i_flags =
+		    htole32(EXTFS_INODE_FLAG_EXTENTS);
+		ip->i_e4din->dinode.i_extra_isize =
+		    htole16(sizeof(struct ext4fs_dinode) - 128);
+		if (++ext4fs_gennumber < (u_long)gettime())
+			ext4fs_gennumber = gettime();
+		ip->i_e4din->dinode.i_nfs_generation =
+		    htole32(ext4fs_gennumber);
+		error = 0;
+		goto out;
+
+restore:
+		memcpy(bp->b_data, saved_bitmap, fs->m_block_size);
+		*gd = saved_gd;
+		fs->m_sble = saved_sb;
+		fs->m_free_inodes_count = saved_free_inodes;
+		fs->m_fs_was_modified = saved_modified;
+		if (transaction_dirty)
+			ext4fs_journal_abort(pvp->v_mount, error);
+		if (*vpp != NULL) {
+			ip = VTOI(*vpp);
+			ip->i_e4din->dinode.i_mode = htole16(0);
+			ip->i_e4din->dinode.i_links_count = htole16(0);
+			ip->i_e4din->dinode.i_dtime = htole32(1);
+			ip->i_effnlink = 0;
+			(*vpp)->v_type = VNON;
+			vput(*vpp);
+			*vpp = NULL;
+		}
+		goto out;
+	}
+
+out:
+	free(saved_bitmap, M_UFSMNT, fs->m_block_size);
+	free(bitmap, M_UFSMNT, fs->m_block_size);
+	return (error);
+}
+
+int
 ext4fs_inode_bitmap_csum_verify (struct m_ext4fs *fs, u_int32_t group,
     struct ext4fs_block_group_descriptor *gd, const void *bitmap)
 {
@@ -1539,6 +1789,55 @@ ext4fs_unmount (struct mount *mp, int mntflags, struct proc *p)
 }
 
 int
+ext4fs_vinit (struct mount *mp, struct vnode **vpp)
+{
+	struct inode *ip;
+	struct vnode *nvp, *vp;
+	dev_t rdev;
+
+	vp = *vpp;
+	ip = VTOI(vp);
+	vp->v_type = IFTOVT(letoh16(ip->i_e4din->dinode.i_mode));
+
+	switch (vp->v_type) {
+	case VCHR:
+	case VBLK:
+		vp->v_op = &ext4fs_specvops;
+		rdev = letoh32(ip->i_e4din->dinode.i_block[0]);
+		if (rdev == 0)
+			rdev = letoh32(ip->i_e4din->dinode.i_block[1]);
+		nvp = checkalias(vp, rdev, mp);
+		if (nvp != NULL) {
+			nvp->v_data = vp->v_data;
+			vp->v_data = NULL;
+			vp->v_op = &spec_vops;
+#ifdef VFSLCKDEBUG
+			vp->v_flag &= ~VLOCKSWORK;
+#endif
+			vrele(vp);
+			vgone(vp);
+			vp = nvp;
+			ip->i_vnode = vp;
+		}
+		break;
+	case VFIFO:
+#ifdef FIFO
+		vp->v_op = &ext4fs_fifovops;
+		break;
+#else
+		return (EOPNOTSUPP);
+#endif
+	default:
+		break;
+	}
+
+	if (ip->i_number == EXT4FS_INODE_ROOT_DIR)
+		vp->v_flag |= VROOT;
+	*vpp = vp;
+	return (0);
+}
+
+int
 ext4fs_vget (struct mount *mp, ino_t ino, struct vnode **vpp)
 {
 	struct m_ext4fs *fs;
@@ -1553,7 +1852,7 @@ ext4fs_vget (struct mount *mp, ino_t ino, struct vnode **vpp)
 	u_int64_t inode_table_block;
 	u_int32_t inode_group, inode_index, block_in_table, offset_in_block;
 	u_int32_t itable_unused;
-	u_int16_t bgd_flags, imode;
+	u_int16_t bgd_flags;
 	int error;
 
 	if (ino > (ufsino_t)-1)
@@ -1658,15 +1957,7 @@ ext4fs_vget (struct mount *mp, ino_t ino, struct vnode **vpp)
 		    letoh16(gd->bgd_inode_table_unused_hi) << 16;
 	if ((bgd_flags & EXT4FS_BGD_FLAG_INODE_UNINIT) ||
 	    inode_index >= fs->m_inodes_per_group - itable_unused) {
-		memset(dp, 0, fs->m_inode_size);
-		error = bwrite(bp);
-		if (error) {
-			pool_put(&ext4fs_dinode_pool, ip->i_e4din);
-			ip->i_e4din = NULL;
-			vput(vp);
-			*vpp = NULL;
-			return (error);
-		}
+		brelse(bp);
 	} else {
 		memcpy(ip->i_e4din, dp, fs->m_inode_size);
 		brelse(bp);
@@ -1688,46 +1979,20 @@ ext4fs_vget (struct mount *mp, ino_t ino, struct vnode **vpp)
 		}
 	}
 
-	/* Set vnode type based on inode mode */
-	imode = letoh16(ip->i_e4din->dinode.i_mode);
-	switch (imode & S_IFMT) {
-	case S_IFDIR:
-		vp->v_type = VDIR;
-		break;
-	case S_IFREG:
-		vp->v_type = VREG;
-		break;
-	case S_IFLNK:
-		vp->v_type = VLNK;
-		break;
-	case S_IFBLK:
-		vp->v_type = VBLK;
-		break;
-	case S_IFCHR:
-		vp->v_type = VCHR;
-		break;
-	case S_IFIFO:
-		vp->v_type = VFIFO;
-		break;
-	case S_IFSOCK:
-		vp->v_type = VSOCK;
-		break;
-	default:
-		vp->v_type = VNON;
-		break;
-	}
-
 	/* Set effective link count */
 	ip->i_effnlink = letoh16(ip->i_e4din->dinode.i_links_count);
-
-	/* Set VROOT flag for root inode */
-	if (ip->i_number == EXT4FS_INODE_ROOT_DIR)
-		vp->v_flag |= VROOT;
 
 	/* If the inode was deleted, reset all fields */
 	if (letoh32(ip->i_e4din->dinode.i_dtime) != 0) {
 		vp->v_type = VNON;
 		ip->i_effnlink = 0;
+	} else {
+		error = ext4fs_vinit(mp, &vp);
+		if (error) {
+			vput(vp);
+			*vpp = NULL;
+			return (error);
+		}
 	}
 
 	*vpp = vp;

@@ -19,6 +19,7 @@ EXT4FSOPS=${EXT4FSOPS:-./ext4fsops}
 EXT4FS_TIMEOUT=${EXT4FS_TIMEOUT:-60}
 EXT4FS_IMAGE_MB=${EXT4FS_IMAGE_MB:-128}
 EXT4FS_BLOCK_SIZES=${EXT4FS_BLOCK_SIZES:-"1024 2048 4096"}
+EXT4FSOPS_MODE=${EXT4FSOPS_MODE:-full}
 
 for tool in "$MKE2FS" "$E2FSCK" "$DEBUGFS" "$DUMPE2FS" \
     "$VNCONFIG" "$MOUNT_EXT4FS" \
@@ -194,48 +195,12 @@ xattr_block()
 	'
 }
 
-inode_type()
-{
-	inode_path=$1
-	"$DEBUGFS" -R "stat $inode_path" "$image" 2>/dev/null | awk '
-	    $1 == "Inode:" {
-		for (i = 1; i <= NF; i++) {
-			if ($i != "Type:")
-				continue
-			type = $(i + 1)
-			for (j = i + 2; j <= NF && $j != "Mode:"; j++)
-				type = type " " $j
-			print type
-			exit
-		}
-	    }
-	'
-}
-
-check_inode_type()
-{
-	inode_path=$1
-	expected_type=$2
-	actual_type=$(inode_type "$inode_path")
-	[ "$actual_type" = "$expected_type" ] ||
-	    fail "$inode_path has type '${actual_type:-missing}', expected $expected_type"
-}
-
-prepare_unlink_fixture()
+prepare_xattr_fixture()
 {
 	xattr_value=$case_dir/xattr.value
 	xattr_commands=$case_dir/xattr.debugfs
 	dd if=/dev/zero of="$xattr_value" bs=1 count=300 status=none
 	{
-		printf 'cd /tree\n'
-		printf 'mknod char-device c 0 0\n'
-		printf 'mknod block-device b 0 0\n'
-		printf 'set_inode_field /tree/unix-socket mode 0140600\n'
-		printf 'set_inode_field /tree/unix-socket flags 0\n'
-		printf 'ln /tree/unix-socket /tree/.unix-socket-hold\n'
-		printf 'unlink /tree/unix-socket\n'
-		printf 'ln /tree/.unix-socket-hold /tree/unix-socket\n'
-		printf 'unlink /tree/.unix-socket-hold\n'
 		printf 'ea_set -f %s /tree/xattr-unique user.regress\n' \
 		    "$xattr_value"
 		printf 'ea_set -f %s /tree/xattr-shared-a user.regress\n' \
@@ -246,7 +211,7 @@ prepare_unlink_fixture()
 	if ! "$DEBUGFS" -w -f "$xattr_commands" "$image" \
 	    >"$case_dir/debugfs-xattr.log" 2>&1; then
 		cat "$case_dir/debugfs-xattr.log" >&2
-		fail "could not create unlink fixtures"
+		fail "could not create external xattr blocks"
 	fi
 	unique_block=$(xattr_block /tree/xattr-unique)
 	shared_a_block=$(xattr_block /tree/xattr-shared-a)
@@ -282,9 +247,6 @@ prepare_unlink_fixture()
 	    fail "shared xattr fixture does not share its block"
 	[ "$(xattr_block /tree/xattr-unique)" -eq "$unique_block" ] ||
 	    fail "shared xattr preparation changed the unique block"
-	check_inode_type /tree/char-device "character special"
-	check_inode_type /tree/block-device "block special"
-	check_inode_type /tree/unix-socket socket
 	check_image xattr-fixture
 }
 
@@ -335,7 +297,7 @@ run_case()
 	unmount_image create
 	detach_image
 	check_image create
-	prepare_unlink_fixture
+	prepare_xattr_fixture
 	attach_image
 	mount_image ""
 	run_step create-growdir
@@ -464,6 +426,52 @@ run_flex_uninit_case()
 	check_image allocation-probe-remount
 	echo " ok"
 }
+
+run_special_case()
+{
+	case_dir=$work/special-inodes
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	test_name="special-inode lookup and removal"
+	print_test_name "$test_name"
+
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b 1024 \
+	    -O 'metadata_csum,^orphan_file' "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs failed"
+	fi
+
+	attach_image
+	mount_image ""
+	run_step create-special "$mountpoint/special"
+	unmount_image special-create
+	detach_image
+	check_image special-create
+
+	attach_image
+	mount_image ""
+	run_step verify-special "$mountpoint/special"
+	run_step remove-special "$mountpoint/special"
+	unmount_image special-remove
+	detach_image
+	check_image special-remove
+	echo " ok"
+}
+
+case "$EXT4FSOPS_MODE" in
+special)
+	run_special_case
+	exit 0
+	;;
+full) ;;
+*)
+	echo "unsupported ext4fsops mode: $EXT4FSOPS_MODE" >&2
+	exit 1
+	;;
+esac
 
 for block_size in $EXT4FS_BLOCK_SIZES; do
 	case "$block_size" in

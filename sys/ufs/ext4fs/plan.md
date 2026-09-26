@@ -11,14 +11,15 @@ concurrency can be added after recovery and crash consistency are proven.
 
 The tree contains mount-time and `fsck_ext4fs` JBD2 recovery using a bounded,
 three-pass scan, revoke, and replay flow.  It also contains a serialized
-runtime core and an ordered on-disk commit/checkpoint writer.  Runtime
-filesystem operations do not use journal handles yet, however; metadata
-buffers still reach their home locations directly through `bwrite()`,
-`bdwrite()`, and `bawrite()`.
+runtime core and an ordered on-disk commit/checkpoint writer.  Runtime journal
+handles now cover inode updates, regular-file extent allocation/free and
+truncate, hard links, unlink/orphan retirement, create, and mknod.  Remaining
+namespace and metadata paths must still be converted before direct metadata
+writes can be retired.
 
 Recovery hardening and its production-kernel regression gate are complete.
-The Phase 3 writer is implemented but cannot be considered activated or
-production-tested until the first Phase 4 metadata path uses it.
+The Phase 3 writer is activated and production-tested by the converted Phase 4
+metadata paths.
 
 ### Phase 1 implementation status (2026-09-23)
 
@@ -170,10 +171,9 @@ reservation, owned metadata buffers, ordered-data dependencies, revoke
 tracking, journal-block exclusion, and a sticky abort error.  Mount failure
 and unmount paths tear this state down.
 
-No live metadata writer uses these handles yet.  Phase 3 now supplies the
-ordered on-disk writer used by `ext4fs_journal_force_commit()`, but normal
-filesystem operations will not generate runtime transactions until Phase 4
-converts their metadata writes.
+Phase 3 supplies the ordered on-disk writer used by
+`ext4fs_journal_force_commit()`.  Converted Phase 4 metadata paths now use the
+runtime handles and generate transactions through this writer.
 
 On 2026-09-24, the root-only journal mount suite passed in full against the
 rebuilt and booted production `GENERIC.MP` kernel.  This exercised runtime
@@ -268,10 +268,9 @@ non-root journal recovery and journal-core regression suites pass.
 On 2026-09-24, the root-only `run-regress-journal-mount` suite also passed in
 full against the rebuilt and booted production kernel.  This revalidates the
 kernel recovery matrix, runtime initialization, clean teardown, and the new
-incomplete-tail recovery rules without a test-only kernel configuration.  The
-final Phase 3 item remains open because no production metadata path invokes
-the writer yet; activation and writer-specific production-kernel tests begin
-with Phase 4.
+incomplete-tail recovery rules without a test-only kernel configuration.
+Phase 4 subsequently activated the writer through production metadata paths;
+the production-kernel runtime regressions now cover those transactions.
 
 ## Pre-Phase 4 ext4fs audit and baseline tests (2026-09-24)
 
@@ -546,13 +545,39 @@ classic-orphan filesystems and the 1 KiB orphan-file filesystem, including
 remount and offline `e2fsck -fn` validation.  The FLEX_BG/BLOCK_UNINIT case also
 passed, so the overall unlink checklist item is complete.
 
+The `create` and `mknod` conversion is complete.  A handle-aware inode
+allocator now validates initialized inode bitmaps and their free counts, safely
+constructs uninitialized inode bitmaps, and journals the selected bitmap,
+block-group descriptor, free-inode counters, and superblock.  The new
+inode-table entry, parent directory block and checksum, parent inode, and any
+directory-growth allocation or extent metadata are committed in the same
+transaction.  Unused inode-table slots are no longer zeroed by an
+out-of-transaction `bwrite()` in `VFS_VGET`.  Character and block device
+numbers, FIFOs, and sockets are fully initialized before the namespace entry
+becomes durable.  The ordinary-operation regression now creates those special
+inodes through the kernel, checks exact inode/block accounting and nonzero
+device numbers, and retains offline debugfs only for the shared-xattr fixture.
+
+The first production-kernel special-inode lookup exposed a null dereference:
+`ext4fs_vget()` assigned through `v_rdev` before `v_specinfo` existed.  Device
+vnodes now follow the native BSD `checkalias()` initialization path and use
+ext4fs special-device operations; FIFO vnodes use the corresponding FIFO
+operations and reclaim wrapper.  A focused `run-regress-ext4fsops-special`
+target exercises create, remount/lookup, type and device-number validation,
+unlink, remount, and offline `e2fsck` without running the full operations
+matrix.  On 2026-09-27, the fixed booted production kernel passed the complete
+ordinary-operation matrix for 1 KiB, 2 KiB, and 4 KiB filesystems, the 1 KiB
+orphan-file case, and FLEX_BG/BLOCK_UNINIT allocation.  This covers the
+remounted special-inode lookup which previously faulted, so the runtime gate is
+complete.
+
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only for
 regular-file data, the journal's own I/O, recovery, checkpointing, or another
 explicitly documented exception.
 
 Wrap each compound namespace operation in one transaction:
 
-- [ ] create and mknod;
+- [x] create and mknod;
 - [x] link;
 - [x] unlink;
 - [ ] mkdir and rmdir;

@@ -656,6 +656,8 @@ void ext4fs_blkfree (struct inode *, u_int64_t);
 /* Inode allocation / free */
 int ext4fs_inode_alloc (struct inode *, mode_t, struct ucred *,
 	struct vnode **);
+int ext4fs_inode_alloc_handle (struct inode *, mode_t,
+	struct ext4fs_journal_handle *, struct vnode **);
 int ext4fs_inode_bitmap_csum_verify (struct m_ext4fs *, u_int32_t,
 	struct ext4fs_block_group_descriptor *, const void *);
 int ext4fs_inode_free_handle (struct inode *, ufsino_t, mode_t,

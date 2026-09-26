@@ -16,5 +16,14 @@
 #include <sys/vnode.h>
 
 extern const struct vops ext4fs_vops;
+extern const struct vops ext4fs_specvops;
+#ifdef FIFO
+extern const struct vops ext4fs_fifovops;
+#endif
+
+int	ext4fs_vinit (struct mount *, struct vnode **);
+#ifdef FIFO
+int	ext4fsfifo_reclaim (void *);
+#endif
 
 #define IS_EXT4_VNODE(vp)   ((vp)->v_tag == VT_EXT4FS)

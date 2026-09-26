@@ -16,8 +16,10 @@
 
 #include <sys/types.h>
 #include <sys/mount.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/un.h>
 
 #include <dirent.h>
 #include <err.h>
@@ -70,6 +72,10 @@ static void	check_link_growth_tree (int);
 static void	check_grow_directory (const char *, int);
 static void	fsync_path (const char *);
 static void	expect_ro_failure (const char *, int);
+static void	create_unix_socket (const char *);
+static void	create_special_files (void);
+static void	verify_special_files (void);
+static void	remove_special_files (void);
 static void	create_grow_directory (void);
 static void	create_filesystem_tree (void);
 static void	verify_created_tree (void);
@@ -596,6 +602,116 @@ expect_ro_failure (const char *operation, int result)
 }
 
 static void
+create_unix_socket (const char *path)
+{
+	struct sockaddr_un sun;
+	int fd;
+
+	fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd == -1)
+		err(1, "socket");
+	memset(&sun, 0, sizeof(sun));
+	sun.sun_len = sizeof(sun);
+	sun.sun_family = AF_UNIX;
+	if (strlcpy(sun.sun_path, path, sizeof(sun.sun_path)) >=
+	    sizeof(sun.sun_path))
+		errx(1, "UNIX socket path too long: %s", path);
+	if (bind(fd, (struct sockaddr *)&sun, sizeof(sun)) == -1)
+		err(1, "bind %s", path);
+	if (close(fd) == -1)
+		err(1, "close UNIX socket");
+}
+
+static void
+create_special_files (void)
+{
+	struct statfs before, after;
+	char path[PATH_MAX];
+
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before special-file creation");
+	make_path(path, sizeof(path), "char-device");
+	if (mknod(path, S_IFCHR | 0600, makedev(1, 7)) == -1)
+		err(1, "mknod %s", path);
+	make_path(path, sizeof(path), "block-device");
+	if (mknod(path, S_IFBLK | 0600, makedev(2, 3)) == -1)
+		err(1, "mknod %s", path);
+	make_path(path, sizeof(path), "fifo");
+	if (mkfifo(path, 0600) == -1)
+		err(1, "mkfifo %s", path);
+	make_path(path, sizeof(path), "unix-socket");
+	create_unix_socket(path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after special-file creation");
+	if (after.f_ffree != before.f_ffree - 4)
+		errx(1, "special-file creation did not allocate four inodes");
+	if (after.f_bfree != before.f_bfree)
+		errx(1, "blockless special-file creation allocated a block");
+	fsync_path(root);
+}
+
+static void
+verify_special_files (void)
+{
+	struct stat st;
+	char path[PATH_MAX];
+
+	make_path(path, sizeof(path), "fifo");
+	if (lstat(path, &st) == -1)
+		err(1, "lstat %s", path);
+	if (!S_ISFIFO(st.st_mode))
+		errx(1, "%s is not a fifo", path);
+	make_path(path, sizeof(path), "char-device");
+	if (lstat(path, &st) == -1)
+		err(1, "lstat %s", path);
+	if (!S_ISCHR(st.st_mode))
+		errx(1, "%s is not a character device", path);
+	if (st.st_rdev != makedev(1, 7))
+		errx(1, "%s has wrong device number", path);
+	make_path(path, sizeof(path), "block-device");
+	if (lstat(path, &st) == -1)
+		err(1, "lstat %s", path);
+	if (!S_ISBLK(st.st_mode))
+		errx(1, "%s is not a block device", path);
+	if (st.st_rdev != makedev(2, 3))
+		errx(1, "%s has wrong device number", path);
+	make_path(path, sizeof(path), "unix-socket");
+	if (lstat(path, &st) == -1)
+		err(1, "lstat %s", path);
+	if (!S_ISSOCK(st.st_mode))
+		errx(1, "%s is not a socket", path);
+}
+
+static void
+remove_special_files (void)
+{
+	struct statfs before, after;
+	char path[PATH_MAX];
+	const char *names[] = {
+		"char-device",
+		"block-device",
+		"fifo",
+		"unix-socket",
+	};
+	size_t i;
+
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before special-file removal");
+	for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		make_path(path, sizeof(path), names[i]);
+		if (unlink(path) == -1)
+			err(1, "unlink %s", path);
+	}
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after special-file removal");
+	if (after.f_ffree != before.f_ffree + 4)
+		errx(1, "special-file removal did not free four inodes");
+	if (after.f_bfree != before.f_bfree)
+		errx(1, "blockless special-file removal freed a block");
+	fsync_path(root);
+}
+
+static void
 create_grow_directory (void)
 {
 	char path[PATH_MAX];
@@ -704,9 +820,7 @@ create_filesystem_tree (void)
 
 	make_path(path, sizeof(path), "empty");
 	write_text_file(path, "");
-	make_path(path, sizeof(path), "fifo");
-	if (mkfifo(path, 0600) == -1)
-		err(1, "mkfifo %s", path);
+	create_special_files();
 	make_path(path, sizeof(path), "fast-link");
 	if (symlink("data", path) == -1)
 		err(1, "symlink %s", path);
@@ -715,8 +829,6 @@ create_filesystem_tree (void)
 	make_path(path, sizeof(path), "slow-link");
 	if (symlink(slow_target, path) == -1)
 		err(1, "symlink %s", path);
-	make_path(path, sizeof(path), "unix-socket");
-	write_text_file(path, "");
 	make_path(path, sizeof(path), "xattr-unique");
 	write_text_file(path, "");
 	make_path(path, sizeof(path), "xattr-shared-a");
@@ -746,7 +858,7 @@ create_filesystem_tree (void)
 static void
 verify_created_tree (void)
 {
-	struct stat first, second, st;
+	struct stat first, second;
 	char path[PATH_MAX], other[PATH_MAX], longname[256];
 	char slow_target[97];
 
@@ -785,32 +897,13 @@ verify_created_tree (void)
 	make_path(path, sizeof(path), "empty");
 	check_regular(path);
 
-	make_path(path, sizeof(path), "fifo");
-	if (lstat(path, &st) == -1)
-		err(1, "lstat %s", path);
-	if (!S_ISFIFO(st.st_mode))
-		errx(1, "%s is not a fifo", path);
+	verify_special_files();
 	make_path(path, sizeof(path), "fast-link");
 	check_symlink(path, "data");
 	memset(slow_target, 's', sizeof(slow_target) - 1);
 	slow_target[sizeof(slow_target) - 1] = '\0';
 	make_path(path, sizeof(path), "slow-link");
 	check_symlink(path, slow_target);
-	make_path(path, sizeof(path), "char-device");
-	if (lstat(path, &st) == -1)
-		err(1, "lstat %s", path);
-	if (!S_ISCHR(st.st_mode))
-		errx(1, "%s is not a character device", path);
-	make_path(path, sizeof(path), "block-device");
-	if (lstat(path, &st) == -1)
-		err(1, "lstat %s", path);
-	if (!S_ISBLK(st.st_mode))
-		errx(1, "%s is not a block device", path);
-	make_path(path, sizeof(path), "unix-socket");
-	if (lstat(path, &st) == -1)
-		err(1, "lstat %s", path);
-	if (!S_ISSOCK(st.st_mode))
-		errx(1, "%s is not a socket", path);
 	make_path(path, sizeof(path), "xattr-unique");
 	check_regular(path);
 	make_path(path, sizeof(path), "xattr-shared-a");
@@ -1286,6 +1379,14 @@ main (int argc, char **argv)
 			err(1, "rmdir %s", root);
 		block_size = (size_t)sfs.f_bsize;
 		create_filesystem_tree();
+	} else if (strcmp(argv[1], "create-special") == 0) {
+		block_size = 0;
+		if (mkdir(root, 0755) == -1)
+			err(1, "mkdir %s", root);
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs %s", root);
+		block_size = (size_t)sfs.f_bsize;
+		create_special_files();
 	} else {
 		if (statfs(root, &sfs) == -1)
 			err(1, "statfs %s", root);
@@ -1304,6 +1405,10 @@ main (int argc, char **argv)
 			create_allocation_probe();
 		else if (strcmp(argv[1], "verify-allocation-probe") == 0)
 			verify_allocation_probe();
+		else if (strcmp(argv[1], "verify-special") == 0)
+			verify_special_files();
+		else if (strcmp(argv[1], "remove-special") == 0)
+			remove_special_files();
 		else
 			errx(1, "unknown mode: %s", argv[1]);
 	}

@@ -55,6 +55,8 @@
 #include <sys/resourcevar.h>
 #include <sys/signalvar.h>
 
+#include <miscfs/fifofs/fifo.h>
+
 #include <ufs/ufs/quota.h>
 #include <ufs/ufs/inode.h>
 #include <ufs/ufs/dir.h>
@@ -62,6 +64,7 @@
 #include <ufs/ufs/ufs_extern.h>
 
 #include <ufs/ext4fs/ext4fs.h>
+#include <ufs/ext4fs/ext4fs_extern.h>
 #include <ufs/ext4fs/ext4fs_journal.h>
 #include <ufs/ext4fs/ext4fs_orphan.h>
 
@@ -3189,6 +3192,86 @@ const struct vops ext4fs_vops = {
 	.vop_bwrite	= vop_generic_bwrite,
 };
 
+const struct vops ext4fs_specvops = {
+	.vop_close	= ufsspec_close,
+	.vop_access	= ext4fs_access,
+	.vop_getattr	= ext4fs_getattr,
+	.vop_setattr	= ext4fs_setattr,
+	.vop_read	= ufsspec_read,
+	.vop_write	= ufsspec_write,
+	.vop_fsync	= ext4fs_fsync,
+	.vop_inactive	= ext4fs_inactive,
+	.vop_reclaim	= ext4fs_reclaim,
+	.vop_lock	= ufs_lock,
+	.vop_unlock	= ufs_unlock,
+	.vop_print	= ext4fs_print,
+	.vop_islocked	= ufs_islocked,
+
+	/* Keep in sync with spec_vops. */
+	.vop_lookup	= vop_generic_lookup,
+	.vop_create	= vop_generic_badop,
+	.vop_mknod	= vop_generic_badop,
+	.vop_open	= spec_open,
+	.vop_ioctl	= spec_ioctl,
+	.vop_kqfilter	= spec_kqfilter,
+	.vop_revoke	= vop_generic_revoke,
+	.vop_remove	= vop_generic_badop,
+	.vop_link	= vop_generic_badop,
+	.vop_rename	= vop_generic_badop,
+	.vop_mkdir	= vop_generic_badop,
+	.vop_rmdir	= vop_generic_badop,
+	.vop_symlink	= vop_generic_badop,
+	.vop_readdir	= vop_generic_badop,
+	.vop_readlink	= vop_generic_badop,
+	.vop_abortop	= vop_generic_badop,
+	.vop_bmap	= vop_generic_bmap,
+	.vop_strategy	= spec_strategy,
+	.vop_pathconf	= spec_pathconf,
+	.vop_advlock	= spec_advlock,
+	.vop_bwrite	= vop_generic_bwrite,
+};
+
+#ifdef FIFO
+const struct vops ext4fs_fifovops = {
+	.vop_close	= ufsfifo_close,
+	.vop_access	= ext4fs_access,
+	.vop_getattr	= ext4fs_getattr,
+	.vop_setattr	= ext4fs_setattr,
+	.vop_read	= ufsfifo_read,
+	.vop_write	= ufsfifo_write,
+	.vop_fsync	= ext4fs_fsync,
+	.vop_inactive	= ext4fs_inactive,
+	.vop_reclaim	= ext4fsfifo_reclaim,
+	.vop_lock	= ufs_lock,
+	.vop_unlock	= ufs_unlock,
+	.vop_print	= ext4fs_print,
+	.vop_islocked	= ufs_islocked,
+	.vop_bwrite	= vop_generic_bwrite,
+
+	/* Keep in sync with fifo_vops. */
+	.vop_lookup	= vop_generic_lookup,
+	.vop_create	= vop_generic_badop,
+	.vop_mknod	= vop_generic_badop,
+	.vop_open	= fifo_open,
+	.vop_ioctl	= fifo_ioctl,
+	.vop_kqfilter	= fifo_kqfilter,
+	.vop_revoke	= vop_generic_revoke,
+	.vop_remove	= vop_generic_badop,
+	.vop_link	= vop_generic_badop,
+	.vop_rename	= vop_generic_badop,
+	.vop_mkdir	= vop_generic_badop,
+	.vop_rmdir	= vop_generic_badop,
+	.vop_symlink	= vop_generic_badop,
+	.vop_readdir	= vop_generic_badop,
+	.vop_readlink	= vop_generic_badop,
+	.vop_abortop	= vop_generic_badop,
+	.vop_bmap	= vop_generic_bmap,
+	.vop_strategy	= vop_generic_badop,
+	.vop_pathconf	= fifo_pathconf,
+	.vop_advlock	= fifo_advlock,
+};
+#endif
+
 /* Stub implementations */
 
 int
@@ -3439,12 +3522,162 @@ found:
 	return (0);
 }
 
+static void
+ext4fs_inode_initialize (struct inode *ip, struct inode *pdir, mode_t mode,
+    struct ucred *cred, dev_t rdev)
+{
+	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
+	struct vnode *vp = ITOV(ip);
+	gid_t gid;
+	u_int32_t iflags;
+
+	din->i_uid_lo = htole16(cred->cr_uid & 0xffff);
+	din->i_uid_hi = htole16((cred->cr_uid >> 16) & 0xffff);
+	gid = letoh16(pdir->i_e4din->dinode.i_gid_lo) |
+	    ((gid_t)letoh16(pdir->i_e4din->dinode.i_gid_hi) << 16);
+	din->i_gid_lo = htole16(gid & 0xffff);
+	din->i_gid_hi = htole16((gid >> 16) & 0xffff);
+	din->i_mode = htole16(mode);
+	vp->v_type = IFTOVT(mode);
+	ip->i_effnlink = 1;
+	din->i_links_count = htole16(1);
+
+	if ((mode & ISGID) && !groupmember(gid, cred) && suser_ucred(cred))
+		din->i_mode = htole16(letoh16(din->i_mode) & ~ISGID);
+
+	switch (vp->v_type) {
+	case VBLK:
+	case VCHR:
+	case VFIFO:
+	case VSOCK:
+		memset(din->i_block, 0, sizeof(din->i_block));
+		iflags = letoh32(din->i_flags);
+		iflags &= ~EXTFS_INODE_FLAG_EXTENTS;
+		din->i_flags = htole32(iflags);
+		if ((vp->v_type == VCHR || vp->v_type == VBLK) &&
+		    rdev != VNOVAL) {
+			din->i_block[0] = htole32((u_int32_t)rdev);
+			din->i_block[1] = htole32((u_int32_t)rdev);
+		}
+		break;
+	default:
+		break;
+	}
+	ip->i_flag |= IN_ACCESS | IN_CHANGE | IN_UPDATE;
+}
+
+static int
+ext4fs_makeinode_journal (mode_t mode, dev_t rdev, struct vnode *dvp,
+    struct vnode **vpp, struct componentname *cnp)
+{
+	struct inode *ip, *pdir = VTOI(dvp);
+	struct ext4fs_dinode_256 saved_dir_inode;
+	struct ext4fs_journal_handle *handle;
+	struct vnode *tvp;
+	int changed, end_error, error, original_error, rollback_error;
+	int saved_dir_flags;
+
+	*vpp = NULL;
+	if (letoh32(pdir->i_e4din->dinode.i_flags) &
+	    EXTFS_INODE_FLAG_INDEX) {
+		pool_put(&namei_pool, cnp->cn_pnbuf);
+		return (EOPNOTSUPP);
+	}
+	memcpy(&saved_dir_inode, pdir->i_e4din, sizeof(saved_dir_inode));
+	saved_dir_flags = pdir->i_flag;
+	handle = NULL;
+	tvp = NULL;
+	changed = 0;
+	error = ext4fs_journal_begin(dvp->v_mount, 16, &handle);
+	if (error)
+		goto out;
+	error = ext4fs_inode_alloc_handle(pdir, mode, handle, &tvp);
+	if (error)
+		goto end;
+
+	ip = VTOI(tvp);
+	ext4fs_inode_initialize(ip, pdir, mode, cnp->cn_cred, rdev);
+	error = ext4fs_update_handle(ip, handle);
+	if (error)
+		goto fail;
+	error = ext4fs_direnter_handle(ip, dvp, cnp, handle, &changed);
+	if (error)
+		goto fail;
+
+	end_error = ext4fs_journal_end(handle);
+	handle = NULL;
+	if (end_error) {
+		error = end_error;
+		ext4fs_journal_abort(dvp->v_mount, error);
+		goto restore;
+	}
+	error = ext4fs_journal_force_commit(dvp->v_mount);
+	if (error) {
+		ext4fs_journal_abort(dvp->v_mount, error);
+		goto restore;
+	}
+	ip->i_flag &= ~IN_MODIFIED;
+	pdir->i_flag &= ~IN_MODIFIED;
+	if ((cnp->cn_flags & SAVESTART) == 0)
+		pool_put(&namei_pool, cnp->cn_pnbuf);
+	*vpp = tvp;
+	return (0);
+
+fail:
+	original_error = error;
+	if (!changed) {
+		memset(ip->i_e4din, 0, sizeof(struct ext4fs_dinode_256));
+		ip->i_effnlink = 0;
+		ip->i_flag = IN_CHANGE | IN_UPDATE;
+		rollback_error = ext4fs_update_handle(ip, handle);
+		if (rollback_error == 0)
+			rollback_error = ext4fs_inode_free_handle(pdir,
+			    ip->i_number, mode, handle);
+		if (rollback_error == 0) {
+			end_error = ext4fs_journal_end(handle);
+			handle = NULL;
+			if (end_error == 0)
+				end_error = ext4fs_journal_force_commit(
+				    dvp->v_mount);
+			if (end_error == 0) {
+				error = original_error;
+				goto restore;
+			}
+			error = end_error;
+		} else
+			error = rollback_error;
+	}
+	ext4fs_journal_abort(dvp->v_mount, error);
+
+end:
+	if (handle != NULL) {
+		end_error = ext4fs_journal_end(handle);
+		handle = NULL;
+		if (error == 0)
+			error = end_error;
+	}
+restore:
+	memcpy(pdir->i_e4din, &saved_dir_inode, sizeof(saved_dir_inode));
+	pdir->i_flag = saved_dir_flags;
+	if (tvp != NULL) {
+		VTOI(tvp)->i_effnlink = 0;
+		VTOI(tvp)->i_e4din->dinode.i_mode = htole16(0);
+		VTOI(tvp)->i_e4din->dinode.i_links_count = htole16(0);
+		VTOI(tvp)->i_e4din->dinode.i_dtime = htole32(1);
+		tvp->v_type = VNON;
+		vput(tvp);
+	}
+out:
+	pool_put(&namei_pool, cnp->cn_pnbuf);
+	return (error);
+}
+
 /*
  * Common code to create a new inode and enter it in a directory.
  */
 static int
-ext4fs_makeinode (int mode, struct vnode *dvp, struct vnode **vpp,
-    struct componentname *cnp)
+ext4fs_makeinode (int mode, dev_t rdev, struct vnode *dvp,
+    struct vnode **vpp, struct componentname *cnp)
 {
 	struct inode *ip, *pdir;
 	struct vnode *tvp;
@@ -3456,7 +3689,8 @@ ext4fs_makeinode (int mode, struct vnode *dvp, struct vnode **vpp,
 	*vpp = NULL;
 	if ((mode & S_IFMT) == 0)
 		mode |= S_IFREG;
-
+	if (pdir->i_e4fs->m_journal != NULL)
+		return (ext4fs_makeinode_journal(mode, rdev, dvp, vpp, cnp));
 
 	error = ext4fs_inode_alloc(pdir, mode, cnp->cn_cred, &tvp);
 	if (error) {
@@ -3466,29 +3700,11 @@ ext4fs_makeinode (int mode, struct vnode *dvp, struct vnode **vpp,
 
 	ip = VTOI(tvp);
 	din = &ip->i_e4din->dinode;
-	/* Set owner from cred and parent */
-	din->i_uid_lo = htole16(cnp->cn_cred->cr_uid & 0xFFFF);
-	din->i_uid_hi = htole16((cnp->cn_cred->cr_uid >> 16) & 0xFFFF);
-	{
-		gid_t gid = letoh16(pdir->i_e4din->dinode.i_gid_lo) |
-		    ((gid_t)letoh16(pdir->i_e4din->dinode.i_gid_hi) << 16);
-		din->i_gid_lo = htole16(gid & 0xFFFF);
-		din->i_gid_hi = htole16((gid >> 16) & 0xFFFF);
-	}
-
-	ip->i_flag |= IN_ACCESS | IN_CHANGE | IN_UPDATE;
-	din->i_mode = htole16(mode);
-	tvp->v_type = IFTOVT(mode);
-	ip->i_effnlink = 1;
-	din->i_links_count = htole16(1);
-
-	/* Clear SGID if not group member */
-	if ((mode & ISGID) &&
-	    !groupmember(letoh16(din->i_gid_lo) |
-	    ((gid_t)letoh16(din->i_gid_hi) << 16), cnp->cn_cred) &&
-	    suser_ucred(cnp->cn_cred))
-		din->i_mode = htole16(letoh16(din->i_mode) & ~ISGID);
-
+	ext4fs_inode_initialize(ip, pdir, mode, cnp->cn_cred, rdev);
+	/*
+	 * Keep the legacy journal-less write ordering until that compatibility
+	 * path is retired.
+	 */
 	/* Write inode to disk before directory entry */
 	if ((error = ext4fs_update(ip, 1)) != 0)
 		goto bad;
@@ -3517,7 +3733,7 @@ ext4fs_create (void *v)
 	struct vop_create_args *ap = v;
 	return (ext4fs_makeinode(
 	    MAKEIMODE(ap->a_vap->va_type, ap->a_vap->va_mode),
-	    ap->a_dvp, ap->a_vpp, ap->a_cnp));
+	    VNOVAL, ap->a_dvp, ap->a_vpp, ap->a_cnp));
 }
 
 int
@@ -3525,36 +3741,13 @@ ext4fs_mknod (void *v)
 {
 	struct vop_mknod_args *ap = v;
 	struct vnode **vpp = ap->a_vpp;
-	struct inode *ip;
-	struct ext4fs_dinode *din;
-	u_int32_t iflags;
 	int error;
 
 	error = ext4fs_makeinode(
 	    MAKEIMODE(ap->a_vap->va_type, ap->a_vap->va_mode),
-	    ap->a_dvp, vpp, ap->a_cnp);
+	    ap->a_vap->va_rdev, ap->a_dvp, vpp, ap->a_cnp);
 	if (error)
 		return (error);
-
-	ip = VTOI(*vpp);
-	din = &ip->i_e4din->dinode;
-
-	/* Special inodes use i_block for device data, not an extent tree. */
-	memset(din->i_block, 0, sizeof(din->i_block));
-	iflags = letoh32(din->i_flags);
-	iflags &= ~EXTFS_INODE_FLAG_EXTENTS;
-	din->i_flags = htole32(iflags);
-
-	/* Store device number */
-	if ((ap->a_vap->va_type == VCHR || ap->a_vap->va_type == VBLK) &&
-	    ap->a_vap->va_rdev != VNOVAL) {
-		/* Old format in i_block[0], new format in i_block[1] */
-		din->i_block[0] = htole32(ap->a_vap->va_rdev);
-		din->i_block[1] = htole32(ap->a_vap->va_rdev);
-	}
-
-	ip->i_flag |= IN_CHANGE | IN_UPDATE;
-	error = ext4fs_update(ip, 1);
 
 	/*
 	 * VOP_MKNOD consumes the newly allocated vnode.  Drop it from the
@@ -3631,7 +3824,12 @@ ext4fs_getattr (void *v)
 	vap->va_uid |= (uid_t)letoh16(din->dinode.i_uid_hi) << 16;
 	vap->va_gid = letoh16(din->dinode.i_gid_lo);
 	vap->va_gid |= (gid_t)letoh16(din->dinode.i_gid_hi) << 16;
-	vap->va_rdev = 0;
+	if (vp->v_type == VBLK || vp->v_type == VCHR) {
+		vap->va_rdev = letoh32(din->dinode.i_block[0]);
+		if (vap->va_rdev == 0)
+			vap->va_rdev = letoh32(din->dinode.i_block[1]);
+	} else
+		vap->va_rdev = 0;
 	vap->va_size = letoh32(din->dinode.i_size_lo);
 	vap->va_size |= (off_t)letoh32(din->dinode.i_size_hi) << 32;
 
@@ -5170,7 +5368,8 @@ ext4fs_symlink (void *v)
 	struct inode *ip;
 	int error, len;
 
-	error = ext4fs_makeinode(S_IFLNK | vap->va_mode, dvp, vpp, cnp);
+	error = ext4fs_makeinode(S_IFLNK | vap->va_mode, VNOVAL, dvp, vpp,
+	    cnp);
 	if (error) {
 		vput(dvp);
 		return (error);
@@ -5950,6 +6149,15 @@ ext4fs_reclaim (void *v)
 
 	return (0);
 }
+
+#ifdef FIFO
+int
+ext4fsfifo_reclaim (void *v)
+{
+	fifo_reclaim(v);
+	return (ext4fs_reclaim(v));
+}
+#endif
 
 int
 ext4fs_bmap (void *v)
