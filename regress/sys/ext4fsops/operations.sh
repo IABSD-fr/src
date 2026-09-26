@@ -184,20 +184,42 @@ check_image()
 run_case()
 {
 	block_size=$1
-	case_dir=$work/block-$block_size
+	orphan_format=${2:-classic}
+	case "$orphan_format" in
+	classic)
+		case_dir=$work/block-$block_size
+		features='metadata_csum,^orphan_file'
+		label="ordinary operations ($block_size byte blocks)"
+		;;
+	orphan-file)
+		case_dir=$work/orphan-file-$block_size
+		features='metadata_csum,orphan_file'
+		label="orphan-file operations ($block_size byte blocks)"
+		;;
+	*)
+		fail "unknown orphan format: $orphan_format"
+		;;
+	esac
 	image=$case_dir/ext4.img
 	mkdir "$case_dir"
 
-	test_name="${block_size}-byte blocks"
-	printf '%-44s' "kernel: ordinary operations ($block_size byte blocks)"
+	test_name="$label"
+	printf '%-52s' "kernel: $label"
 
 	dd if=/dev/zero of="$image" bs=1m count=0 \
 	    seek="$EXT4FS_IMAGE_MB" status=none
 	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
-	    -O 'metadata_csum,^orphan_file' "$image" \
+	    -O "$features" "$image" \
 	    >"$case_dir/mke2fs.log" 2>&1; then
 		cat "$case_dir/mke2fs.log" >&2
 		fail "mke2fs failed"
+	fi
+	if [ "$orphan_format" = orphan-file ]; then
+		"$DUMPE2FS" "$image" >"$case_dir/dumpe2fs.log" 2>&1 ||
+		    fail "dumpe2fs rejected the orphan-file image"
+		grep -q '^Filesystem features:.*orphan_file' \
+		    "$case_dir/dumpe2fs.log" ||
+		    fail "fixture does not enable orphan_file"
 	fi
 
 	attach_image
@@ -214,6 +236,14 @@ run_case()
 	unmount_image mutate
 	detach_image
 	check_image mutate
+	if [ "$orphan_format" = orphan-file ]; then
+		"$DUMPE2FS" "$image" >"$case_dir/dumpe2fs-after-mutate.log" \
+		    2>&1 || fail "dumpe2fs rejected the mutated orphan-file image"
+		if grep -q '^Filesystem features:.*orphan_present' \
+		    "$case_dir/dumpe2fs-after-mutate.log"; then
+			fail "clean close retained ORPHAN_PRESENT"
+		fi
+	fi
 
 	attach_image
 	mount_image ""
@@ -331,6 +361,10 @@ for block_size in $EXT4FS_BLOCK_SIZES; do
 	esac
 	run_case "$block_size"
 done
+
+case " $EXT4FS_BLOCK_SIZES " in
+*' 1024 '*) run_case 1024 orphan-file ;;
+esac
 
 case " $EXT4FS_BLOCK_SIZES " in
 *' 1024 '*) run_flex_uninit_case ;;

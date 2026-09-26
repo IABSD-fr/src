@@ -794,7 +794,7 @@ mutate_filesystem_tree (void)
 	struct timeval times[2];
 	char path[PATH_MAX], other[PATH_MAX];
 	off_t marker, overwrite;
-	int fd, i;
+	int fd, fd2, i;
 
 	/* Isolate non-final unlink from the legacy rename path below. */
 	make_path(path, sizeof(path),
@@ -887,6 +887,43 @@ mutate_filesystem_tree (void)
 		err(1, "statfs after orphan inode reuse");
 	if (orphan_during.f_ffree != orphan_before.f_ffree)
 		errx(1, "freed orphan inode was not reusable exactly once");
+
+	/* Close two unlinked files out of orphan insertion order. */
+	make_path(path, sizeof(path), "orphan-order-a");
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	make_path(other, sizeof(other), "orphan-order-b");
+	fd2 = open(other, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd2 == -1)
+		err(1, "open %s", other);
+	write_pattern_fd(fd, 0, block_size + 7, 0xd6U);
+	write_pattern_fd(fd2, 0, block_size + 11, 0xe7U);
+	if (statfs(root, &orphan_before) == -1)
+		err(1, "statfs before ordered orphan closes");
+	if (unlink(path) == -1)
+		err(1, "unlink %s", path);
+	if (unlink(other) == -1)
+		err(1, "unlink %s", other);
+	if (statfs(root, &orphan_during) == -1)
+		err(1, "statfs during ordered orphan closes");
+	if (orphan_during.f_ffree != orphan_before.f_ffree)
+		errx(1, "multiple open-file unlinks freed an inode early");
+	if (close(fd) == -1)
+		err(1, "close first inserted orphan");
+	if (statfs(root, &orphan_after) == -1)
+		err(1, "statfs after non-head orphan close");
+	if (orphan_after.f_ffree != orphan_before.f_ffree + 1)
+		errx(1, "non-head orphan close did not free exactly one inode");
+	check_pattern_fd(fd2, 0, block_size + 11, 0xe7U);
+	if (close(fd2) == -1)
+		err(1, "close second inserted orphan");
+	if (statfs(root, &orphan_after) == -1)
+		err(1, "statfs after final ordered orphan close");
+	if (orphan_after.f_ffree != orphan_before.f_ffree + 2)
+		errx(1, "ordered orphan closes did not free exactly two inodes");
+	check_absent(path);
+	check_absent(other);
 
 	make_path(path, sizeof(path), "sparse");
 	fd = open(path, O_RDWR);
@@ -1014,6 +1051,10 @@ verify_final_tree (void)
 	check_absent(path);
 	make_path(path, sizeof(path), "orphan-reuse");
 	check_text_file(path, "orphan-inode-reused");
+	make_path(path, sizeof(path), "orphan-order-a");
+	check_absent(path);
+	make_path(path, sizeof(path), "orphan-order-b");
+	check_absent(path);
 	make_path(path, sizeof(path), "temporary-directory");
 	check_absent(path);
 	make_path(path, sizeof(path), "sparse");

@@ -4278,7 +4278,7 @@ ext4fs_remove (void *v)
 	struct ext4fs_journal_handle *handle;
 	struct ext4fs saved_sb;
 	u_int64_t xattr;
-	u_int32_t saved_last_orphan;
+	u_int32_t saved_feature_ro_compat, saved_last_orphan;
 	u_int16_t depth, nlink;
 	int changed, end_error, error, saved_dir_flags, saved_effnlink;
 	int journal_final, orphan_added, orphan_locked, saved_flags;
@@ -4301,7 +4301,6 @@ ext4fs_remove (void *v)
 	    ((u_int64_t)letoh16(din->i_extended_attributes_hi) << 32);
 	depth = letoh16(din->i_extent_header.eh_depth);
 	journal_final = nlink == 1 && vp->v_type == VREG &&
-	    !(fs->m_feature_compat & EXT4FS_FEATURE_COMPAT_ORPHAN_FILE) &&
 	    (letoh32(din->i_flags) & EXTFS_INODE_FLAG_EXTENTS) &&
 	    letoh16(din->i_extent_header.eh_magic) ==
 	    EXT4FS_EXTENT_HEADER_MAGIC && depth <= 1 && xattr == 0;
@@ -4327,6 +4326,7 @@ ext4fs_remove (void *v)
 			rw_enter_write(&fs->m_runtime_orphan_lock);
 			orphan_locked = 1;
 			saved_sb = fs->m_sble;
+			saved_feature_ro_compat = fs->m_feature_ro_compat;
 			saved_last_orphan = fs->m_last_orphan;
 			saved_modified = fs->m_fs_was_modified;
 		}
@@ -4385,6 +4385,7 @@ journal_restore:
 		    sizeof(saved_dir_inode));
 		if (orphan_locked) {
 			fs->m_sble = saved_sb;
+			fs->m_feature_ro_compat = saved_feature_ro_compat;
 			fs->m_last_orphan = saved_last_orphan;
 			fs->m_fs_was_modified = saved_modified;
 		}
