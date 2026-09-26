@@ -39,6 +39,9 @@
 struct ext4fs_runtime_orphan {
 	struct inode			*ro_inode;
 	struct ext4fs_runtime_orphan	*ro_next;
+	u_int32_t			 ro_file_block;
+	u_int32_t			 ro_file_entry;
+	int				 ro_in_file;
 };
 
 struct ext4fs_orphan_extent_ctx {
@@ -66,6 +69,11 @@ static int	ext4fs_orphan_inode_read (struct m_ext4fs *, struct vnode *,
 static int	ext4fs_orphan_inode_write (struct m_ext4fs *, struct vnode *,
 		    u_int32_t, struct ext4fs_dinode_256 *);
 static int	ext4fs_orphan_recount (struct mount *, int64_t);
+static int	ext4fs_orphan_file_add_handle (struct inode *,
+		    struct ext4fs_journal_handle *);
+static int	ext4fs_orphan_file_remove_handle (struct inode *,
+		    struct ext4fs_runtime_orphan *,
+		    struct ext4fs_journal_handle *);
 
 static int
 ext4fs_orphan_flush (struct mount *mp)
@@ -264,9 +272,10 @@ ext4fs_orphan_add_handle (struct inode *ip,
 
 	if (handle == NULL || ip->i_number < fs->m_first_non_reserved_inode ||
 	    ip->i_number > fs->m_inodes_count ||
-	    (fs->m_feature_compat & EXT4FS_FEATURE_COMPAT_ORPHAN_FILE) ||
 	    letoh16(ip->i_e4din->dinode.i_links_count) != 0)
 		return (EINVAL);
+	if (fs->m_feature_compat & EXT4FS_FEATURE_COMPAT_ORPHAN_FILE)
+		return (ext4fs_orphan_file_add_handle(ip, handle));
 	next = fs->m_runtime_orphans == NULL ? 0 :
 	    fs->m_runtime_orphans->ro_inode->i_number;
 	if (fs->m_last_orphan != next)
@@ -368,10 +377,10 @@ ext4fs_orphan_retire (struct inode *ip, mode_t mode)
 	u_int64_t blocks, xattr;
 	u_int32_t group, next;
 	int changed, end_error, error, saved_flags, saved_modified;
+	u_int32_t saved_feature_ro_compat;
 	u_int32_t saved_free_inodes, saved_last_orphan;
 
-	if (fs->m_journal == NULL ||
-	    (fs->m_feature_compat & EXT4FS_FEATURE_COMPAT_ORPHAN_FILE))
+	if (fs->m_journal == NULL)
 		return (EOPNOTSUPP);
 	blocks = letoh32(ip->i_e4din->dinode.i_blocks_lo) |
 	    ((u_int64_t)letoh16(ip->i_e4din->dinode.i_blocks_hi) << 32);
@@ -403,21 +412,36 @@ ext4fs_orphan_retire (struct inode *ip, mode_t mode)
 		previous = orphan;
 	}
 	if (orphan == NULL || fs->m_runtime_orphans == NULL ||
-	    fs->m_last_orphan != fs->m_runtime_orphans->ro_inode->i_number ||
 	    letoh16(ip->i_e4din->dinode.i_links_count) != 0) {
 		error = EINVAL;
 		goto unchanged;
 	}
-	next = orphan->ro_next == NULL ? 0 :
-	    orphan->ro_next->ro_inode->i_number;
-	if (letoh32(ip->i_e4din->dinode.i_dtime) != next) {
-		error = EINVAL;
-		goto unchanged;
-	}
-	if (previous != NULL && letoh32(previous->ro_inode->i_e4din->
-	    dinode.i_dtime) != ip->i_number) {
-		error = EINVAL;
-		goto unchanged;
+	if (orphan->ro_in_file) {
+		if (!(fs->m_feature_compat &
+		    EXT4FS_FEATURE_COMPAT_ORPHAN_FILE)) {
+			error = EINVAL;
+			goto unchanged;
+		}
+	} else {
+		if ((fs->m_feature_compat &
+		    EXT4FS_FEATURE_COMPAT_ORPHAN_FILE) ||
+		    fs->m_last_orphan !=
+		    fs->m_runtime_orphans->ro_inode->i_number) {
+			error = EINVAL;
+			goto unchanged;
+		}
+		next = orphan->ro_next == NULL ? 0 :
+		    orphan->ro_next->ro_inode->i_number;
+		if (letoh32(ip->i_e4din->dinode.i_dtime) != next) {
+			error = EINVAL;
+			goto unchanged;
+		}
+		if (previous != NULL &&
+		    letoh32(previous->ro_inode->i_e4din->dinode.i_dtime) !=
+		    ip->i_number) {
+			error = EINVAL;
+			goto unchanged;
+		}
 	}
 	memcpy(&saved_inode, ip->i_e4din, sizeof(saved_inode));
 	saved_flags = ip->i_flag;
@@ -425,10 +449,17 @@ ext4fs_orphan_retire (struct inode *ip, mode_t mode)
 	saved_sb = fs->m_sble;
 	saved_free_inodes = fs->m_free_inodes_count;
 	saved_last_orphan = fs->m_last_orphan;
+	saved_feature_ro_compat = fs->m_feature_ro_compat;
 	saved_modified = fs->m_fs_was_modified;
-	pip = previous == NULL ? NULL : previous->ro_inode;
+	pip = orphan->ro_in_file || previous == NULL ? NULL :
+	    previous->ro_inode;
 
-	if (pip == NULL) {
+	if (orphan->ro_in_file) {
+		error = ext4fs_orphan_file_remove_handle(ip, orphan, handle);
+		if (error)
+			goto fail;
+		changed = 1;
+	} else if (pip == NULL) {
 		fs->m_last_orphan = next;
 		fs->m_sble.sb_last_orphan = htole32(next);
 		fs->m_fs_was_modified = 1;
@@ -496,6 +527,7 @@ restore:
 	fs->m_sble = saved_sb;
 	fs->m_free_inodes_count = saved_free_inodes;
 	fs->m_last_orphan = saved_last_orphan;
+	fs->m_feature_ro_compat = saved_feature_ro_compat;
 	fs->m_fs_was_modified = saved_modified;
 	rw_exit_write(&fs->m_runtime_orphan_lock);
 	return (error);
@@ -1638,12 +1670,26 @@ ext4fs_orphan_file_block_csum (struct m_ext4fs *fs, u_int32_t seed,
 }
 
 static int
+ext4fs_orphan_file_block_verify (struct m_ext4fs *fs, u_int32_t seed,
+    u_int64_t physical, void *data)
+{
+	struct ext4fs_orphan_block_tail *tail;
+	u_int32_t calculated;
+
+	tail = (struct ext4fs_orphan_block_tail *)
+	    ((char *)data + fs->m_block_size - sizeof(*tail));
+	calculated = ext4fs_orphan_file_block_csum(fs, seed, physical, data);
+	if (letoh32(tail->ob_magic) != EXT4FS_ORPHAN_BLOCK_TAIL_MAGIC ||
+	    letoh32(tail->ob_checksum) != calculated)
+		return (EINVAL);
+	return (0);
+}
+
+static int
 ext4fs_orphan_file_block_read (struct ext4fs_orphan_extent_ctx *ctx,
     struct ext4fs_dinode *din, u_int32_t logical, u_int32_t seed,
     u_int64_t *physicalp, struct buf **bpp)
 {
-	struct ext4fs_orphan_block_tail *tail;
-	u_int32_t calculated;
 	int error;
 
 	*bpp = NULL;
@@ -1661,17 +1707,330 @@ ext4fs_orphan_file_block_read (struct ext4fs_orphan_extent_ctx *ctx,
 		*bpp = NULL;
 		return (error);
 	}
-	tail = (struct ext4fs_orphan_block_tail *)
-	    ((char *)(*bpp)->b_data + ctx->fs->m_block_size -
-	    sizeof(*tail));
-	calculated = ext4fs_orphan_file_block_csum(ctx->fs, seed,
-	    *physicalp, (*bpp)->b_data);
-	if (letoh32(tail->ob_magic) != EXT4FS_ORPHAN_BLOCK_TAIL_MAGIC ||
-	    letoh32(tail->ob_checksum) != calculated) {
+	error = ext4fs_orphan_file_block_verify(ctx->fs, seed, *physicalp,
+	    (*bpp)->b_data);
+	if (error) {
 		brelse(*bpp);
 		*bpp = NULL;
-		return (EINVAL);
+		return (error);
 	}
+	return (0);
+}
+
+static int
+ext4fs_orphan_file_open (struct mount *mp,
+    struct ext4fs_orphan_extent_ctx *ctx, struct ext4fs_dinode_256 *odp,
+    u_int32_t *nblocksp, u_int32_t *entriesp, u_int32_t *seedp)
+{
+	struct ufsmount *ump = VFSTOUFS(mp);
+	struct m_ext4fs *fs = ump->um_e4fs;
+	struct ext4fs_dinode *odin = &odp->dinode;
+	u_int64_t size;
+	int error;
+
+	if (!(fs->m_feature_compat & EXT4FS_FEATURE_COMPAT_ORPHAN_FILE) ||
+	    fs->m_orphan_file_inode == 0)
+		return (EINVAL);
+	error = ext4fs_orphan_inode_read(fs, ump->um_devvp,
+	    fs->m_orphan_file_inode, odp);
+	if (error)
+		return (error);
+	if ((letoh16(odin->i_mode) & S_IFMT) != S_IFREG ||
+	    !(letoh32(odin->i_flags) & EXTFS_INODE_FLAG_EXTENTS))
+		return (EINVAL);
+	size = letoh32(odin->i_size_lo) |
+	    (u_int64_t)letoh32(odin->i_size_hi) << 32;
+	if (size == 0 || size % fs->m_block_size != 0 ||
+	    size / fs->m_block_size > UINT32_MAX)
+		return (EINVAL);
+	*nblocksp = size / fs->m_block_size;
+	*entriesp = (fs->m_block_size -
+	    sizeof(struct ext4fs_orphan_block_tail)) / sizeof(u_int32_t);
+	if (*entriesp == 0)
+		return (EINVAL);
+
+	memset(ctx, 0, sizeof(*ctx));
+	ctx->fs = fs;
+	ctx->devvp = ump->um_devvp;
+	ctx->ino = fs->m_orphan_file_inode;
+	ctx->generation = odin->i_nfs_generation;
+	error = ext4fs_orphan_extent_validate(ctx, odin);
+	if (error)
+		return (error);
+	*seedp = ext4fs_orphan_file_seed(fs, ctx->ino, ctx->generation);
+	return (0);
+}
+
+static struct ext4fs_runtime_orphan *
+ext4fs_orphan_runtime_find (struct m_ext4fs *fs, u_int32_t ino)
+{
+	struct ext4fs_runtime_orphan *orphan;
+
+	for (orphan = fs->m_runtime_orphans; orphan != NULL;
+	    orphan = orphan->ro_next) {
+		if (orphan->ro_inode->i_number == ino)
+			return (orphan);
+	}
+	return (NULL);
+}
+
+static u_int64_t
+ext4fs_orphan_runtime_count (struct m_ext4fs *fs)
+{
+	struct ext4fs_runtime_orphan *orphan;
+	u_int64_t count;
+
+	count = 0;
+	for (orphan = fs->m_runtime_orphans; orphan != NULL;
+	    orphan = orphan->ro_next)
+		count++;
+	return (count);
+}
+
+struct ext4fs_orphan_file_state {
+	struct ext4fs_orphan_extent_ctx	 ofs_ctx;
+	struct ext4fs_dinode_256	 ofs_dinode;
+	u_int64_t			 ofs_occupied;
+	u_int32_t			 ofs_nblocks;
+	u_int32_t			 ofs_entries;
+	u_int32_t			 ofs_seed;
+	u_int32_t			 ofs_free_block;
+	u_int32_t			 ofs_free_entry;
+};
+
+static int
+ext4fs_orphan_file_runtime_scan (struct mount *mp,
+    struct ext4fs_orphan_file_state *state)
+{
+	struct ufsmount *ump = VFSTOUFS(mp);
+	struct m_ext4fs *fs = ump->um_e4fs;
+	struct ext4fs_runtime_orphan *tracked;
+	struct ext4fs_dinode_256 dp;
+	struct ext4fs_dinode *odin = &state->ofs_dinode.dinode;
+	struct buf *bp;
+	u_int64_t physical, runtime_count;
+	u_int32_t block, entry, ino;
+	int error;
+
+	memset(state, 0, sizeof(*state));
+	state->ofs_free_block = UINT32_MAX;
+	error = ext4fs_orphan_file_open(mp, &state->ofs_ctx,
+	    &state->ofs_dinode, &state->ofs_nblocks, &state->ofs_entries,
+	    &state->ofs_seed);
+	if (error)
+		return (error);
+	runtime_count = ext4fs_orphan_runtime_count(fs);
+	for (block = 0; block < state->ofs_nblocks; block++) {
+		error = ext4fs_orphan_file_block_read(&state->ofs_ctx, odin,
+		    block, state->ofs_seed, &physical, &bp);
+		if (error)
+			return (error);
+		for (entry = 0; entry < state->ofs_entries; entry++) {
+			ino = letoh32(((u_int32_t *)bp->b_data)[entry]);
+			if (ino == 0) {
+				if (state->ofs_free_block == UINT32_MAX) {
+					state->ofs_free_block = block;
+					state->ofs_free_entry = entry;
+				}
+				continue;
+			}
+			if (ino < fs->m_first_non_reserved_inode ||
+			    ino > fs->m_inodes_count ||
+			    ino == fs->m_orphan_file_inode ||
+			    ino == fs->m_journal_inode_number) {
+				brelse(bp);
+				return (EINVAL);
+			}
+			tracked = ext4fs_orphan_runtime_find(fs, ino);
+			if (tracked == NULL || !tracked->ro_in_file ||
+			    tracked->ro_file_block != block ||
+			    tracked->ro_file_entry != entry) {
+				brelse(bp);
+				return (EINVAL);
+			}
+			error = ext4fs_orphan_inode_read(fs, ump->um_devvp,
+			    ino, &dp);
+			if (error) {
+				brelse(bp);
+				return (error);
+			}
+			state->ofs_occupied++;
+		}
+		brelse(bp);
+	}
+	if (state->ofs_occupied != runtime_count)
+		return (EINVAL);
+	if ((state->ofs_occupied == 0 &&
+	    (fs->m_feature_ro_compat &
+	    EXT4FS_FEATURE_RO_COMPAT_ORPHAN_PRESENT)) ||
+	    (state->ofs_occupied != 0 &&
+	    !(fs->m_feature_ro_compat &
+	    EXT4FS_FEATURE_RO_COMPAT_ORPHAN_PRESENT)))
+		return (EINVAL);
+	return (0);
+}
+
+static int
+ext4fs_orphan_file_add_handle (struct inode *ip,
+    struct ext4fs_journal_handle *handle)
+{
+	struct mount *mp = ITOV(ip)->v_mount;
+	struct ufsmount *ump = VFSTOUFS(mp);
+	struct m_ext4fs *fs = ump->um_e4fs;
+	struct ext4fs_runtime_orphan *orphan;
+	struct ext4fs_orphan_file_state state;
+	struct ext4fs_orphan_block_tail *tail;
+	struct ext4fs_dinode_256 saved_inode;
+	struct ext4fs_dinode *odin = &state.ofs_dinode.dinode;
+	struct ext4fs saved_sb;
+	struct buf *bp;
+	u_int64_t physical;
+	u_int32_t saved_ro;
+	u_int32_t saved_entry, saved_tail_checksum;
+	int error, saved_flags, saved_modified;
+
+	if (handle == NULL)
+		return (EINVAL);
+	error = ext4fs_orphan_file_runtime_scan(mp, &state);
+	if (error)
+		return (error);
+	if (state.ofs_free_block == UINT32_MAX)
+		return (ENOSPC);
+
+	orphan = malloc(sizeof(*orphan), M_UFSMNT, M_WAITOK | M_ZERO);
+	memcpy(&saved_inode, ip->i_e4din, sizeof(saved_inode));
+	saved_flags = ip->i_flag;
+	saved_sb = fs->m_sble;
+	saved_ro = fs->m_feature_ro_compat;
+	saved_modified = fs->m_fs_was_modified;
+
+	ip->i_flag |= IN_CHANGE;
+	error = ext4fs_update_handle(ip, handle);
+	if (error)
+		goto restore;
+	error = ext4fs_orphan_extent_lookup(&state.ofs_ctx, odin,
+	    state.ofs_free_block, &physical);
+	if (error || physical == 0) {
+		if (error == 0)
+			error = EINVAL;
+		goto restore;
+	}
+	error = ext4fs_journal_get_metadata(handle, ump->um_devvp, physical,
+	    &bp);
+	if (error)
+		goto restore;
+	error = ext4fs_orphan_file_block_verify(fs, state.ofs_seed, physical,
+	    bp->b_data);
+	if (error)
+		goto restore;
+	if (letoh32(((u_int32_t *)bp->b_data)[state.ofs_free_entry]) != 0) {
+		error = EBUSY;
+		goto restore;
+	}
+	tail = (struct ext4fs_orphan_block_tail *)
+	    ((char *)bp->b_data + fs->m_block_size - sizeof(*tail));
+	saved_entry = ((u_int32_t *)bp->b_data)[state.ofs_free_entry];
+	saved_tail_checksum = tail->ob_checksum;
+	((u_int32_t *)bp->b_data)[state.ofs_free_entry] =
+	    htole32((u_int32_t)ip->i_number);
+	tail->ob_checksum = htole32(ext4fs_orphan_file_block_csum(fs,
+	    state.ofs_seed, physical, bp->b_data));
+	error = ext4fs_journal_dirty_metadata(handle, bp);
+	if (error) {
+		((u_int32_t *)bp->b_data)[state.ofs_free_entry] = saved_entry;
+		tail->ob_checksum = saved_tail_checksum;
+		goto restore;
+	}
+	fs->m_feature_ro_compat |= EXT4FS_FEATURE_RO_COMPAT_ORPHAN_PRESENT;
+	fs->m_sble.sb_feature_ro_compat =
+	    htole32(fs->m_feature_ro_compat);
+	fs->m_fs_was_modified = 1;
+	error = ext4fs_sbwrite_handle(mp, handle);
+	if (error)
+		goto restore;
+
+	orphan->ro_inode = ip;
+	orphan->ro_file_block = state.ofs_free_block;
+	orphan->ro_file_entry = state.ofs_free_entry;
+	orphan->ro_in_file = 1;
+	orphan->ro_next = fs->m_runtime_orphans;
+	fs->m_runtime_orphans = orphan;
+	return (0);
+
+restore:
+	memcpy(ip->i_e4din, &saved_inode, sizeof(saved_inode));
+	ip->i_flag = saved_flags;
+	fs->m_sble = saved_sb;
+	fs->m_feature_ro_compat = saved_ro;
+	fs->m_fs_was_modified = saved_modified;
+	free(orphan, M_UFSMNT, sizeof(*orphan));
+	return (error);
+}
+
+static int
+ext4fs_orphan_file_remove_handle (struct inode *ip,
+    struct ext4fs_runtime_orphan *orphan,
+    struct ext4fs_journal_handle *handle)
+{
+	struct mount *mp = ITOV(ip)->v_mount;
+	struct ufsmount *ump = VFSTOUFS(mp);
+	struct m_ext4fs *fs = ump->um_e4fs;
+	struct ext4fs_orphan_file_state state;
+	struct ext4fs_orphan_block_tail *tail;
+	struct ext4fs_dinode *odin = &state.ofs_dinode.dinode;
+	struct buf *bp;
+	u_int64_t physical;
+	u_int32_t saved_entry, saved_tail_checksum;
+	int error;
+
+	if (handle == NULL || orphan == NULL || !orphan->ro_in_file ||
+	    orphan->ro_inode != ip)
+		return (EINVAL);
+	error = ext4fs_orphan_file_runtime_scan(mp, &state);
+	if (error)
+		return (error);
+	if (state.ofs_occupied == 0)
+		return (EINVAL);
+	if (orphan->ro_file_block >= state.ofs_nblocks ||
+	    orphan->ro_file_entry >= state.ofs_entries)
+		return (EINVAL);
+	error = ext4fs_orphan_extent_lookup(&state.ofs_ctx, odin,
+	    orphan->ro_file_block, &physical);
+	if (error)
+		return (error);
+	if (physical == 0)
+		return (EINVAL);
+	error = ext4fs_journal_get_metadata(handle, ump->um_devvp, physical,
+	    &bp);
+	if (error)
+		return (error);
+	error = ext4fs_orphan_file_block_verify(fs, state.ofs_seed, physical,
+	    bp->b_data);
+	if (error)
+		return (error);
+	if (letoh32(((u_int32_t *)bp->b_data)[orphan->ro_file_entry]) !=
+	    ip->i_number)
+		return (EINVAL);
+	tail = (struct ext4fs_orphan_block_tail *)
+	    ((char *)bp->b_data + fs->m_block_size - sizeof(*tail));
+	saved_entry = ((u_int32_t *)bp->b_data)[orphan->ro_file_entry];
+	saved_tail_checksum = tail->ob_checksum;
+	((u_int32_t *)bp->b_data)[orphan->ro_file_entry] = 0;
+	tail->ob_checksum = htole32(ext4fs_orphan_file_block_csum(fs,
+	    state.ofs_seed, physical, bp->b_data));
+	error = ext4fs_journal_dirty_metadata(handle, bp);
+	if (error) {
+		((u_int32_t *)bp->b_data)[orphan->ro_file_entry] = saved_entry;
+		tail->ob_checksum = saved_tail_checksum;
+		return (error);
+	}
+	if (state.ofs_occupied == 1) {
+		fs->m_feature_ro_compat &=
+		    ~EXT4FS_FEATURE_RO_COMPAT_ORPHAN_PRESENT;
+		fs->m_sble.sb_feature_ro_compat =
+		    htole32(fs->m_feature_ro_compat);
+	}
+	fs->m_fs_was_modified = 1;
 	return (0);
 }
 
@@ -1685,40 +2044,14 @@ ext4fs_orphan_file_scan (struct mount *mp, int *count)
 	struct ext4fs_orphan_extent_ctx ctx;
 	struct ext4fs_orphan_block_tail *tail;
 	struct buf *bp;
-	u_int64_t physical, size;
+	u_int64_t physical;
 	u_int32_t block, entry, entries, ino, nblocks, seed;
 	int error;
 
-	if (!(fs->m_feature_compat & EXT4FS_FEATURE_COMPAT_ORPHAN_FILE) ||
-	    fs->m_orphan_file_inode == 0)
-		return (EINVAL);
-	error = ext4fs_orphan_inode_read(fs, ump->um_devvp,
-	    fs->m_orphan_file_inode, &odp);
+	error = ext4fs_orphan_file_open(mp, &ctx, &odp, &nblocks,
+	    &entries, &seed);
 	if (error)
 		return (error);
-	if ((letoh16(odin->i_mode) & S_IFMT) != S_IFREG ||
-	    !(letoh32(odin->i_flags) & EXTFS_INODE_FLAG_EXTENTS))
-		return (EINVAL);
-	size = letoh32(odin->i_size_lo) |
-	    (u_int64_t)letoh32(odin->i_size_hi) << 32;
-	if (size == 0 || size % fs->m_block_size != 0 ||
-	    size / fs->m_block_size > UINT32_MAX)
-		return (EINVAL);
-	nblocks = size / fs->m_block_size;
-	entries = (fs->m_block_size -
-	    sizeof(struct ext4fs_orphan_block_tail)) / sizeof(u_int32_t);
-	if (entries == 0)
-		return (EINVAL);
-
-	memset(&ctx, 0, sizeof(ctx));
-	ctx.fs = fs;
-	ctx.devvp = ump->um_devvp;
-	ctx.ino = fs->m_orphan_file_inode;
-	ctx.generation = odin->i_nfs_generation;
-	error = ext4fs_orphan_extent_validate(&ctx, odin);
-	if (error)
-		return (error);
-	seed = ext4fs_orphan_file_seed(fs, ctx.ino, ctx.generation);
 
 	/* Authenticate every block and inode before changing any entry. */
 	for (block = 0; block < nblocks; block++) {
