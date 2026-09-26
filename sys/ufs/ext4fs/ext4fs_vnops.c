@@ -620,7 +620,7 @@ ext4fs_block_bitmap_init (struct inode *ip, u_int32_t group,
 	return (0);
 }
 
-static int
+int
 ext4fs_block_bitmap_csum_verify (struct m_ext4fs *fs, u_int32_t group,
     struct ext4fs_block_group_descriptor *gd, const void *bitmap)
 {
@@ -4277,12 +4277,13 @@ ext4fs_remove (void *v)
 	struct ext4fs_dinode_256 saved_dir_inode, saved_inode;
 	struct ext4fs_journal_handle *handle;
 	struct ext4fs saved_sb;
-	u_int64_t blocks, size, xattr;
+	u_int64_t blocks, blockless_units, size, xattr;
 	u_int32_t inode_flags;
 	u_int32_t saved_feature_ro_compat, saved_last_orphan;
 	u_int16_t depth, nlink;
 	int changed, end_error, error, saved_dir_flags, saved_effnlink;
-	int journal_final, orphan_added, orphan_locked, saved_flags;
+	int journal_final, journal_final_error, orphan_added, orphan_locked;
+	int saved_flags;
 	int saved_modified;
 
 	if (vp->v_type == VDIR) {
@@ -4305,34 +4306,71 @@ ext4fs_remove (void *v)
 	size = letoh32(din->i_size_lo) |
 	    ((u_int64_t)letoh32(din->i_size_hi) << 32);
 	inode_flags = letoh32(din->i_flags);
+	blockless_units = 0;
+	if (xattr != 0) {
+		if (inode_flags & EXTFS_INODE_FLAG_HUGE_FILE) {
+			if (fs->m_feature_ro_compat &
+			    EXT4FS_FEATURE_RO_COMPAT_HUGE_FILE)
+				blockless_units = 1;
+			else
+				blockless_units = UINT64_MAX;
+		} else
+			blockless_units = fs->m_block_size / DEV_BSIZE;
+	}
 	depth = letoh16(din->i_extent_header.eh_depth);
 	journal_final = 0;
-	if (nlink == 1 && xattr == 0) {
+	journal_final_error = EOPNOTSUPP;
+	if (nlink == 1) {
 		switch (vp->v_type) {
 		case VREG:
-			journal_final =
-			    (inode_flags & EXTFS_INODE_FLAG_EXTENTS) &&
-			    letoh16(din->i_extent_header.eh_magic) ==
-			    EXT4FS_EXTENT_HEADER_MAGIC && depth <= 1;
+			if (!(inode_flags & EXTFS_INODE_FLAG_EXTENTS) ||
+			    letoh16(din->i_extent_header.eh_magic) !=
+			    EXT4FS_EXTENT_HEADER_MAGIC)
+				journal_final_error = EIO;
+			else if (depth <= 1)
+				journal_final = 1;
 			break;
 		case VLNK:
 			if (inode_flags & EXTFS_INODE_FLAG_EXTENTS) {
-				journal_final =
-				    letoh16(din->i_extent_header.eh_magic) ==
-				    EXT4FS_EXTENT_HEADER_MAGIC && depth <= 1;
+				if (letoh16(din->i_extent_header.eh_magic) !=
+				    EXT4FS_EXTENT_HEADER_MAGIC)
+					journal_final_error = EIO;
+				else if (depth <= 1)
+					journal_final = 1;
 			} else {
-				journal_final = blocks == 0 &&
-				    size <= EXT4FS_SYMLINK_LEN_MAX;
+				if (blocks == blockless_units &&
+				    size <= EXT4FS_SYMLINK_LEN_MAX)
+					journal_final = 1;
+				else
+					journal_final_error = EIO;
 			}
 			break;
+		case VBLK:
+		case VCHR:
 		case VFIFO:
-			journal_final =
-			    !(inode_flags & EXTFS_INODE_FLAG_EXTENTS) &&
-			    blocks == 0 && size == 0;
+		case VSOCK:
+			if (!(inode_flags & EXTFS_INODE_FLAG_EXTENTS) &&
+			    blocks == blockless_units && size == 0)
+				journal_final = 1;
+			else
+				journal_final_error = EIO;
 			break;
 		default:
 			break;
 		}
+	}
+	if (fs->m_journal != NULL && nlink == 0) {
+		error = EIO;
+		goto out;
+	}
+	if (fs->m_journal != NULL && nlink == 1 && !journal_final) {
+		error = journal_final_error;
+		goto out;
+	}
+	if (fs->m_journal != NULL && journal_final && xattr != 0) {
+		error = ext4fs_orphan_xattr_validate(ip);
+		if (error)
+			goto out;
 	}
 	/*
 	 * Removing a non-final name needs no orphan record.  Commit the

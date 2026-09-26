@@ -99,6 +99,11 @@ fail()
 	exit 1
 }
 
+print_test_name()
+{
+	printf '%-52s' "kernel: $1"
+}
+
 run_step()
 {
 	mode=$1
@@ -181,6 +186,108 @@ check_image()
 	fi
 }
 
+xattr_block()
+{
+	xattr_path=$1
+	"$DEBUGFS" -R "stat $xattr_path" "$image" 2>/dev/null | awk '
+	    $1 == "File" && $2 == "ACL:" { print $3; exit }
+	'
+}
+
+inode_type()
+{
+	inode_path=$1
+	"$DEBUGFS" -R "stat $inode_path" "$image" 2>/dev/null | awk '
+	    $1 == "Inode:" {
+		for (i = 1; i <= NF; i++) {
+			if ($i != "Type:")
+				continue
+			type = $(i + 1)
+			for (j = i + 2; j <= NF && $j != "Mode:"; j++)
+				type = type " " $j
+			print type
+			exit
+		}
+	    }
+	'
+}
+
+check_inode_type()
+{
+	inode_path=$1
+	expected_type=$2
+	actual_type=$(inode_type "$inode_path")
+	[ "$actual_type" = "$expected_type" ] ||
+	    fail "$inode_path has type '${actual_type:-missing}', expected $expected_type"
+}
+
+prepare_unlink_fixture()
+{
+	xattr_value=$case_dir/xattr.value
+	xattr_commands=$case_dir/xattr.debugfs
+	dd if=/dev/zero of="$xattr_value" bs=1 count=300 status=none
+	{
+		printf 'cd /tree\n'
+		printf 'mknod char-device c 0 0\n'
+		printf 'mknod block-device b 0 0\n'
+		printf 'set_inode_field /tree/unix-socket mode 0140600\n'
+		printf 'set_inode_field /tree/unix-socket flags 0\n'
+		printf 'ln /tree/unix-socket /tree/.unix-socket-hold\n'
+		printf 'unlink /tree/unix-socket\n'
+		printf 'ln /tree/.unix-socket-hold /tree/unix-socket\n'
+		printf 'unlink /tree/.unix-socket-hold\n'
+		printf 'ea_set -f %s /tree/xattr-unique user.regress\n' \
+		    "$xattr_value"
+		printf 'ea_set -f %s /tree/xattr-shared-a user.regress\n' \
+		    "$xattr_value"
+		printf 'ea_set -f %s /tree/xattr-shared-b user.regress\n' \
+		    "$xattr_value"
+	} >"$xattr_commands"
+	if ! "$DEBUGFS" -w -f "$xattr_commands" "$image" \
+	    >"$case_dir/debugfs-xattr.log" 2>&1; then
+		cat "$case_dir/debugfs-xattr.log" >&2
+		fail "could not create unlink fixtures"
+	fi
+	unique_block=$(xattr_block /tree/xattr-unique)
+	shared_a_block=$(xattr_block /tree/xattr-shared-a)
+	shared_b_block=$(xattr_block /tree/xattr-shared-b)
+	case "$unique_block:$shared_a_block:$shared_b_block" in
+	*[!0-9:]*|:*|*::*|*:)
+		fail "could not locate external xattr blocks"
+		;;
+	esac
+	[ "$unique_block" -ne 0 ] && [ "$shared_a_block" -ne 0 ] &&
+	    [ "$shared_b_block" -ne 0 ] ||
+	    fail "xattr value was not stored in an external block"
+	[ "$unique_block" -ne "$shared_a_block" ] &&
+	    [ "$shared_a_block" -ne "$shared_b_block" ] ||
+	    fail "fresh xattr blocks unexpectedly alias"
+	if ! "$DEBUGFS" -w -R \
+	    "set_inode_field /tree/xattr-shared-b file_acl $shared_a_block" \
+	    "$image" >"$case_dir/debugfs-xattr-share.log" 2>&1; then
+		cat "$case_dir/debugfs-xattr-share.log" >&2
+		fail "could not construct shared xattr fixture"
+	fi
+	set +e
+	"$TIMEOUT" -k 2 "$EXT4FS_TIMEOUT" "$E2FSCK" -fy "$image" \
+	    >"$case_dir/e2fsck-xattr-prepare.log" 2>&1
+	xattr_fsck_status=$?
+	set -e
+	if [ "$xattr_fsck_status" -gt 1 ]; then
+		cat "$case_dir/e2fsck-xattr-prepare.log" >&2
+		fail "e2fsck could not normalize shared xattr fixture"
+	fi
+	shared_b_block=$(xattr_block /tree/xattr-shared-b)
+	[ "$shared_b_block" -eq "$shared_a_block" ] ||
+	    fail "shared xattr fixture does not share its block"
+	[ "$(xattr_block /tree/xattr-unique)" -eq "$unique_block" ] ||
+	    fail "shared xattr preparation changed the unique block"
+	check_inode_type /tree/char-device "character special"
+	check_inode_type /tree/block-device "block special"
+	check_inode_type /tree/unix-socket socket
+	check_image xattr-fixture
+}
+
 run_case()
 {
 	block_size=$1
@@ -204,7 +311,7 @@ run_case()
 	mkdir "$case_dir"
 
 	test_name="$label"
-	printf '%-52s' "kernel: $label"
+	print_test_name "$label"
 
 	dd if=/dev/zero of="$image" bs=1m count=0 \
 	    seek="$EXT4FS_IMAGE_MB" status=none
@@ -228,6 +335,13 @@ run_case()
 	unmount_image create
 	detach_image
 	check_image create
+	prepare_unlink_fixture
+	attach_image
+	mount_image ""
+	run_step create-growdir
+	unmount_image create-growdir
+	detach_image
+	check_image create-growdir
 
 	attach_image
 	mount_image ""
@@ -274,7 +388,7 @@ run_flex_uninit_case()
 	: >"$empty"
 
 	test_name="FLEX_BG BLOCK_UNINIT allocation"
-	printf '%-44s' "kernel: FLEX_BG BLOCK_UNINIT allocation"
+	print_test_name "$test_name"
 	dd if=/dev/zero of="$image" bs=1m count=0 \
 	    seek="$EXT4FS_IMAGE_MB" status=none
 	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b 1024 \

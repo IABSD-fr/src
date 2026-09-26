@@ -74,6 +74,10 @@ static int	ext4fs_orphan_file_add_handle (struct inode *,
 static int	ext4fs_orphan_file_remove_handle (struct inode *,
 		    struct ext4fs_runtime_orphan *,
 		    struct ext4fs_journal_handle *);
+static int	ext4fs_orphan_xattr_release_handle (struct inode *, u_int64_t,
+		    u_int32_t, struct ext4fs_journal_handle *);
+static int	ext4fs_orphan_xattr_state (struct inode *, u_int64_t,
+		    u_int32_t *);
 
 static int
 ext4fs_orphan_flush (struct mount *mp)
@@ -368,16 +372,17 @@ ext4fs_orphan_retire (struct inode *ip, mode_t mode)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_runtime_orphan *orphan, *previous;
-	struct ext4fs_block_group_descriptor saved_gd;
+	struct ext4fs_block_group_descriptor saved_gd, saved_xattr_gd;
 	struct ext4fs_dinode_256 saved_inode;
 	struct ext4fs_journal_handle *handle;
 	struct ext4fs saved_sb;
 	struct inode *pip;
 	struct timespec ts;
-	u_int64_t blocks, size, xattr;
+	u_int64_t blocks, saved_free_blocks, size, xattr;
 	u_int32_t flags;
-	u_int32_t group, next;
+	u_int32_t group, next, xattr_group, xattr_references;
 	int changed, end_error, error, saved_flags, saved_modified;
+	int saved_xattr_valid;
 	u_int32_t saved_feature_ro_compat;
 	u_int32_t saved_free_inodes, saved_last_orphan;
 
@@ -391,8 +396,19 @@ ext4fs_orphan_retire (struct inode *ip, mode_t mode)
 	    ((u_int64_t)letoh16(
 	    ip->i_e4din->dinode.i_extended_attributes_hi) << 32);
 	flags = letoh32(ip->i_e4din->dinode.i_flags);
-	if (blocks != 0 || xattr != 0)
+	if (xattr == 0 && blocks != 0)
 		return (EBUSY);
+	if (xattr != 0) {
+		if (flags & EXTFS_INODE_FLAG_HUGE_FILE) {
+			if (!(fs->m_feature_ro_compat &
+			    EXT4FS_FEATURE_RO_COMPAT_HUGE_FILE) || blocks != 1)
+				return (EIO);
+		} else if (blocks != fs->m_block_size / DEV_BSIZE)
+			return (EIO);
+		error = ext4fs_orphan_xattr_validate(ip);
+		if (error)
+			return (error);
+	}
 	if (size != 0 && ((mode & S_IFMT) != S_IFLNK ||
 	    (flags & EXTFS_INODE_FLAG_EXTENTS) ||
 	    size > EXT4FS_SYMLINK_LEN_MAX))
@@ -405,7 +421,7 @@ ext4fs_orphan_retire (struct inode *ip, mode_t mode)
 	rw_enter_write(&fs->m_runtime_orphan_lock);
 	handle = NULL;
 	changed = 0;
-	error = ext4fs_journal_begin(ITOV(ip)->v_mount, 6, &handle);
+	error = ext4fs_journal_begin(ITOV(ip)->v_mount, 10, &handle);
 	if (error) {
 		rw_exit_write(&fs->m_runtime_orphan_lock);
 		return (error);
@@ -449,16 +465,36 @@ ext4fs_orphan_retire (struct inode *ip, mode_t mode)
 			goto unchanged;
 		}
 	}
+	xattr_references = 0;
+	if (xattr != 0) {
+		error = ext4fs_orphan_xattr_state(ip, xattr,
+		    &xattr_references);
+		if (error)
+			goto unchanged;
+	}
 	memcpy(&saved_inode, ip->i_e4din, sizeof(saved_inode));
 	saved_flags = ip->i_flag;
 	saved_gd = fs->m_gd[group];
 	saved_sb = fs->m_sble;
+	saved_free_blocks = fs->m_free_blocks_count;
 	saved_free_inodes = fs->m_free_inodes_count;
 	saved_last_orphan = fs->m_last_orphan;
 	saved_feature_ro_compat = fs->m_feature_ro_compat;
 	saved_modified = fs->m_fs_was_modified;
 	pip = orphan->ro_in_file || previous == NULL ? NULL :
 	    previous->ro_inode;
+	xattr_group = 0;
+	saved_xattr_valid = 0;
+	if (xattr != 0) {
+		xattr_group = (xattr - fs->m_first_data_block) /
+		    fs->m_blocks_per_group;
+		if (xattr_group >= fs->m_block_group_count) {
+			error = EINVAL;
+			goto fail;
+		}
+		saved_xattr_gd = fs->m_gd[xattr_group];
+		saved_xattr_valid = 1;
+	}
 
 	if (orphan->ro_in_file) {
 		error = ext4fs_orphan_file_remove_handle(ip, orphan, handle);
@@ -479,6 +515,10 @@ ext4fs_orphan_retire (struct inode *ip, mode_t mode)
 	}
 
 	getnanotime(&ts);
+	ip->i_e4din->dinode.i_extended_attributes_lo = 0;
+	ip->i_e4din->dinode.i_extended_attributes_hi = 0;
+	ip->i_e4din->dinode.i_blocks_lo = 0;
+	ip->i_e4din->dinode.i_blocks_hi = 0;
 	ip->i_e4din->dinode.i_size_lo = 0;
 	ip->i_e4din->dinode.i_size_hi = 0;
 	ip->i_e4din->dinode.i_mode = 0;
@@ -491,6 +531,12 @@ ext4fs_orphan_retire (struct inode *ip, mode_t mode)
 	error = ext4fs_inode_free_handle(ip, ip->i_number, mode, handle);
 	if (error)
 		goto fail;
+	if (xattr != 0) {
+		error = ext4fs_orphan_xattr_release_handle(ip, xattr,
+		    xattr_references, handle);
+		if (error)
+			goto fail;
+	}
 	end_error = ext4fs_journal_end(handle);
 	handle = NULL;
 	if (end_error) {
@@ -533,7 +579,10 @@ restore:
 		pip->i_e4din->dinode.i_dtime = htole32(ip->i_number);
 	fs->m_gd[group] = saved_gd;
 	fs->m_sble = saved_sb;
+	fs->m_free_blocks_count = saved_free_blocks;
 	fs->m_free_inodes_count = saved_free_inodes;
+	if (saved_xattr_valid)
+		fs->m_gd[xattr_group] = saved_xattr_gd;
 	fs->m_last_orphan = saved_last_orphan;
 	fs->m_feature_ro_compat = saved_feature_ro_compat;
 	fs->m_fs_was_modified = saved_modified;
@@ -824,6 +873,40 @@ ext4fs_orphan_xattr_block (struct m_ext4fs *fs, struct ext4fs_dinode *din)
 	return (block);
 }
 
+static int
+ext4fs_orphan_block_allocated (struct m_ext4fs *fs, struct vnode *devvp,
+    u_int64_t block)
+{
+	struct ext4fs_block_group_descriptor *gd;
+	struct buf *bp = NULL;
+	u_int64_t bitmap_block;
+	u_int32_t bit, group;
+	int allocated, error;
+
+	if (!ext4fs_orphan_data_block_valid(fs, block))
+		return (EINVAL);
+	group = (block - fs->m_first_data_block) / fs->m_blocks_per_group;
+	bit = (block - fs->m_first_data_block) % fs->m_blocks_per_group;
+	gd = &fs->m_gd[group];
+	if (letoh16(gd->bgd_flags) & EXT4FS_BGD_FLAG_BLOCK_UNINIT)
+		return (EINVAL);
+	bitmap_block = ext4fs_bgd_get_block(fs, gd,
+	    EXT4FS_BGD_BLOCK_BITMAP);
+	error = bread(devvp, (daddr_t)EXT4FS_FSBTODB(fs, bitmap_block),
+	    fs->m_block_size, &bp);
+	if (error) {
+		if (bp != NULL)
+			brelse(bp);
+		return (error);
+	}
+	error = ext4fs_block_bitmap_csum_verify(fs, group, gd, bp->b_data);
+	allocated = isset((u_int8_t *)bp->b_data, bit);
+	brelse(bp);
+	if (error)
+		return (error);
+	return (allocated ? 0 : EINVAL);
+}
+
 static u_int32_t
 ext4fs_orphan_xattr_csum (struct m_ext4fs *fs, u_int64_t block,
     void *data)
@@ -846,12 +929,35 @@ ext4fs_orphan_xattr_csum (struct m_ext4fs *fs, u_int64_t block,
 }
 
 static int
+ext4fs_orphan_xattr_verify (struct ext4fs_orphan_extent_ctx *ctx,
+    u_int64_t block, void *data)
+{
+	struct ext4fs_orphan_xattr_header *header = data;
+	u_int32_t calculated;
+	int i;
+
+	if (letoh32(header->h_magic) != EXT4FS_ORPHAN_XATTR_MAGIC ||
+	    letoh32(header->h_refcount) == 0 ||
+	    letoh32(header->h_blocks) != 1)
+		return (EINVAL);
+	for (i = 0; i < nitems(header->h_reserved); i++) {
+		if (header->h_reserved[i] != 0)
+			return (EINVAL);
+	}
+	if (ctx->fs->m_feature_ro_compat &
+	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM) {
+		calculated = ext4fs_orphan_xattr_csum(ctx->fs, block, data);
+		if (letoh32(header->h_checksum) != calculated)
+			return (EINVAL);
+	}
+	return (0);
+}
+
+static int
 ext4fs_orphan_xattr_read (struct ext4fs_orphan_extent_ctx *ctx,
     struct ext4fs_dinode *din, u_int64_t *blockp, struct buf **bpp)
 {
-	struct ext4fs_orphan_xattr_header *header;
-	u_int32_t calculated;
-	int error, i;
+	int error;
 
 	*bpp = NULL;
 	*blockp = ext4fs_orphan_xattr_block(ctx->fs, din);
@@ -868,28 +974,9 @@ ext4fs_orphan_xattr_read (struct ext4fs_orphan_extent_ctx *ctx,
 		*bpp = NULL;
 		return (error);
 	}
-	header = (struct ext4fs_orphan_xattr_header *)(*bpp)->b_data;
-	if (letoh32(header->h_magic) != EXT4FS_ORPHAN_XATTR_MAGIC ||
-	    letoh32(header->h_refcount) == 0 ||
-	    letoh32(header->h_blocks) != 1) {
-		error = EINVAL;
+	error = ext4fs_orphan_xattr_verify(ctx, *blockp, (*bpp)->b_data);
+	if (error)
 		goto bad;
-	}
-	for (i = 0; i < nitems(header->h_reserved); i++) {
-		if (header->h_reserved[i] != 0) {
-			error = EINVAL;
-			goto bad;
-		}
-	}
-	if (ctx->fs->m_feature_ro_compat &
-	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM) {
-		calculated = ext4fs_orphan_xattr_csum(ctx->fs, *blockp,
-		    (*bpp)->b_data);
-		if (letoh32(header->h_checksum) != calculated) {
-			error = EINVAL;
-			goto bad;
-		}
-	}
 	return (0);
 bad:
 	brelse(*bpp);
@@ -907,7 +994,7 @@ ext4fs_orphan_xattr_references (struct ext4fs_orphan_extent_ctx *ctx,
 	struct ext4fs_dinode_256 dp;
 	struct ext4fs_dinode *din;
 	struct buf *bitmap_bp = NULL, *table_bp = NULL;
-	u_int64_t inode_start, table;
+	u_int64_t bitmap, inode_start, table;
 	u_int32_t base, group, i, ino, slots, valid;
 	int error;
 
@@ -927,18 +1014,34 @@ ext4fs_orphan_xattr_references (struct ext4fs_orphan_extent_ctx *ctx,
 			valid = ctx->fs->m_inodes_count - inode_start;
 		else
 			valid = ctx->fs->m_inodes_per_group;
+		bitmap = ext4fs_bgd_get_block(ctx->fs, gd,
+		    EXT4FS_BGD_INODE_BITMAP);
+		if (bitmap < ctx->fs->m_first_data_block ||
+		    bitmap >= ctx->fs->m_blocks_count)
+			return (EINVAL);
 		error = bread(ctx->devvp,
-		    (daddr_t)EXT4FS_FSBTODB(ctx->fs,
-		    ext4fs_bgd_get_block(ctx->fs, gd,
-		    EXT4FS_BGD_INODE_BITMAP)),
+		    (daddr_t)EXT4FS_FSBTODB(ctx->fs, bitmap),
 		    ctx->fs->m_block_size, &bitmap_bp);
 		if (error) {
 			if (bitmap_bp != NULL)
 				brelse(bitmap_bp);
 			return (error);
 		}
+		error = ext4fs_inode_bitmap_csum_verify(ctx->fs, group, gd,
+		    bitmap_bp->b_data);
+		if (error) {
+			brelse(bitmap_bp);
+			return (error);
+		}
 		table = ext4fs_bgd_get_block(ctx->fs, gd,
 		    EXT4FS_BGD_INODE_TABLE);
+		if (table < ctx->fs->m_first_data_block ||
+		    table >= ctx->fs->m_blocks_count ||
+		    ctx->fs->m_inode_table_blocks_per_group >
+		    ctx->fs->m_blocks_count - table) {
+			brelse(bitmap_bp);
+			return (EINVAL);
+		}
 		base = 0;
 		while (base < valid) {
 			slots = ctx->fs->m_inodes_per_block;
@@ -991,6 +1094,125 @@ ext4fs_orphan_xattr_references (struct ext4fs_orphan_extent_ctx *ctx,
 }
 
 static int
+ext4fs_orphan_xattr_state (struct inode *ip, u_int64_t expected,
+    u_int32_t *referencesp)
+{
+	struct ext4fs_orphan_extent_ctx ctx;
+	struct ext4fs_orphan_xattr_header *header;
+	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
+	struct buf *bp;
+	u_int64_t block;
+	int error;
+
+	if (expected == 0 || referencesp == NULL)
+		return (EINVAL);
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.fs = ip->i_e4fs;
+	ctx.devvp = ip->i_devvp;
+	ctx.ino = ip->i_number;
+	ctx.generation = din->i_nfs_generation;
+	error = ext4fs_orphan_block_allocated(ctx.fs, ctx.devvp, expected);
+	if (error)
+		return (error);
+	error = ext4fs_orphan_xattr_read(&ctx, din, &block, &bp);
+	if (error)
+		return (error);
+	if (block == 0)
+		return (EINVAL);
+	if (block != expected) {
+		brelse(bp);
+		return (EINVAL);
+	}
+	error = ext4fs_orphan_xattr_references(&ctx, block, referencesp);
+	if (error == 0) {
+		header = (struct ext4fs_orphan_xattr_header *)bp->b_data;
+		if (*referencesp == UINT32_MAX ||
+		    letoh32(header->h_refcount) != *referencesp + 1)
+			error = EINVAL;
+	}
+	brelse(bp);
+	return (error);
+}
+
+int
+ext4fs_orphan_xattr_validate (struct inode *ip)
+{
+	u_int64_t block;
+	u_int32_t references;
+
+	block = ext4fs_orphan_xattr_block(ip->i_e4fs,
+	    &ip->i_e4din->dinode);
+	if (block == 0)
+		return (0);
+	return (ext4fs_orphan_xattr_state(ip, block, &references));
+}
+
+static int
+ext4fs_orphan_xattr_release_handle (struct inode *ip, u_int64_t block,
+    u_int32_t references, struct ext4fs_journal_handle *handle)
+{
+	struct ext4fs_orphan_extent_ctx ctx;
+	struct ext4fs_orphan_xattr_header *header;
+	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
+	struct buf *bp;
+	u_int32_t saved_checksum, saved_refcount;
+	int error;
+
+	if (handle == NULL || block == 0)
+		return (EINVAL);
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.fs = ip->i_e4fs;
+	ctx.devvp = ip->i_devvp;
+	ctx.ino = ip->i_number;
+	ctx.generation = din->i_nfs_generation;
+	error = ext4fs_orphan_block_allocated(ctx.fs, ctx.devvp, block);
+	if (error)
+		return (error);
+	bp = NULL;
+	error = bread(ctx.devvp, (daddr_t)EXT4FS_FSBTODB(ctx.fs, block),
+	    ctx.fs->m_block_size, &bp);
+	if (error) {
+		if (bp != NULL)
+			brelse(bp);
+		return (error);
+	}
+	error = ext4fs_orphan_xattr_verify(&ctx, block, bp->b_data);
+	if (error == 0) {
+		header = (struct ext4fs_orphan_xattr_header *)bp->b_data;
+		if (references == UINT32_MAX ||
+		    letoh32(header->h_refcount) != references + 1)
+			error = EINVAL;
+	}
+	brelse(bp);
+	if (error)
+		return (error);
+	if (references == 0)
+		return (ext4fs_blkfree_handle(ip, handle, block));
+
+	error = ext4fs_journal_get_metadata(handle, ctx.devvp, block, &bp);
+	if (error)
+		return (error);
+	error = ext4fs_orphan_xattr_verify(&ctx, block, bp->b_data);
+	if (error)
+		return (error);
+	header = (struct ext4fs_orphan_xattr_header *)bp->b_data;
+	if (letoh32(header->h_refcount) != references + 1)
+		return (EINVAL);
+	saved_refcount = header->h_refcount;
+	saved_checksum = header->h_checksum;
+	header->h_refcount = htole32(references);
+	header->h_checksum = 0;
+	header->h_checksum = htole32(ext4fs_orphan_xattr_csum(ctx.fs,
+	    block, bp->b_data));
+	error = ext4fs_journal_dirty_metadata(handle, bp);
+	if (error) {
+		header->h_refcount = saved_refcount;
+		header->h_checksum = saved_checksum;
+	}
+	return (error);
+}
+
+static int
 ext4fs_orphan_xattr_release (struct mount *mp,
     struct ext4fs_orphan_extent_ctx *ctx, struct ext4fs_dinode *din)
 {
@@ -1018,6 +1240,12 @@ ext4fs_orphan_xattr_release (struct mount *mp,
 		if (error)
 			return (error);
 	} else {
+		error = ext4fs_orphan_block_allocated(ctx->fs, ctx->devvp,
+		    block);
+		if (error) {
+			brelse(bp);
+			return (error);
+		}
 		header = (struct ext4fs_orphan_xattr_header *)bp->b_data;
 		header->h_refcount = htole32(references);
 		header->h_checksum = 0;

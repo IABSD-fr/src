@@ -1190,7 +1190,7 @@ ext4fs_inode_alloc (struct inode *pip, mode_t mode, struct ucred *cred,
 	return (ENOSPC);
 }
 
-static int
+int
 ext4fs_inode_bitmap_csum_verify (struct m_ext4fs *fs, u_int32_t group,
     struct ext4fs_block_group_descriptor *gd, const void *bitmap)
 {

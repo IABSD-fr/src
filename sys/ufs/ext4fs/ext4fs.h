@@ -643,6 +643,8 @@ ext4fs_mode_to_ft (u_int16_t mode)
 }
 
 /* Block allocation / free */
+int ext4fs_block_bitmap_csum_verify (struct m_ext4fs *, u_int32_t,
+    struct ext4fs_block_group_descriptor *, const void *);
 int ext4fs_blkalloc (struct inode *, u_int64_t, u_int32_t, u_int64_t *,
     u_int32_t *);
 int ext4fs_blkalloc_handle (struct inode *, struct ext4fs_journal_handle *,
@@ -654,6 +656,8 @@ void ext4fs_blkfree (struct inode *, u_int64_t);
 /* Inode allocation / free */
 int ext4fs_inode_alloc (struct inode *, mode_t, struct ucred *,
 	struct vnode **);
+int ext4fs_inode_bitmap_csum_verify (struct m_ext4fs *, u_int32_t,
+	struct ext4fs_block_group_descriptor *, const void *);
 int ext4fs_inode_free_handle (struct inode *, ufsino_t, mode_t,
 	struct ext4fs_journal_handle *);
 void ext4fs_inode_free (struct inode *, ufsino_t, mode_t);

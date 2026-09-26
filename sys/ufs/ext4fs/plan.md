@@ -531,8 +531,20 @@ symlinks, extent-backed slow symlinks, and FIFOs now uses the same orphan
 lifecycle, with exact inode and data-block accounting added to the ordinary
 and orphan-file regressions.  On 2026-09-26, the full ext4fs regression set
 passed against the booted production kernel with that extension.  Device
-nodes and sockets also remain on the legacy path, so the overall unlink
-checklist item remains open.
+nodes, sockets, and regular files with external extended attributes now use
+the same orphan lifecycle as well.  External-xattr deletion verifies the
+block bitmap checksum and allocation bit, xattr checksum, and exact live
+reference count before namespace mutation; final retirement either journals
+the shared-block refcount/checksum decrement or frees and revokes the final
+xattr block with the inode and orphan record.  The regression constructs both
+unique and shared external-xattr fixtures and checks exact inode/block
+accounting, along with offline-created character, block, and socket inodes.
+Unsupported or corrupt final-link inode shapes now fail closed instead of
+falling back to direct metadata writes.  On 2026-09-26, the booted production-
+kernel matrix passed the complete unlink regression on 1 KiB, 2 KiB, and 4 KiB
+classic-orphan filesystems and the 1 KiB orphan-file filesystem, including
+remount and offline `e2fsck -fn` validation.  The FLEX_BG/BLOCK_UNINIT case also
+passed, so the overall unlink checklist item is complete.
 
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only for
 regular-file data, the journal's own I/O, recovery, checkpointing, or another
@@ -542,7 +554,7 @@ Wrap each compound namespace operation in one transaction:
 
 - [ ] create and mknod;
 - [x] link;
-- [ ] unlink;
+- [x] unlink;
 - [ ] mkdir and rmdir;
 - [ ] rename;
 - [ ] symlink;

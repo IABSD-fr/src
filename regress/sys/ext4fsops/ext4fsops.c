@@ -70,6 +70,7 @@ static void	check_link_growth_tree (int);
 static void	check_grow_directory (const char *, int);
 static void	fsync_path (const char *);
 static void	expect_ro_failure (const char *, int);
+static void	create_grow_directory (void);
 static void	create_filesystem_tree (void);
 static void	verify_created_tree (void);
 static void	mutate_filesystem_tree (void);
@@ -595,6 +596,24 @@ expect_ro_failure (const char *operation, int result)
 }
 
 static void
+create_grow_directory (void)
+{
+	char path[PATH_MAX];
+	int i;
+
+	make_path(path, sizeof(path), "growdir");
+	if (mkdir(path, 0755) == -1)
+		err(1, "mkdir %s", path);
+	for (i = 0; i < GROW_FILES; i++) {
+		make_indexed_path(path, sizeof(path), "growdir", i);
+		write_text_file(path, "");
+	}
+	make_path(path, sizeof(path), "growdir");
+	fsync_path(path);
+	fsync_path(root);
+}
+
+static void
 create_filesystem_tree (void)
 {
 	struct statfs before, after;
@@ -602,7 +621,7 @@ create_filesystem_tree (void)
 	char slow_target[97];
 	off_t base, marker;
 	unsigned char append_buf[73];
-	int fd, i;
+	int fd;
 	ssize_t n;
 
 	if (statfs(root, &before) == -1 && errno != ENOENT)
@@ -696,14 +715,14 @@ create_filesystem_tree (void)
 	make_path(path, sizeof(path), "slow-link");
 	if (symlink(slow_target, path) == -1)
 		err(1, "symlink %s", path);
-
-	make_path(path, sizeof(path), "growdir");
-	if (mkdir(path, 0755) == -1)
-		err(1, "mkdir %s", path);
-	for (i = 0; i < GROW_FILES; i++) {
-		make_indexed_path(path, sizeof(path), "growdir", i);
-		write_text_file(path, "");
-	}
+	make_path(path, sizeof(path), "unix-socket");
+	write_text_file(path, "");
+	make_path(path, sizeof(path), "xattr-unique");
+	write_text_file(path, "");
+	make_path(path, sizeof(path), "xattr-shared-a");
+	write_text_file(path, "");
+	make_path(path, sizeof(path), "xattr-shared-b");
+	write_text_file(path, "");
 
 	memset(longname, 'n', sizeof(longname) - 1);
 	longname[sizeof(longname) - 1] = '\0';
@@ -777,6 +796,27 @@ verify_created_tree (void)
 	slow_target[sizeof(slow_target) - 1] = '\0';
 	make_path(path, sizeof(path), "slow-link");
 	check_symlink(path, slow_target);
+	make_path(path, sizeof(path), "char-device");
+	if (lstat(path, &st) == -1)
+		err(1, "lstat %s", path);
+	if (!S_ISCHR(st.st_mode))
+		errx(1, "%s is not a character device", path);
+	make_path(path, sizeof(path), "block-device");
+	if (lstat(path, &st) == -1)
+		err(1, "lstat %s", path);
+	if (!S_ISBLK(st.st_mode))
+		errx(1, "%s is not a block device", path);
+	make_path(path, sizeof(path), "unix-socket");
+	if (lstat(path, &st) == -1)
+		err(1, "lstat %s", path);
+	if (!S_ISSOCK(st.st_mode))
+		errx(1, "%s is not a socket", path);
+	make_path(path, sizeof(path), "xattr-unique");
+	check_regular(path);
+	make_path(path, sizeof(path), "xattr-shared-a");
+	check_regular(path);
+	make_path(path, sizeof(path), "xattr-shared-b");
+	check_regular(path);
 	make_path(path, sizeof(path), "growdir");
 	check_grow_directory(path, 0);
 
@@ -805,15 +845,54 @@ mutate_filesystem_tree (void)
 	make_path(path, sizeof(path), "fifo");
 	if (unlink(path) == -1)
 		err(1, "unlink fifo");
+	make_path(path, sizeof(path), "char-device");
+	if (unlink(path) == -1)
+		err(1, "unlink char-device");
+	make_path(path, sizeof(path), "block-device");
+	if (unlink(path) == -1)
+		err(1, "unlink block-device");
+	make_path(path, sizeof(path), "unix-socket");
+	if (unlink(path) == -1)
+		err(1, "unlink unix-socket");
 	make_path(path, sizeof(path), "slow-link");
 	if (unlink(path) == -1)
 		err(1, "unlink slow-link");
 	if (statfs(root, &after) == -1)
 		err(1, "statfs after non-regular unlink");
-	if (after.f_ffree != before.f_ffree + 3)
-		errx(1, "non-regular unlink did not free exactly three inodes");
+	if (after.f_ffree != before.f_ffree + 6)
+		errx(1, "non-regular unlink did not free exactly six inodes");
 	if (after.f_bfree != before.f_bfree + 1)
 		errx(1, "slow symlink unlink did not free exactly one block");
+
+	/* Release unique and shared external-xattr blocks exactly once. */
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before unique xattr unlink");
+	make_path(path, sizeof(path), "xattr-unique");
+	if (unlink(path) == -1)
+		err(1, "unlink xattr-unique");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after unique xattr unlink");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree + 1)
+		errx(1, "unique xattr unlink accounting mismatch");
+	before = after;
+	make_path(path, sizeof(path), "xattr-shared-a");
+	if (unlink(path) == -1)
+		err(1, "unlink xattr-shared-a");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after first shared xattr unlink");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "shared xattr was freed while still referenced");
+	before = after;
+	make_path(path, sizeof(path), "xattr-shared-b");
+	if (unlink(path) == -1)
+		err(1, "unlink xattr-shared-b");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after last shared xattr unlink");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree + 1)
+		errx(1, "last shared xattr unlink accounting mismatch");
 
 	/* Isolate non-final unlink from the legacy rename path below. */
 	make_path(path, sizeof(path),
@@ -1095,6 +1174,18 @@ verify_final_tree (void)
 	check_absent(path);
 	make_path(path, sizeof(path), "fifo");
 	check_absent(path);
+	make_path(path, sizeof(path), "char-device");
+	check_absent(path);
+	make_path(path, sizeof(path), "block-device");
+	check_absent(path);
+	make_path(path, sizeof(path), "unix-socket");
+	check_absent(path);
+	make_path(path, sizeof(path), "xattr-unique");
+	check_absent(path);
+	make_path(path, sizeof(path), "xattr-shared-a");
+	check_absent(path);
+	make_path(path, sizeof(path), "xattr-shared-b");
+	check_absent(path);
 
 	memset(longname, 'n', sizeof(longname) - 1);
 	longname[sizeof(longname) - 1] = '\0';
@@ -1201,6 +1292,8 @@ main (int argc, char **argv)
 		block_size = (size_t)sfs.f_bsize;
 		if (strcmp(argv[1], "verify-create") == 0)
 			verify_created_tree();
+		else if (strcmp(argv[1], "create-growdir") == 0)
+			create_grow_directory();
 		else if (strcmp(argv[1], "mutate") == 0)
 			mutate_filesystem_tree();
 		else if (strcmp(argv[1], "verify-final") == 0)

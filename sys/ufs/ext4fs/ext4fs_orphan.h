@@ -31,4 +31,5 @@ int	ext4fs_orphan_add_handle (struct inode *,
 void	ext4fs_orphan_add_rollback (struct inode *);
 int	ext4fs_orphan_is_tracked (struct inode *);
 int	ext4fs_orphan_pending (struct mount *);
+int	ext4fs_orphan_xattr_validate (struct inode *);
 int	ext4fs_orphan_retire (struct inode *, mode_t);
