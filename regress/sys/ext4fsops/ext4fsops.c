@@ -796,6 +796,25 @@ mutate_filesystem_tree (void)
 	off_t marker, overwrite;
 	int fd, fd2, i;
 
+	/* Exercise journaled retirement with and without extent data. */
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before non-regular unlink");
+	make_path(path, sizeof(path), "fast-link");
+	if (unlink(path) == -1)
+		err(1, "unlink fast-link");
+	make_path(path, sizeof(path), "fifo");
+	if (unlink(path) == -1)
+		err(1, "unlink fifo");
+	make_path(path, sizeof(path), "slow-link");
+	if (unlink(path) == -1)
+		err(1, "unlink slow-link");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after non-regular unlink");
+	if (after.f_ffree != before.f_ffree + 3)
+		errx(1, "non-regular unlink did not free exactly three inodes");
+	if (after.f_bfree != before.f_bfree + 1)
+		errx(1, "slow symlink unlink did not free exactly one block");
+
 	/* Isolate non-final unlink from the legacy rename path below. */
 	make_path(path, sizeof(path),
 	    "link-grow/journal-growth-link");
@@ -1017,7 +1036,6 @@ verify_final_tree (void)
 {
 	struct stat first, second, st;
 	char path[PATH_MAX], other[PATH_MAX], longname[256];
-	char slow_target[97];
 
 	make_path(path, sizeof(path), "data");
 	check_absent(path);
@@ -1072,16 +1090,11 @@ verify_final_tree (void)
 	check_grow_directory(path, 1);
 
 	make_path(path, sizeof(path), "fast-link");
-	check_symlink(path, "data");
-	memset(slow_target, 's', sizeof(slow_target) - 1);
-	slow_target[sizeof(slow_target) - 1] = '\0';
+	check_absent(path);
 	make_path(path, sizeof(path), "slow-link");
-	check_symlink(path, slow_target);
+	check_absent(path);
 	make_path(path, sizeof(path), "fifo");
-	if (lstat(path, &st) == -1)
-		err(1, "lstat %s", path);
-	if (!S_ISFIFO(st.st_mode))
-		errx(1, "%s is not a fifo", path);
+	check_absent(path);
 
 	memset(longname, 'n', sizeof(longname) - 1);
 	longname[sizeof(longname) - 1] = '\0';

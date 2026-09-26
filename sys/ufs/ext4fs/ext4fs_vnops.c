@@ -4277,7 +4277,8 @@ ext4fs_remove (void *v)
 	struct ext4fs_dinode_256 saved_dir_inode, saved_inode;
 	struct ext4fs_journal_handle *handle;
 	struct ext4fs saved_sb;
-	u_int64_t xattr;
+	u_int64_t blocks, size, xattr;
+	u_int32_t inode_flags;
 	u_int32_t saved_feature_ro_compat, saved_last_orphan;
 	u_int16_t depth, nlink;
 	int changed, end_error, error, saved_dir_flags, saved_effnlink;
@@ -4299,15 +4300,44 @@ ext4fs_remove (void *v)
 	nlink = letoh16(din->i_links_count);
 	xattr = letoh32(din->i_extended_attributes_lo) |
 	    ((u_int64_t)letoh16(din->i_extended_attributes_hi) << 32);
+	blocks = letoh32(din->i_blocks_lo) |
+	    ((u_int64_t)letoh16(din->i_blocks_hi) << 32);
+	size = letoh32(din->i_size_lo) |
+	    ((u_int64_t)letoh32(din->i_size_hi) << 32);
+	inode_flags = letoh32(din->i_flags);
 	depth = letoh16(din->i_extent_header.eh_depth);
-	journal_final = nlink == 1 && vp->v_type == VREG &&
-	    (letoh32(din->i_flags) & EXTFS_INODE_FLAG_EXTENTS) &&
-	    letoh16(din->i_extent_header.eh_magic) ==
-	    EXT4FS_EXTENT_HEADER_MAGIC && depth <= 1 && xattr == 0;
+	journal_final = 0;
+	if (nlink == 1 && xattr == 0) {
+		switch (vp->v_type) {
+		case VREG:
+			journal_final =
+			    (inode_flags & EXTFS_INODE_FLAG_EXTENTS) &&
+			    letoh16(din->i_extent_header.eh_magic) ==
+			    EXT4FS_EXTENT_HEADER_MAGIC && depth <= 1;
+			break;
+		case VLNK:
+			if (inode_flags & EXTFS_INODE_FLAG_EXTENTS) {
+				journal_final =
+				    letoh16(din->i_extent_header.eh_magic) ==
+				    EXT4FS_EXTENT_HEADER_MAGIC && depth <= 1;
+			} else {
+				journal_final = blocks == 0 &&
+				    size <= EXT4FS_SYMLINK_LEN_MAX;
+			}
+			break;
+		case VFIFO:
+			journal_final =
+			    !(inode_flags & EXTFS_INODE_FLAG_EXTENTS) &&
+			    blocks == 0 && size == 0;
+			break;
+		default:
+			break;
+		}
+	}
 	/*
 	 * Removing a non-final name needs no orphan record.  Commit the
 	 * directory block, parent inode, and target link count together.  A
-	 * supported final regular-file name also adds the inode to the classic
+	 * supported final name also adds the inode to the classic
 	 * orphan list in that transaction; inactive retirement leaves it there
 	 * until truncation and inode freeing are durable.
 	 */
@@ -5820,7 +5850,9 @@ ext4fs_inactive (void *v)
 
 		if (ip->i_e4fs->m_journal != NULL &&
 		    ext4fs_orphan_is_tracked(ip)) {
-			error = ext4fs_truncate(ip, 0, 0, NOCRED);
+			if (letoh32(ip->i_e4din->dinode.i_flags) &
+			    EXTFS_INODE_FLAG_EXTENTS)
+				error = ext4fs_truncate(ip, 0, 0, NOCRED);
 			if (error == 0)
 				error = ext4fs_orphan_retire(ip, mode);
 			goto out;

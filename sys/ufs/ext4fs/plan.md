@@ -510,19 +510,29 @@ both cases passed against the booted production kernel on 1 KiB, 2 KiB, and
 4 KiB filesystems; remount verification, `e2fsck -fn`, and the
 FLEX_BG/BLOCK_UNINIT control also passed.
 
-Supported final-link removal of regular files now uses the classic orphan
-list.  The namespace removal and orphan insertion commit atomically; final
-close leaves that durable reference in place while truncation commits, then
-removes the reference in the same transaction which retires the inode bitmap,
-group descriptor, counters, inode, and superblock.  A synchronized runtime
-list permits non-head orphans to close safely, and unmount refuses to mark the
-journal clean while a runtime orphan remains.  The regression verifies that
-an open-unlinked inode is not freed early, is freed exactly once on final
-close, and is immediately reusable.  On 2026-09-26, the production-kernel
-matrix passed on 1 KiB, 2 KiB, and 4 KiB filesystems, including remount,
-`e2fsck -fn`, and FLEX_BG/BLOCK_UNINIT checks.  Orphan-file updates, external
-extended attributes, and final-link removal of non-regular inode types remain
-on the legacy path, so the overall unlink checklist item remains open.
+Supported final-link removal of regular files now uses either the classic
+orphan list or the orphan file.  The namespace removal and orphan insertion
+commit atomically; final close leaves that durable reference in place while
+truncation commits, then removes the reference in the same transaction which
+retires the inode bitmap, group descriptor, counters, inode, and superblock.
+A synchronized runtime list permits non-head orphans to close safely, and
+unmount refuses to mark the journal clean while a runtime orphan remains.
+Orphan-file insertion and removal authenticate the orphan-file inode and
+extent map, every block-tail checksum, every occupied slot, and the referenced
+inode checksum; slot and checksum changes are journaled with the
+`ORPHAN_PRESENT` feature bit.  The regression verifies that an open-unlinked
+inode is not freed early, is freed exactly once on final close, is immediately
+reusable, and that two orphans can close out of insertion order.  On
+2026-09-26, the production-kernel matrix passed classic-orphan operation on
+1 KiB, 2 KiB, and 4 KiB filesystems and orphan-file operation on 1 KiB,
+including remount, `e2fsck -fn`, and FLEX_BG/BLOCK_UNINIT checks.  External
+extended attributes remain on the legacy path.  Final-link removal of fast
+symlinks, extent-backed slow symlinks, and FIFOs now uses the same orphan
+lifecycle, with exact inode and data-block accounting added to the ordinary
+and orphan-file regressions.  On 2026-09-26, the full ext4fs regression set
+passed against the booted production kernel with that extension.  Device
+nodes and sockets also remain on the legacy path, so the overall unlink
+checklist item remains open.
 
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only for
 regular-file data, the journal's own I/O, recovery, checkpointing, or another

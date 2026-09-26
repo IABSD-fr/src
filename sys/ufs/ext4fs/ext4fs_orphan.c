@@ -374,7 +374,8 @@ ext4fs_orphan_retire (struct inode *ip, mode_t mode)
 	struct ext4fs saved_sb;
 	struct inode *pip;
 	struct timespec ts;
-	u_int64_t blocks, xattr;
+	u_int64_t blocks, size, xattr;
+	u_int32_t flags;
 	u_int32_t group, next;
 	int changed, end_error, error, saved_flags, saved_modified;
 	u_int32_t saved_feature_ro_compat;
@@ -384,12 +385,17 @@ ext4fs_orphan_retire (struct inode *ip, mode_t mode)
 		return (EOPNOTSUPP);
 	blocks = letoh32(ip->i_e4din->dinode.i_blocks_lo) |
 	    ((u_int64_t)letoh16(ip->i_e4din->dinode.i_blocks_hi) << 32);
+	size = letoh32(ip->i_e4din->dinode.i_size_lo) |
+	    ((u_int64_t)letoh32(ip->i_e4din->dinode.i_size_hi) << 32);
 	xattr = letoh32(ip->i_e4din->dinode.i_extended_attributes_lo) |
 	    ((u_int64_t)letoh16(
 	    ip->i_e4din->dinode.i_extended_attributes_hi) << 32);
-	if (blocks != 0 || xattr != 0 ||
-	    letoh32(ip->i_e4din->dinode.i_size_lo) != 0 ||
-	    letoh32(ip->i_e4din->dinode.i_size_hi) != 0)
+	flags = letoh32(ip->i_e4din->dinode.i_flags);
+	if (blocks != 0 || xattr != 0)
+		return (EBUSY);
+	if (size != 0 && ((mode & S_IFMT) != S_IFLNK ||
+	    (flags & EXTFS_INODE_FLAG_EXTENTS) ||
+	    size > EXT4FS_SYMLINK_LEN_MAX))
 		return (EBUSY);
 
 	group = (ip->i_number - 1) / fs->m_inodes_per_group;
@@ -473,6 +479,8 @@ ext4fs_orphan_retire (struct inode *ip, mode_t mode)
 	}
 
 	getnanotime(&ts);
+	ip->i_e4din->dinode.i_size_lo = 0;
+	ip->i_e4din->dinode.i_size_hi = 0;
 	ip->i_e4din->dinode.i_mode = 0;
 	ip->i_e4din->dinode.i_dtime = htole32((u_int32_t)ts.tv_sec);
 	ip->i_flag |= IN_CHANGE | IN_UPDATE;
