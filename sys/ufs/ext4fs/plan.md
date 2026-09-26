@@ -508,10 +508,21 @@ transaction.  The regression covers both merging a removed entry into its
 predecessor and zeroing the first entry in a directory block.  On 2026-09-26,
 both cases passed against the booted production kernel on 1 KiB, 2 KiB, and
 4 KiB filesystems; remount verification, `e2fsck -fn`, and the
-FLEX_BG/BLOCK_UNINIT control also passed.  Final-link unlink remains on the
-legacy path pending runtime orphan updates, journaled truncation, and
-journaled inode freeing; therefore the overall unlink checklist item remains
-open.
+FLEX_BG/BLOCK_UNINIT control also passed.
+
+Supported final-link removal of regular files now uses the classic orphan
+list.  The namespace removal and orphan insertion commit atomically; final
+close leaves that durable reference in place while truncation commits, then
+removes the reference in the same transaction which retires the inode bitmap,
+group descriptor, counters, inode, and superblock.  A synchronized runtime
+list permits non-head orphans to close safely, and unmount refuses to mark the
+journal clean while a runtime orphan remains.  The regression verifies that
+an open-unlinked inode is not freed early, is freed exactly once on final
+close, and is immediately reusable.  On 2026-09-26, the production-kernel
+matrix passed on 1 KiB, 2 KiB, and 4 KiB filesystems, including remount,
+`e2fsck -fn`, and FLEX_BG/BLOCK_UNINIT checks.  Orphan-file updates, external
+extended attributes, and final-link removal of non-regular inode types remain
+on the legacy path, so the overall unlink checklist item remains open.
 
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only for
 regular-file data, the journal's own I/O, recovery, checkpointing, or another

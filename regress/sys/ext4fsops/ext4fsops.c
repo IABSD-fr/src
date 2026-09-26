@@ -790,6 +790,7 @@ static void
 mutate_filesystem_tree (void)
 {
 	struct statfs before, after;
+	struct statfs orphan_before, orphan_during, orphan_after;
 	struct timeval times[2];
 	char path[PATH_MAX], other[PATH_MAX];
 	off_t marker, overwrite;
@@ -862,14 +863,30 @@ mutate_filesystem_tree (void)
 	if (fd == -1)
 		err(1, "open %s", path);
 	write_pattern_fd(fd, 0, block_size + 19, 0xc5U);
+	if (statfs(root, &orphan_before) == -1)
+		err(1, "statfs before open-file unlink");
 	if (unlink(path) == -1)
 		err(1, "unlink open file");
+	if (statfs(root, &orphan_during) == -1)
+		err(1, "statfs during open-file unlink");
+	if (orphan_during.f_ffree != orphan_before.f_ffree)
+		errx(1, "open-file unlink freed its inode before last close");
 	check_pattern_fd(fd, 0, block_size + 19, 0xc5U);
 	if (fsync(fd) == -1)
 		err(1, "fsync unlinked file");
 	if (close(fd) == -1)
 		err(1, "close unlinked file");
 	check_absent(path);
+	if (statfs(root, &orphan_after) == -1)
+		err(1, "statfs after open-file close");
+	if (orphan_after.f_ffree != orphan_before.f_ffree + 1)
+		errx(1, "last close did not free exactly one orphan inode");
+	make_path(path, sizeof(path), "orphan-reuse");
+	write_text_file(path, "orphan-inode-reused");
+	if (statfs(root, &orphan_during) == -1)
+		err(1, "statfs after orphan inode reuse");
+	if (orphan_during.f_ffree != orphan_before.f_ffree)
+		errx(1, "freed orphan inode was not reusable exactly once");
 
 	make_path(path, sizeof(path), "sparse");
 	fd = open(path, O_RDWR);
@@ -995,6 +1012,8 @@ verify_final_tree (void)
 
 	make_path(path, sizeof(path), "open-unlinked");
 	check_absent(path);
+	make_path(path, sizeof(path), "orphan-reuse");
+	check_text_file(path, "orphan-inode-reused");
 	make_path(path, sizeof(path), "temporary-directory");
 	check_absent(path);
 	make_path(path, sizeof(path), "sparse");

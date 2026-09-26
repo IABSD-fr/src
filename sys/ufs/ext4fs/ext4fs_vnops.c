@@ -63,6 +63,7 @@
 
 #include <ufs/ext4fs/ext4fs.h>
 #include <ufs/ext4fs/ext4fs_journal.h>
+#include <ufs/ext4fs/ext4fs_orphan.h>
 
 /* Convert ext4 directory entry file type to BSD dirent type */
 static const u_int8_t ext4fs_type_to_dt[EXT4FS_FT_MAX] = {
@@ -4275,9 +4276,13 @@ ext4fs_remove (void *v)
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
 	struct ext4fs_dinode_256 saved_dir_inode, saved_inode;
 	struct ext4fs_journal_handle *handle;
-	u_int16_t nlink;
+	struct ext4fs saved_sb;
+	u_int64_t xattr;
+	u_int32_t saved_last_orphan;
+	u_int16_t depth, nlink;
 	int changed, end_error, error, saved_dir_flags, saved_effnlink;
-	int saved_flags;
+	int journal_final, orphan_added, orphan_locked, saved_flags;
+	int saved_modified;
 
 	if (vp->v_type == VDIR) {
 		error = EPERM;
@@ -4292,13 +4297,22 @@ ext4fs_remove (void *v)
 	}
 
 	nlink = letoh16(din->i_links_count);
+	xattr = letoh32(din->i_extended_attributes_lo) |
+	    ((u_int64_t)letoh16(din->i_extended_attributes_hi) << 32);
+	depth = letoh16(din->i_extent_header.eh_depth);
+	journal_final = nlink == 1 && vp->v_type == VREG &&
+	    !(fs->m_feature_compat & EXT4FS_FEATURE_COMPAT_ORPHAN_FILE) &&
+	    (letoh32(din->i_flags) & EXTFS_INODE_FLAG_EXTENTS) &&
+	    letoh16(din->i_extent_header.eh_magic) ==
+	    EXT4FS_EXTENT_HEADER_MAGIC && depth <= 1 && xattr == 0;
 	/*
 	 * Removing a non-final name needs no orphan record.  Commit the
-	 * directory block, parent inode, and target link count together.
-	 * Final-link removal remains on the legacy path until runtime orphan
-	 * insertion, removal, truncation, and inode freeing share a transaction.
+	 * directory block, parent inode, and target link count together.  A
+	 * supported final regular-file name also adds the inode to the classic
+	 * orphan list in that transaction; inactive retirement leaves it there
+	 * until truncation and inode freeing are durable.
 	 */
-	if (fs->m_journal != NULL && nlink > 1) {
+	if (fs->m_journal != NULL && (nlink > 1 || journal_final)) {
 		memcpy(&saved_inode, ip->i_e4din, sizeof(saved_inode));
 		memcpy(&saved_dir_inode, dp->i_e4din,
 		    sizeof(saved_dir_inode));
@@ -4307,9 +4321,21 @@ ext4fs_remove (void *v)
 		saved_effnlink = ip->i_effnlink;
 		handle = NULL;
 		changed = 0;
+		orphan_added = 0;
+		orphan_locked = 0;
+		if (journal_final) {
+			rw_enter_write(&fs->m_runtime_orphan_lock);
+			orphan_locked = 1;
+			saved_sb = fs->m_sble;
+			saved_last_orphan = fs->m_last_orphan;
+			saved_modified = fs->m_fs_was_modified;
+		}
 		error = ext4fs_journal_begin(vp->v_mount, 16, &handle);
-		if (error)
+		if (error) {
+			if (orphan_locked)
+				rw_exit_write(&fs->m_runtime_orphan_lock);
 			goto out;
+		}
 
 		error = ext4fs_dirremove_handle(ip, dvp, handle, &changed);
 		if (error)
@@ -4318,7 +4344,12 @@ ext4fs_remove (void *v)
 		din->i_links_count = htole16(nlink);
 		ip->i_effnlink = nlink;
 		ip->i_flag |= IN_CHANGE;
-		error = ext4fs_update_handle(ip, handle);
+		if (journal_final) {
+			error = ext4fs_orphan_add_handle(ip, handle);
+			if (error == 0)
+				orphan_added = 1;
+		} else
+			error = ext4fs_update_handle(ip, handle);
 		if (error)
 			goto journal_fail;
 		end_error = ext4fs_journal_end(handle);
@@ -4335,6 +4366,8 @@ ext4fs_remove (void *v)
 		}
 		ip->i_flag &= ~IN_MODIFIED;
 		dp->i_flag &= ~IN_MODIFIED;
+		if (orphan_locked)
+			rw_exit_write(&fs->m_runtime_orphan_lock);
 		goto out;
 
 journal_fail:
@@ -4345,12 +4378,21 @@ journal_fail:
 		if (error == 0)
 			error = end_error;
 journal_restore:
+		if (orphan_added)
+			ext4fs_orphan_add_rollback(ip);
 		memcpy(ip->i_e4din, &saved_inode, sizeof(saved_inode));
 		memcpy(dp->i_e4din, &saved_dir_inode,
 		    sizeof(saved_dir_inode));
+		if (orphan_locked) {
+			fs->m_sble = saved_sb;
+			fs->m_last_orphan = saved_last_orphan;
+			fs->m_fs_was_modified = saved_modified;
+		}
 		ip->i_flag = saved_flags;
 		dp->i_flag = saved_dir_flags;
 		ip->i_effnlink = saved_effnlink;
+		if (orphan_locked)
+			rw_exit_write(&fs->m_runtime_orphan_lock);
 		goto out;
 	}
 
@@ -5766,13 +5808,6 @@ ext4fs_inactive (void *v)
 		goto out;
 	}
 
-	/*
-	 * If the inode was deleted (dtime != 0), skip further processing.
-	 */
-	if (letoh32(ip->i_e4din->dinode.i_dtime) != 0) {
-		goto out;
-	}
-
 	nlink = letoh16(ip->i_e4din->dinode.i_links_count);
 
 	/*
@@ -5781,6 +5816,16 @@ ext4fs_inactive (void *v)
 	 */
 	if (nlink == 0 && (vp->v_mount->mnt_flag & MNT_RDONLY) == 0) {
 		struct timespec ts;
+
+		if (ip->i_e4fs->m_journal != NULL &&
+		    ext4fs_orphan_is_tracked(ip)) {
+			error = ext4fs_truncate(ip, 0, 0, NOCRED);
+			if (error == 0)
+				error = ext4fs_orphan_retire(ip, mode);
+			goto out;
+		}
+		if (letoh32(ip->i_e4din->dinode.i_dtime) != 0)
+			goto out;
 
 		(void)ext4fs_truncate(ip, 0, 0, NOCRED);
 
