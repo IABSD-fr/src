@@ -511,7 +511,7 @@ journal handle. This includes:
 - [x] block bitmaps;
 - [x] inode bitmaps;
 - [x] block-group descriptors;
-- [ ] extent-tree roots, index blocks, and leaf blocks;
+- [x] extent-tree roots, index blocks, and leaf blocks;
 - [ ] directory blocks and checksum tails;
 - [ ] orphan-list and orphan-file updates;
 - [ ] allocation and free counters;
@@ -717,6 +717,26 @@ format and block-size combinations passed against the rebuilt booted
 production kernel.  The ordinary, block-bitmap, inode-bitmap, and
 special-inode suites passed in the same run, so this checklist item is
 complete.
+
+The extent-tree writer audit and production-kernel gate are complete
+for supported depth-0 and depth-1 trees.  Inode roots and external leaf
+blocks are updated through the same transaction as data-block and
+extent-block allocation or release.  Direct extent helpers are named
+and guarded as journal-less paths.  A preflight before allocation and a
+second check under the serialized journal handle reject any insertion
+which would require an external index block and depth-2 mutation.
+
+The focused `run-regress-ext4fsops-extents` target starts with a full
+external leaf and exercises a split, another leaf insertion, partial
+truncate and zeroed regrowth, removal of an empty leaf, and complete
+truncate.  Every mutation advances the JBD2 sequence, has exact inode
+block accounting, survives a remount, preserves extent checksums, and
+passes offline `e2fsck -fn`.  A four-leaf boundary fixture also proves
+that unsupported depth-2 growth returns `EOPNOTSUPP` without allocating
+a block, changing descriptor counters, or starting a transaction.  On
+2026-09-27, these cases passed against the rebuilt booted production
+kernel with 1 KiB, 2 KiB, and 4 KiB blocks.  The ordinary, bitmap,
+descriptor, and special-inode targets passed in the same complete run.
 
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only
 for regular-file data, the journal's own I/O, recovery, checkpointing,

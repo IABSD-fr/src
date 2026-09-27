@@ -9,6 +9,7 @@ REGRESS_TARGETS=	run-regress-ext4fsops \
 			run-regress-ext4fsops-bitmap \
 			run-regress-ext4fsops-inode-bitmap \
 			run-regress-ext4fsops-bgd \
+			run-regress-ext4fsops-extents \
 			run-regress-ext4fsops-special
 REGRESS_ROOT_TARGETS=	${REGRESS_TARGETS}
 
@@ -38,6 +39,14 @@ run-regress-ext4fsops-bgd: ${PROG}
 	    EXT4FS_IMAGE_MB='${EXT4FS_IMAGE_MB}' \
 	    EXT4FS_BLOCK_SIZES='${EXT4FS_BLOCK_SIZES}' \
 	    EXT4FSOPS_MODE='bgd' \
+	    sh ${.CURDIR}/operations.sh
+
+run-regress-ext4fsops-extents: ${PROG}
+	env EXT4FSOPS='${.OBJDIR}/${PROG}' \
+	    EXT4FS_TIMEOUT='${EXT4FS_TIMEOUT}' \
+	    EXT4FS_IMAGE_MB='${EXT4FS_IMAGE_MB}' \
+	    EXT4FS_BLOCK_SIZES='${EXT4FS_BLOCK_SIZES}' \
+	    EXT4FSOPS_MODE='extents' \
 	    sh ${.CURDIR}/operations.sh
 
 run-regress-ext4fsops-special: ${PROG}

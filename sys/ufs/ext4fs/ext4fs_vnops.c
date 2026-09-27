@@ -1339,6 +1339,8 @@ ext4fs_extent_metadata_get (struct inode *ip,
 	int error;
 
 	*bpp = NULL;
+	if (handle == NULL && fs->m_journal != NULL)
+		return (EIO);
 	if (handle != NULL)
 		return (ext4fs_journal_get_metadata(handle, ip->i_devvp,
 		    fsblock, bpp));
@@ -1364,6 +1366,8 @@ ext4fs_extent_metadata_new (struct inode *ip,
 	struct buf *bp;
 	int error;
 
+	if (handle == NULL && fs->m_journal != NULL)
+		return (EIO);
 	bp = getblk(ip->i_devvp,
 	    (daddr_t)EXT4FS_FSBTODB(fs, fsblock), fs->m_block_size, 0,
 	    INFSLP);
@@ -1381,11 +1385,13 @@ ext4fs_extent_metadata_new (struct inode *ip,
 }
 
 static int
-ext4fs_extent_metadata_dirty (struct ext4fs_journal_handle *handle,
-    struct buf *bp)
+ext4fs_extent_metadata_dirty (struct inode *ip,
+    struct ext4fs_journal_handle *handle, struct buf *bp)
 {
 	if (handle != NULL)
 		return (ext4fs_journal_dirty_metadata(handle, bp));
+	if (ip->i_e4fs->m_journal != NULL)
+		return (EIO);
 	bdwrite(bp);
 	return (0);
 }
@@ -1396,6 +1402,81 @@ ext4fs_extent_metadata_release (struct ext4fs_journal_handle *handle,
 {
 	if (handle == NULL && bp != NULL)
 		brelse(bp);
+}
+
+/*
+ * Reject an insertion which would require an unsupported external
+ * index block before allocation changes enter a transaction.
+ */
+static int
+ext4fs_extent_insert_check (struct inode *ip, u_int32_t lbn)
+{
+	struct m_ext4fs *fs = ip->i_e4fs;
+	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
+	struct ext4fs_extent_header *eh, *leaf_eh;
+	struct ext4fs_extent_idx *idx;
+	struct buf *bp = NULL;
+	u_int64_t leaf_block;
+	u_int16_t depth, entries, leaf_entries, leaf_max;
+	u_int16_t root_max;
+	int error, found, i;
+
+	eh = &din->i_extent_header;
+	error = ext4fs_extent_header_check(eh,
+	    sizeof(din->i_block), -1);
+	if (error)
+		return (error);
+	depth = letoh16(eh->eh_depth);
+	if (depth > 1)
+		return (EOPNOTSUPP);
+	if (depth == 0)
+		return (ext4fs_extent_leaf_check(fs, eh));
+
+	error = ext4fs_extent_index_check(fs, eh);
+	if (error)
+		return (error);
+	entries = letoh16(eh->eh_entries);
+	root_max = letoh16(eh->eh_max);
+	if (entries == 0)
+		return (EIO);
+	idx = din->i_extent_idx;
+	found = 0;
+	for (i = 0; i < entries; i++) {
+		if (letoh32(idx[i].ei_block) <= lbn)
+			found = i;
+		else
+			break;
+	}
+	leaf_block = letoh32(idx[found].ei_leaf_lo) |
+	    ((u_int64_t)letoh16(idx[found].ei_leaf_hi) << 32);
+	error = bread(ip->i_devvp,
+	    (daddr_t)EXT4FS_FSBTODB(fs, leaf_block),
+	    fs->m_block_size, &bp);
+	if (error) {
+		if (bp != NULL)
+			brelse(bp);
+		return (error);
+	}
+	leaf_eh = (struct ext4fs_extent_header *)bp->b_data;
+	error = ext4fs_extent_header_check(leaf_eh,
+	    fs->m_block_size, 0);
+	if (error == 0)
+		error = ext4fs_extent_block_csum_verify(fs,
+		    ip->i_number, din->i_nfs_generation,
+		    bp->b_data);
+	if (error == 0)
+		error = ext4fs_extent_leaf_check(fs, leaf_eh);
+	if (error)
+		goto out;
+	leaf_entries = letoh16(leaf_eh->eh_entries);
+	leaf_max = letoh16(leaf_eh->eh_max);
+	if (leaf_entries < leaf_max || entries < root_max)
+		goto out;
+	error = EOPNOTSUPP;
+
+out:
+	brelse(bp);
+	return (error);
 }
 
 /*
@@ -1454,7 +1535,7 @@ ext4fs_extent_grow_tree (struct inode *ip,
 
 	ext4fs_extent_block_csum_set(fs, ip->i_number,
 	    din->i_nfs_generation, bp->b_data);
-	error = ext4fs_extent_metadata_dirty(handle, bp);
+	error = ext4fs_extent_metadata_dirty(ip, handle, bp);
 	if (error)
 		return (error);
 
@@ -1493,7 +1574,7 @@ ext4fs_extent_grow_tree (struct inode *ip,
  * Split a full leaf block into two.
  * The old leaf keeps the first half, a new leaf gets the second half.
  * A new index entry is added to the parent (the inode root).
- * Returns ENOSPC if the parent index is also full (depth 2+ needed).
+ * Returns EOPNOTSUPP if the parent is full (depth 2+ needed).
  */
 static int
 ext4fs_leaf_split (struct inode *ip,
@@ -1524,7 +1605,7 @@ ext4fs_leaf_split (struct inode *ip,
 	if (root_entries >= root_max) {
 		ext4fs_extent_metadata_release(handle, old_bp);
 		/* Depth two or greater is not implemented yet. */
-		return (ENOSPC);
+		return (EOPNOTSUPP);
 	}
 
 	/* Allocate block for new leaf. */
@@ -1570,7 +1651,7 @@ ext4fs_leaf_split (struct inode *ip,
 
 	ext4fs_extent_block_csum_set(fs, ip->i_number,
 	    din->i_nfs_generation, new_bp->b_data);
-	error = ext4fs_extent_metadata_dirty(handle, new_bp);
+	error = ext4fs_extent_metadata_dirty(ip, handle, new_bp);
 	if (error) {
 		ext4fs_extent_metadata_release(handle, old_bp);
 		return (error);
@@ -1580,7 +1661,7 @@ ext4fs_leaf_split (struct inode *ip,
 	old_eh->eh_entries = htole16(old_entries);
 	ext4fs_extent_block_csum_set(fs, ip->i_number,
 	    din->i_nfs_generation, old_bp->b_data);
-	error = ext4fs_extent_metadata_dirty(handle, old_bp);
+	error = ext4fs_extent_metadata_dirty(ip, handle, old_bp);
 	if (error)
 		return (error);
 
@@ -1692,7 +1773,7 @@ ext4fs_extent_insert_depth (struct inode *ip,
 			last->e_len = htole16(last_len + len);
 			ext4fs_extent_block_csum_set(fs, ip->i_number,
 			    din->i_nfs_generation, bp->b_data);
-			error = ext4fs_extent_metadata_dirty(handle,
+			error = ext4fs_extent_metadata_dirty(ip, handle,
 			    bp);
 			if (error)
 				return (error);
@@ -1721,7 +1802,7 @@ ext4fs_extent_insert_depth (struct inode *ip,
 		leaf_eh->eh_entries = htole16(leaf_entries + 1);
 		ext4fs_extent_block_csum_set(fs, ip->i_number,
 		    din->i_nfs_generation, bp->b_data);
-		error = ext4fs_extent_metadata_dirty(handle, bp);
+		error = ext4fs_extent_metadata_dirty(ip, handle, bp);
 		if (error)
 			return (error);
 		ip->i_flag |= IN_CHANGE | IN_MODIFIED;
@@ -1753,6 +1834,8 @@ ext4fs_extent_insert_handle (struct inode *ip,
 	u_int16_t entries, maxe, depth;
 	int error, i;
 
+	if (handle == NULL && ip->i_e4fs->m_journal != NULL)
+		return (EIO);
 	error = ext4fs_extent_header_check(eh,
 	    sizeof(din->i_block), -1);
 	if (error)
@@ -1830,9 +1913,16 @@ ext4fs_extent_insert_handle (struct inode *ip,
 }
 
 static int
-ext4fs_extent_insert (struct inode *ip, u_int32_t lbn, u_int64_t pblk,
-    u_int16_t len)
+ext4fs_extent_insert_direct (struct inode *ip, u_int32_t lbn,
+    u_int64_t pblk, u_int16_t len)
 {
+	int error;
+
+	if (ip->i_e4fs->m_journal != NULL)
+		return (EIO);
+	error = ext4fs_extent_insert_check(ip, lbn);
+	if (error)
+		return (error);
 	return (ext4fs_extent_insert_handle(ip, NULL, lbn, pblk, len));
 }
 
@@ -1873,7 +1963,7 @@ ext4fs_inode_blocks_add (struct inode *ip, u_int64_t blocks)
  * Otherwise, allocate a new physical block and insert extent.
  */
 static int
-ext4fs_buf_alloc (struct inode *ip, u_int64_t lbn, int size,
+ext4fs_buf_alloc_direct (struct inode *ip, u_int64_t lbn, int size,
     struct ucred *cred, struct buf **bpp, int flags)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
@@ -1881,6 +1971,10 @@ ext4fs_buf_alloc (struct inode *ip, u_int64_t lbn, int size,
 	u_int64_t pblk, goal, ncontig, i_blocks;
 	int error;
 
+	if (fs->m_journal != NULL)
+		return (EIO);
+	if (lbn > UINT32_MAX)
+		return (EFBIG);
 	/* Check if already mapped */
 	error = ext4fs_extent_pblk(ip, lbn, &pblk, &ncontig);
 	if (error)
@@ -1896,6 +1990,9 @@ ext4fs_buf_alloc (struct inode *ip, u_int64_t lbn, int size,
 			brelse(*bpp);
 		return (error);
 	}
+	error = ext4fs_extent_insert_check(ip, (u_int32_t)lbn);
+	if (error)
+		return (error);
 	/* Not mapped - allocate a new block */
 	/* Goal: try to be contiguous with last extent */
 	goal = 0;
@@ -1922,7 +2019,7 @@ ext4fs_buf_alloc (struct inode *ip, u_int64_t lbn, int size,
 		error = ext4fs_blkalloc(ip, goal, 1, &pblk, &got);
 		if (error)
 			return (error);
-		error = ext4fs_extent_insert(ip, lbn, pblk, 1);
+		error = ext4fs_extent_insert_direct(ip, lbn, pblk, 1);
 		if (error) {
 			ext4fs_blkfree(ip, pblk);
 			return (error);
@@ -1980,6 +2077,9 @@ ext4fs_buf_alloc_handle (struct inode *ip,
 	if (pblk != 0)
 		return (ext4fs_journal_get_metadata(handle, ip->i_devvp,
 		    pblk, bpp));
+	error = ext4fs_extent_insert_check(ip, (u_int32_t)lbn);
+	if (error)
+		return (error);
 
 	goal = 0;
 	if (lbn > 0) {
@@ -4406,6 +4506,9 @@ ext4fs_write_allocated_block (struct inode *ip, struct uio *uio,
 		return (EOPNOTSUPP);
 	if (lbn > UINT32_MAX)
 		return (EFBIG);
+	error = ext4fs_extent_insert_check(ip, (u_int32_t)lbn);
+	if (error)
+		return (error);
 	goal = 0;
 	if (lbn > 0 && ext4fs_extent_pblk(ip, lbn - 1, &previous,
 	    &ncontig) == 0 && previous != 0)
@@ -4420,6 +4523,9 @@ ext4fs_write_allocated_block (struct inode *ip, struct uio *uio,
 	error = ext4fs_journal_begin(vp->v_mount, 9, &handle);
 	if (error)
 		return (error);
+	error = ext4fs_extent_insert_check(ip, (u_int32_t)lbn);
+	if (error)
+		goto fail;
 
 	error = ext4fs_blkalloc_handle(ip, handle, goal, 1, &pblk,
 	    &got);
@@ -4615,7 +4721,7 @@ ext4fs_write (void *v)
 			    &prealloc_got);
 			if (error)
 				break;
-			error = ext4fs_extent_insert(ip, lbn,
+			error = ext4fs_extent_insert_direct(ip, lbn,
 			    prealloc_start, prealloc_got);
 			if (error) {
 				for (prealloc_i = 0;
@@ -4643,7 +4749,7 @@ ext4fs_write (void *v)
 			/* Already mapped */
 		} else {
 			/* Allocate one block. */
-			error = ext4fs_buf_alloc(ip, lbn,
+			error = ext4fs_buf_alloc_direct(ip, lbn,
 			    fs->m_block_size, ap->a_cred, NULL, 0);
 			if (error)
 				break;
@@ -6201,7 +6307,8 @@ ext4fs_mkdir (void *v)
 	din->i_links_count = htole16(2);
 
 	/* Allocate first block for "." and ".." */
-	error = ext4fs_buf_alloc(ip, 0, fs->m_block_size, cnp->cn_cred,
+	error = ext4fs_buf_alloc_direct(ip, 0, fs->m_block_size,
+	    cnp->cn_cred,
 	    &bp, B_CLRBUF);
 	if (error)
 		goto bad;
@@ -7161,7 +7268,7 @@ ext4fs_direnter (struct inode *ip, struct vnode *dvp,
 
 		if (blkoff == 0) {
 			/* Need a new block */
-			error = ext4fs_buf_alloc(dp, lbn,
+			error = ext4fs_buf_alloc_direct(dp, lbn,
 			    fs->m_block_size, cnp->cn_cred, &bp,
 			    B_CLRBUF);
 			if (error)

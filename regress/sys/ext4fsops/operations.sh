@@ -747,6 +747,152 @@ run_bgd_case()
 	echo " ok"
 }
 
+extent_leaf_count()
+{
+	stage=$1
+	output=$case_dir/extents-$stage.log
+	if ! "$DEBUGFS" -R 'stat /extent-probe' "$image" \
+	    >"$output" 2>&1; then
+		cat "$output" >&2
+		fail "could not inspect the extent fixture after $stage"
+	fi
+	awk '
+	    {
+		line = $0
+		while (match(line, /\(ETB0\):/)) {
+			count++
+			line = substr(line, RSTART + RLENGTH)
+		}
+	    }
+	    END { print count + 0 }
+	' "$output"
+}
+
+check_extent_leaf_count()
+{
+	expected=$1
+	stage=$2
+	actual=$(extent_leaf_count "$stage")
+	case "$actual" in
+	*[!0-9]*|'')
+		fail "could not count extent leaves after $stage"
+		;;
+	esac
+	if [ "$actual" -ne "$expected" ]; then
+		reason="expected $expected leaves after $stage"
+		fail "$reason, got $actual"
+	fi
+}
+
+prepare_extent_fixture()
+{
+	fixture_entries=$1
+	source_root=$case_dir/source
+	source_file=$source_root/extent-probe
+	fixture_size=$(((2 * fixture_entries - 1) * block_size))
+	mkdir "$source_root"
+	dd if=/dev/zero of="$source_file" bs=1 count=0 \
+	    seek="$fixture_size" status=none
+	fixture_entry=0
+	while [ "$fixture_entry" -lt "$fixture_entries" ]; do
+		fixture_offset=$((2 * fixture_entry * block_size))
+		printf x | dd of="$source_file" bs=1 \
+		    seek="$fixture_offset" conv=notrunc status=none
+		fixture_entry=$((fixture_entry + 1))
+	done
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O 'metadata_csum,^orphan_file' -d "$source_root" \
+	    "$image" >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs could not create the extent fixture"
+	fi
+	check_image fixture
+}
+
+run_extent_step()
+{
+	action=$1
+	expected_leaves=$2
+	attach_image
+	mount_image ""
+	run_step "$action" "$mountpoint"
+	unmount_image "$action"
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "$action did not advance the journal sequence"
+	check_image "$action"
+	check_extent_leaf_count "$expected_leaves" "$action"
+	sequence_before=$sequence_after
+}
+
+run_extent_case()
+{
+	block_size=$1
+	case_dir=$work/extents-$block_size
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	test_name="extent-tree transactions ($block_size byte blocks)"
+	print_test_name "$test_name"
+
+	extent_capacity=$(((block_size - 12) / 12))
+	prepare_extent_fixture "$extent_capacity"
+	check_extent_leaf_count 1 fixture
+	sequence_before=$(journal_sequence)
+	run_extent_step extent-split 2
+	run_extent_step extent-append 2
+	run_extent_step extent-shrink 2
+	run_extent_step extent-prune 1
+	run_extent_step extent-zero 0
+
+	attach_image
+	mount_image ""
+	run_step extent-verify-zero "$mountpoint"
+	unmount_image extent-final
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" = "$sequence_before" ] ||
+	    fail "zero extent verification started a transaction"
+	check_image extent-final
+	echo " ok"
+}
+
+run_extent_reject_case()
+{
+	block_size=1024
+	case_dir=$work/extents-reject-$block_size
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	test_name="depth-2 extent growth rejection"
+	print_test_name "$test_name"
+
+	extent_capacity=$(((block_size - 12) / 12))
+	prepare_extent_fixture "$((4 * extent_capacity - 3))"
+	check_extent_leaf_count 4 fixture
+	group_descriptor_counts >"$case_dir/counts-before"
+	sequence_before=$(journal_sequence)
+
+	attach_image
+	mount_image noatime
+	run_step extent-reject "$mountpoint"
+	unmount_image extent-reject
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" = "$sequence_before" ] ||
+	    fail "rejected deep growth started a transaction"
+	check_image extent-reject
+	check_extent_leaf_count 4 extent-reject
+	group_descriptor_counts >"$case_dir/counts-after"
+	cmp -s "$case_dir/counts-before" "$case_dir/counts-after" || {
+		diff -u "$case_dir/counts-before" \
+		    "$case_dir/counts-after" >&2 || :
+		fail "rejected deep growth changed descriptor counters"
+	}
+	echo " ok"
+}
+
 run_special_case()
 {
 	case_dir=$work/special-inodes
@@ -827,6 +973,22 @@ bgd)
 			run_bgd_case "$block_size" "$descriptor_size"
 		done
 	done
+	exit 0
+	;;
+extents)
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		case "$block_size" in
+		1024|2048|4096) ;;
+		*)
+			echo "bad block size: $block_size" >&2
+			exit 1
+			;;
+		esac
+		run_extent_case "$block_size"
+	done
+	case " $EXT4FS_BLOCK_SIZES " in
+	*' 1024 '*) run_extent_reject_case ;;
+	esac
 	exit 0
 	;;
 full) ;;

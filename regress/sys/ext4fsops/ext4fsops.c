@@ -37,6 +37,9 @@
 #define EXTENT_WRITES	12
 #define SHRINK_EXTENT_LBN	10
 #define SHRINK_EXTENT_BYTES	37
+#define EXTENT_NODE_HEADER_BYTES	12
+#define EXTENT_NODE_ENTRY_BYTES	12
+#define EXTENT_PARTIAL_BYTES	37
 #define DIR_TAIL_BYTES	12
 #define FAST_SYMLINK_BYTES	60
 #define IO_CHUNK	4096
@@ -45,6 +48,8 @@
 #define APPEND_SEED	0x52U
 #define OVERWRITE_SEED	0x93U
 #define EXTENT_SEED	0xb4U
+#define EXTENT_SPLIT_SEED	0x68U
+#define EXTENT_APPEND_SEED	0x79U
 #define BITMAP_SEED	0xc7U
 
 static char root[PATH_MAX];
@@ -87,6 +92,17 @@ static void	verify_readonly_tree (void);
 static void	create_allocation_probe (void);
 static void	verify_allocation_probe (void);
 static void	create_extent_file (const char *);
+static size_t	extent_leaf_capacity (void);
+static off_t	extent_lbn_offset (size_t);
+static int	check_extent_fixture (off_t, size_t);
+static void	check_extent_source (int, size_t);
+static void	extent_split_fixture (void);
+static void	extent_append_fixture (void);
+static void	extent_shrink_fixture (void);
+static void	extent_prune_fixture (void);
+static void	extent_zero_fixture (void);
+static void	extent_verify_zero_fixture (void);
+static void	extent_reject_deep_growth (void);
 static void	allocate_bitmap_probe (void);
 static void	verify_bitmap_probe (int);
 static void	free_bitmap_probe (void);
@@ -569,6 +585,272 @@ create_extent_file (const char *path)
 		err(1, "fsync %s", path);
 	if (close(fd) == -1)
 		err(1, "close %s", path);
+}
+
+static size_t
+extent_leaf_capacity (void)
+{
+	return ((block_size - EXTENT_NODE_HEADER_BYTES) /
+	    EXTENT_NODE_ENTRY_BYTES);
+}
+
+static off_t
+extent_lbn_offset (size_t lbn)
+{
+	return ((off_t)lbn * (off_t)block_size);
+}
+
+static int
+check_extent_fixture (off_t expected_size, size_t expected_blocks)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	blkcnt_t expected_sectors;
+	int fd;
+
+	make_path(path, sizeof(path), "extent-probe");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	expected_sectors = (blkcnt_t)expected_blocks *
+	    (blkcnt_t)(block_size / 512);
+	if (!S_ISREG(st.st_mode) || st.st_nlink != 1 ||
+	    st.st_size != expected_size ||
+	    st.st_blocks != expected_sectors)
+		errx(1, "extent fixture has wrong inode shape");
+	return (fd);
+}
+
+static void
+check_extent_source (int fd, size_t index)
+{
+	unsigned char byte;
+	off_t offset;
+	ssize_t n;
+
+	offset = extent_lbn_offset(2 * index);
+	n = pread(fd, &byte, 1, offset);
+	if (n == -1)
+		err(1, "pread source extent");
+	if (n != 1 || byte != 'x')
+		errx(1, "source extent mismatch at logical block %zu",
+		    2 * index);
+	check_zero_fd(fd, offset + 1, block_size - 1);
+}
+
+static void
+extent_split_fixture (void)
+{
+	struct stat st;
+	size_t capacity, split_lbn;
+	off_t original_size, split_size;
+	int fd;
+
+	capacity = extent_leaf_capacity();
+	split_lbn = 2 * capacity;
+	original_size = extent_lbn_offset(2 * capacity - 1);
+	split_size = extent_lbn_offset(split_lbn + 1);
+	fd = check_extent_fixture(original_size, capacity + 1);
+	check_extent_source(fd, 0);
+	check_extent_source(fd, capacity - 1);
+	check_zero_fd(fd, extent_lbn_offset(1), block_size);
+	write_pattern_fd(fd, extent_lbn_offset(split_lbn), block_size,
+	    EXTENT_SPLIT_SEED);
+	if (fsync(fd) == -1)
+		err(1, "fsync split extent fixture");
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat split extent fixture");
+	if (st.st_size != split_size ||
+	    st.st_blocks != (blkcnt_t)(capacity + 3) *
+	    (blkcnt_t)(block_size / 512))
+		errx(1, "extent split has wrong inode shape");
+	check_pattern_fd(fd, extent_lbn_offset(split_lbn), block_size,
+	    EXTENT_SPLIT_SEED);
+	if (close(fd) == -1)
+		err(1, "close split extent fixture");
+}
+
+static void
+extent_append_fixture (void)
+{
+	struct stat st;
+	size_t append_lbn, capacity, split_lbn;
+	off_t append_size, split_size;
+	int fd;
+
+	capacity = extent_leaf_capacity();
+	split_lbn = 2 * capacity;
+	append_lbn = split_lbn + 2;
+	split_size = extent_lbn_offset(split_lbn + 1);
+	append_size = extent_lbn_offset(append_lbn + 1);
+	fd = check_extent_fixture(split_size, capacity + 3);
+	check_pattern_fd(fd, extent_lbn_offset(split_lbn), block_size,
+	    EXTENT_SPLIT_SEED);
+	write_pattern_fd(fd, extent_lbn_offset(append_lbn), block_size,
+	    EXTENT_APPEND_SEED);
+	if (fsync(fd) == -1)
+		err(1, "fsync appended extent fixture");
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat appended extent fixture");
+	if (st.st_size != append_size ||
+	    st.st_blocks != (blkcnt_t)(capacity + 4) *
+	    (blkcnt_t)(block_size / 512))
+		errx(1, "extent append has wrong inode shape");
+	check_pattern_fd(fd, extent_lbn_offset(append_lbn), block_size,
+	    EXTENT_APPEND_SEED);
+	if (close(fd) == -1)
+		err(1, "close appended extent fixture");
+}
+
+static void
+extent_shrink_fixture (void)
+{
+	struct stat st;
+	size_t append_lbn, capacity, split_lbn;
+	off_t append_size, retained_size, split_offset, split_size;
+	int fd;
+
+	capacity = extent_leaf_capacity();
+	split_lbn = 2 * capacity;
+	append_lbn = split_lbn + 2;
+	split_offset = extent_lbn_offset(split_lbn);
+	split_size = extent_lbn_offset(split_lbn + 1);
+	append_size = extent_lbn_offset(append_lbn + 1);
+	retained_size = split_offset + EXTENT_PARTIAL_BYTES;
+	fd = check_extent_fixture(append_size, capacity + 4);
+	check_pattern_fd(fd, extent_lbn_offset(append_lbn), block_size,
+	    EXTENT_APPEND_SEED);
+	if (ftruncate(fd, retained_size) == -1)
+		err(1, "shrink extent fixture");
+	if (fsync(fd) == -1)
+		err(1, "fsync shrunken extent fixture");
+	if (ftruncate(fd, split_size) == -1)
+		err(1, "regrow extent fixture");
+	if (fsync(fd) == -1)
+		err(1, "fsync regrown extent fixture");
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat regrown extent fixture");
+	if (st.st_size != split_size ||
+	    st.st_blocks != (blkcnt_t)(capacity + 3) *
+	    (blkcnt_t)(block_size / 512))
+		errx(1, "extent shrink has wrong inode shape");
+	check_pattern_fd(fd, split_offset, EXTENT_PARTIAL_BYTES,
+	    EXTENT_SPLIT_SEED);
+	check_zero_fd(fd, split_offset + EXTENT_PARTIAL_BYTES,
+	    block_size - EXTENT_PARTIAL_BYTES);
+	if (close(fd) == -1)
+		err(1, "close shrunken extent fixture");
+}
+
+static void
+extent_prune_fixture (void)
+{
+	struct stat st;
+	size_t capacity, first_entries, split_lbn;
+	off_t pruned_size, split_size;
+	int fd;
+
+	capacity = extent_leaf_capacity();
+	split_lbn = 2 * capacity;
+	first_entries = capacity - capacity / 2;
+	split_size = extent_lbn_offset(split_lbn + 1);
+	pruned_size = extent_lbn_offset(2 * first_entries);
+	fd = check_extent_fixture(split_size, capacity + 3);
+	if (ftruncate(fd, pruned_size) == -1)
+		err(1, "prune extent fixture");
+	if (fsync(fd) == -1)
+		err(1, "fsync pruned extent fixture");
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat pruned extent fixture");
+	if (st.st_size != pruned_size ||
+	    st.st_blocks != (blkcnt_t)(first_entries + 1) *
+	    (blkcnt_t)(block_size / 512))
+		errx(1, "extent prune has wrong inode shape");
+	check_extent_source(fd, 0);
+	check_extent_source(fd, first_entries - 1);
+	if (close(fd) == -1)
+		err(1, "close pruned extent fixture");
+}
+
+static void
+extent_zero_fixture (void)
+{
+	struct stat st;
+	size_t capacity, first_entries;
+	off_t pruned_size;
+	int fd;
+
+	capacity = extent_leaf_capacity();
+	first_entries = capacity - capacity / 2;
+	pruned_size = extent_lbn_offset(2 * first_entries);
+	fd = check_extent_fixture(pruned_size, first_entries + 1);
+	if (ftruncate(fd, 0) == -1)
+		err(1, "zero extent fixture");
+	if (fsync(fd) == -1)
+		err(1, "fsync zeroed extent fixture");
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat zeroed extent fixture");
+	if (st.st_size != 0 || st.st_blocks != 0)
+		errx(1, "zeroed extent fixture retains blocks");
+	if (close(fd) == -1)
+		err(1, "close zeroed extent fixture");
+}
+
+static void
+extent_verify_zero_fixture (void)
+{
+	int fd;
+
+	fd = check_extent_fixture(0, 0);
+	if (close(fd) == -1)
+		err(1, "close verified extent fixture");
+}
+
+static void
+extent_reject_deep_growth (void)
+{
+	struct stat st;
+	struct statfs before, after;
+	unsigned char buf[IO_CHUNK];
+	size_t capacity, entries, reject_lbn;
+	off_t original_size;
+	ssize_t n;
+	int fd;
+
+	capacity = extent_leaf_capacity();
+	entries = 4 * capacity - 3;
+	reject_lbn = 2 * entries;
+	original_size = extent_lbn_offset(2 * entries - 1);
+	fd = check_extent_fixture(original_size, entries + 4);
+	check_extent_source(fd, 0);
+	check_extent_source(fd, entries - 1);
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before rejected extent growth");
+	fill_pattern(buf, block_size, extent_lbn_offset(reject_lbn),
+	    EXTENT_APPEND_SEED);
+	errno = 0;
+	n = pwrite(fd, buf, block_size,
+	    extent_lbn_offset(reject_lbn));
+	if (n != -1)
+		errx(1, "unsupported deep extent growth succeeded");
+	if (errno != EOPNOTSUPP)
+		errx(1, "deep extent growth failed with %s",
+		    strerror(errno));
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat rejected extent fixture");
+	if (st.st_size != original_size ||
+	    st.st_blocks != (blkcnt_t)(entries + 4) *
+	    (blkcnt_t)(block_size / 512))
+		errx(1, "rejected extent growth changed inode shape");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after rejected extent growth");
+	if (after.f_bfree != before.f_bfree ||
+	    after.f_ffree != before.f_ffree)
+		errx(1, "rejected extent growth changed free counts");
+	if (close(fd) == -1)
+		err(1, "close rejected extent fixture");
 }
 
 static void
@@ -1924,6 +2206,20 @@ main (int argc, char **argv)
 			verify_special_files();
 		else if (strcmp(argv[1], "remove-special") == 0)
 			remove_special_files();
+		else if (strcmp(argv[1], "extent-split") == 0)
+			extent_split_fixture();
+		else if (strcmp(argv[1], "extent-append") == 0)
+			extent_append_fixture();
+		else if (strcmp(argv[1], "extent-shrink") == 0)
+			extent_shrink_fixture();
+		else if (strcmp(argv[1], "extent-prune") == 0)
+			extent_prune_fixture();
+		else if (strcmp(argv[1], "extent-zero") == 0)
+			extent_zero_fixture();
+		else if (strcmp(argv[1], "extent-verify-zero") == 0)
+			extent_verify_zero_fixture();
+		else if (strcmp(argv[1], "extent-reject") == 0)
+			extent_reject_deep_growth();
 		else
 			errx(1, "unknown mode: %s", argv[1]);
 	}
