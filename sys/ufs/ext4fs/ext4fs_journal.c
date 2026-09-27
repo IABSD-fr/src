@@ -295,13 +295,15 @@ jbd2_fill_blockmap_from_eh (struct jbd2_replay_ctx *ctx,
 
 			for (jblock = 0; jblock < len; jblock++) {
 				u_int32_t j = lblk + jblock;
+				struct jbd2_blockmap_entry *entry;
+
 				if (j < lblk)
 					return (EINVAL);
 				if (j < ctx->rc_blockmap_count) {
-					if (ctx->rc_blockmap[j].
-					    jb_fsblock != 0)
+					entry = &ctx->rc_blockmap[j];
+					if (entry->jb_fsblock != 0)
 						return (EINVAL);
-					ctx->rc_blockmap[j].jb_fsblock =
+					entry->jb_fsblock =
 					    pblock + jblock;
 				}
 			}
@@ -734,9 +736,12 @@ jbd2_revoke_check (struct jbd2_replay_ctx *ctx, u_int64_t block,
 	    2654435761U;
 	hash &= mask;
 	while (ctx->rc_revoke[hash].re_block != 0) {
-		if (ctx->rc_revoke[hash].re_block == key)
-			return ((int32_t)(ctx->rc_revoke[hash].
-			    re_sequence - sequence) >= 0);
+		struct jbd2_revoke_entry *entry;
+
+		entry = &ctx->rc_revoke[hash];
+		if (entry->re_block == key)
+			return ((int32_t)(entry->re_sequence -
+			    sequence) >= 0);
 		hash = (hash + 1) & mask;
 	}
 	return (0);

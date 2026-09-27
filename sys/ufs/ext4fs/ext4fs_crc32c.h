@@ -32,7 +32,7 @@ u_int32_t	ext4fs_csum_seed (struct m_ext4fs *);
 /* Compute a block or inode bitmap checksum. */
 u_int32_t	ext4fs_bitmap_csum (struct m_ext4fs *, u_int32_t,
     const void *, size_t);
-u_int16_t ext4fs_bgd_csum (struct m_ext4fs *,
+u_int16_t	ext4fs_bgd_csum (struct m_ext4fs *,
     struct ext4fs_block_group_descriptor *, u_int32_t);
 int	ext4fs_bgd_csum_verify (struct m_ext4fs *,
     struct ext4fs_block_group_descriptor *, u_int32_t);

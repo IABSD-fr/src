@@ -385,6 +385,7 @@ ext4fs_orphan_retire (struct inode *ip, mode_t mode)
 	struct ext4fs_runtime_orphan *orphan, *previous;
 	struct ext4fs_block_group_descriptor saved_gd, saved_xattr_gd;
 	struct ext4fs_dinode_256 saved_inode;
+	struct ext4fs_dinode *previous_din;
 	struct ext4fs_journal_handle *handle;
 	struct ext4fs saved_sb;
 	struct inode *pip;
@@ -470,12 +471,14 @@ ext4fs_orphan_retire (struct inode *ip, mode_t mode)
 			error = EINVAL;
 			goto unchanged;
 		}
-		if (previous != NULL &&
-		    letoh32(previous->ro_inode->i_e4din->
-		    dinode.i_dtime) !=
-		    ip->i_number) {
-			error = EINVAL;
-			goto unchanged;
+		if (previous != NULL) {
+			previous_din =
+			    &previous->ro_inode->i_e4din->dinode;
+			if (letoh32(previous_din->i_dtime) !=
+			    ip->i_number) {
+				error = EINVAL;
+				goto unchanged;
+			}
 		}
 	}
 	xattr_references = 0;

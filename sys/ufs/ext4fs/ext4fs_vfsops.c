@@ -229,8 +229,10 @@ ext4fs_mount (struct mount *mp, const char *path, void *data,
 		error = ext4fs_mountfs(devvp, mp, p);
 	} else {
 		ump = VFSTOUFS(mp);
-		if (devvp != ump->um_devvp)
-			error = EINVAL;	/* XXX needs translation */
+		if (devvp != ump->um_devvp) {
+			/* XXX needs translation */
+			error = EINVAL;
+		}
 		else
 			vrele(devvp);
 	}
@@ -428,7 +430,8 @@ ext4fs_mountfs (struct vnode *devvp, struct mount *mp, struct proc *p)
 	ump->um_devvp = devvp;
 	ump->um_nindir = EXT4FS_NINDIR(mfs);
 	ump->um_bptrtodb = mfs->m_fs_block_to_disk_block;
-	ump->um_seqinc = 1; /* no frags */
+	/* No fragments. */
+	ump->um_seqinc = 1;
 	ump->um_maxsymlinklen = EXT4FS_SYMLINK_LEN_MAX;
 	devvp->v_specmountpoint = mp;
 
@@ -446,8 +449,9 @@ ext4fs_mountfs (struct vnode *devvp, struct mount *mp, struct proc *p)
 		/*
 		 * Keep the filesystem clean while orphan recovery
 		 * checkpoints.  Incomplete recovery retains an orphan
-		 * root and can resume on the next writable mount.  Mark it
-		 * dirty only after those roots are gone.
+		 * root.  It can resume on the next writable mount.
+		 * Mark the filesystem dirty only after those roots are
+		 * gone.
 		 */
 		if (recovered)
 			mfs->m_state &= ~EXT4FS_STATE_VALID;
@@ -497,7 +501,8 @@ ext4fs_sbcheck (struct ext4fs *sble, int ronly)
 	tmp = letoh16(sble->sb_magic);
 	if (tmp != EXT4FS_MAGIC) {
 		printf("ext2fs: wrong magic number 0x%x\n", tmp);
-		return (EIO);		/* XXX needs translation */
+		/* XXX needs translation */
+		return (EIO);
 	}
 
 	if (ext4fs_sb_csum_verify(sble) != 0) {
@@ -511,7 +516,8 @@ ext4fs_sbcheck (struct ext4fs *sble, int ronly)
 		/* Skewed log: 1024 -> 0, 2048 -> 1, 4096 -> 2. */
 		tmp += 10;
 		printf("ext2fs: wrong log2(block size) %d\n", tmp);
-		return (EIO);	   /* XXX needs translation */
+		/* XXX needs translation */
+		return (EIO);
 	}
 
 	if (letoh32(sble->sb_blocks_per_group) == 0) {
@@ -527,7 +533,8 @@ ext4fs_sbcheck (struct ext4fs *sble, int ronly)
 	tmp = letoh32(sble->sb_revision_level);
 	if (tmp != EXT4FS_REV_DYNAMIC) {
 		printf("ext2fs: wrong revision number 0x%x\n", tmp);
-		return (EIO);		/* XXX needs translation */
+		/* XXX needs translation */
+		return (EIO);
 	}
 
 	tmp = letoh16(sble->sb_inode_size);
@@ -539,7 +546,8 @@ ext4fs_sbcheck (struct ext4fs *sble, int ronly)
 	tmp = letoh32(sble->sb_first_non_reserved_inode);
 	if (tmp != EXT4FS_INODE_FIRST) {
 		printf("ext4fs: first inode at 0x%x\n", tmp);
-		return (EINVAL);      /* XXX needs translation */
+		/* XXX needs translation */
+		return (EINVAL);
 	}
 
 	tmp = letoh32(sble->sb_block_group_descriptor_size);
@@ -556,7 +564,8 @@ ext4fs_sbcheck (struct ext4fs *sble, int ronly)
 		    mask);
 		PRINTF_FEATURES(mask, ext4fs_feature_incompat);
 		printf("\n");
-		return (EINVAL);      /* XXX needs translation */
+		/* XXX needs translation */
+		return (EINVAL);
 	}
 
 	if (tmp & EXT4FS_FEATURE_INCOMPAT_RECOVER) {
@@ -1022,6 +1031,8 @@ ext4fs_inode_alloc (struct inode *pip, mode_t mode, struct ucred *cred,
 	struct m_ext4fs *fs = pip->i_e4fs;
 	struct vnode *pvp = ITOV(pip);
 	struct ext4fs_block_group_descriptor *gd;
+	struct ext4fs_dinode *din;
+	struct ext4fs_extent_header *eh;
 	struct buf *bp, *tbp;
 	struct inode *ip;
 	u_int32_t group, ngroups, ino_in_group, pbit, tb, it_blocks;
@@ -1177,8 +1188,8 @@ ext4fs_inode_alloc (struct inode *pip, mode_t mode, struct ucred *cred,
 					if (fs->m_feature_incompat &
 				    EXT4FS_FEATURE_INCOMPAT_64BIT)
 						dirs |= (u_int32_t)
-						    letoh16(gd->
-					    bgd_used_dirs_count_hi)
+						    letoh16(
+				    gd->bgd_used_dirs_count_hi)
 						    << 16;
 					dirs++;
 					gd->bgd_used_dirs_count_lo =
@@ -1223,18 +1234,13 @@ ext4fs_inode_alloc (struct inode *pip, mode_t mode, struct ucred *cred,
 				    sizeof(struct ext4fs_dinode_256));
 
 				/* Initialize extent header */
-				ip->i_e4din->dinode.i_extent_header.
-				    eh_magic =
-				    htole16(EXT4FS_EXTENT_HEADER_MAGIC);
-				ip->i_e4din->dinode.i_extent_header.
-				    eh_entries =
-				    htole16(0);
-				ip->i_e4din->dinode.i_extent_header.
-				    eh_max =
-				    htole16(4);
-				ip->i_e4din->dinode.i_extent_header.
-				    eh_depth =
-				    htole16(0);
+				din = &ip->i_e4din->dinode;
+				eh = &din->i_extent_header;
+				eh->eh_magic = htole16(
+				    EXT4FS_EXTENT_HEADER_MAGIC);
+				eh->eh_entries = htole16(0);
+				eh->eh_max = htole16(4);
+				eh->eh_depth = htole16(0);
 				ip->i_e4din->dinode.i_flags =
 				    htole32(EXTFS_INODE_FLAG_EXTENTS);
 
@@ -1994,8 +2000,8 @@ ext4fs_vget (struct mount *mp, ino_t ino, struct vnode **vpp)
 
 	if (error) {
 		/*
-		 * ufs_ihashins locked, then unlocked, the vnode on error.
-		 * We need to properly clean up the inode and vnode.
+		 * ufs_ihashins locked and then unlocked the vnode on
+		 * error.  We need to clean up the inode and vnode.
 		 * vrele will trigger reclaim which will free the inode.
 		 */
 		vrele(vp);

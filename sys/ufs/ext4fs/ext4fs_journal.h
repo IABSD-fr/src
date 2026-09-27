@@ -149,13 +149,15 @@ struct jbd2_block_tag {
 	u_int32_t	t_blocknr;
 	u_int16_t	t_checksum;
 	u_int16_t	t_flags;
-	u_int32_t	t_blocknr_high;	/* only if 64BIT */
+	/* Present only with the 64BIT feature. */
+	u_int32_t	t_blocknr_high;
 } __attribute__((packed));
 
 /* Revoke block header */
 struct jbd2_revoke_header {
 	struct jbd2_header r_header;
-	u_int32_t	r_count;	/* bytes used in this block */
+	/* Bytes used in this block. */
+	u_int32_t	r_count;
 } __attribute__((packed));
 
 /* Revocation table entry */
@@ -167,7 +169,8 @@ struct jbd2_revoke_entry {
 
 /* Block map entry: journal block -> filesystem block */
 struct jbd2_blockmap_entry {
-	u_int64_t	jb_fsblock;	/* filesystem block number */
+	/* Filesystem block number. */
+	u_int64_t	jb_fsblock;
 };
 
 struct jbd2_replay_ctx {
@@ -179,8 +182,10 @@ struct jbd2_replay_ctx {
 	u_int32_t		rc_blocksize;
 	u_int32_t		rc_maxlen;
 	u_int32_t		rc_first;
-	u_int32_t		rc_sequence;	/* starting sequence */
-	u_int32_t		rc_start;	/* starting block */
+	/* Starting sequence. */
+	u_int32_t		rc_sequence;
+	/* Starting block. */
+	u_int32_t		rc_start;
 	/* Next unused block when clean. */
 	u_int32_t		rc_head;
 	u_int32_t		rc_max_transaction;
