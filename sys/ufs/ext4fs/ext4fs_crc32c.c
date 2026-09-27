@@ -1,17 +1,19 @@
 /*
  * Copyright (c) 2025 kmx.io.
  *
- * Permission to use, copy, modify, and distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
+ * Permission to use, copy, modify, and distribute this software for
+ * any purpose with or without fee is hereby granted, provided that the
+ * above copyright notice and this permission notice appear in all
+ * copies.
  *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+ * WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE
+ * AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL
+ * DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA
+ * OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+ * TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+ * PERFORMANCE OF THIS SOFTWARE.
  */
 
 #include <sys/param.h>
@@ -148,7 +150,7 @@ ext4fs_inode_has_csum_hi (const struct ext4fs_dinode_256 *dp)
 {
 	size_t end;
 
-	/* i_extra_isize counts bytes beginning at the 128-byte boundary. */
+	/* i_extra_isize starts at the 128-byte boundary. */
 	end = offsetof(struct ext4fs_dinode, i_checksum_hi) +
 	    sizeof(dp->dinode.i_checksum_hi);
 	return (letoh16(dp->dinode.i_extra_isize) >= end - 128);
@@ -202,7 +204,8 @@ ext4fs_inode_csum_verify (struct m_ext4fs *fs,
 	provided = letoh16(dp->dinode.i_checksum_lo);
 	calculated = ext4fs_inode_csum(fs, dp, ino);
 	if (ext4fs_inode_has_csum_hi(dp))
-		provided |= (u_int32_t)letoh16(dp->dinode.i_checksum_hi) << 16;
+		provided |= (u_int32_t)
+		    letoh16(dp->dinode.i_checksum_hi) << 16;
 	else
 		calculated &= 0xffff;
 
@@ -236,11 +239,12 @@ ext4fs_bitmap_csum (struct m_ext4fs *fs, u_int32_t group,
  * Write the checksum tail at the end of a directory block.
  *
  * The tail is a 12-byte structure placed at block_size - 12.
- * Checksum covers: UUID seed, inode number, inode generation, block data.
+ * The checksum covers the UUID seed, inode number, inode generation,
+ * and block data.
  */
 void
-ext4fs_dir_set_csum (struct m_ext4fs *fs, u_int32_t ino, u_int32_t gen_le,
-    void *buf)
+ext4fs_dir_set_csum (struct m_ext4fs *fs, u_int32_t ino,
+    u_int32_t gen_le, void *buf)
 {
 	struct ext4fs_directory_tail *tail;
 	u_int32_t crc, seed, ino_le;
@@ -281,7 +285,8 @@ ext4fs_dir_csum_verify (struct m_ext4fs *fs, u_int32_t ino,
 	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
 		return (0);
 	tail = (const struct ext4fs_directory_tail *)
-	    ((const char *)buf + fs->m_block_size - EXT4FS_DIR_TAIL_SIZE);
+	    ((const char *)buf + fs->m_block_size -
+	    EXT4FS_DIR_TAIL_SIZE);
 	if (tail->det_reserved_zero1 != 0 ||
 	    letoh16(tail->det_rec_len) != EXT4FS_DIR_TAIL_SIZE ||
 	    tail->det_reserved_zero2 != 0 ||
@@ -366,7 +371,8 @@ ext4fs_extent_block_csum_set (struct m_ext4fs *fs, u_int32_t ino,
  * Verify an external extent-tree block checksum.
  *
  * Returns 0 when checksums are disabled or the checksum is valid, and
- * EINVAL when the header cannot contain a checksum tail or it does not match.
+ * EINVAL when the header cannot contain a checksum tail or when the
+ * checksum does not match.
  */
 int
 ext4fs_extent_block_csum_verify (struct m_ext4fs *fs, u_int32_t ino,

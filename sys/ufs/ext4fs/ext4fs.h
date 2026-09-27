@@ -2,31 +2,32 @@
  * Copyright (c) 2025 kmx.io.
  * Copyright (c) 1997 Manuel Bouyer.
  * Copyright (c) 1982, 1986, 1989, 1993
- *	The Regents of the University of California.  All rights reserved.
+ * The Regents of the University of California.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the University nor the names of its contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
+ * 2. Redistributions in binary form must reproduce the above
+ *    copyright notice, this list of conditions and the following
+ *    disclaimer in the documentation and/or other materials provided
+ *    with the distribution.
+ * 3. Neither the name of the University nor the names of its
+ *    contributors may be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
  *
- * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
+ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS''
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+ * PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR
+ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+ * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * Modified for ext4fs by kmx.io.
  */
@@ -75,9 +76,11 @@ struct ext4fs_runtime_orphan;
 
 #define	EXT4FS_NINDIR(fs)	((fs)->m_block_size / sizeof(u_int32_t))
 
-#define EXT4FS_LBLKNO(fs, offset)  ((offset) >> (fs)->m_block_size_shift)
+#define EXT4FS_LBLKNO(fs, offset) \
+	((offset) >> (fs)->m_block_size_shift)
 #define EXT4FS_BLKOFF(fs, offset)  ((offset) & ((fs)->m_block_size - 1))
-#define EXT4FS_FSBTODB(fs, b)      ((b) << (fs)->m_fs_block_to_disk_block)
+#define EXT4FS_FSBTODB(fs, b) \
+	((b) << (fs)->m_fs_block_to_disk_block)
 
 #define EXT4FS_CHECKSUM_TYPE_NONE	0x0000
 #define EXT4FS_CHECKSUM_TYPE_CRC32C	0x0001
@@ -86,7 +89,8 @@ struct ext4fs_runtime_orphan;
 #define EXT4FS_ENCODING_UTF8	0x0001	// UTF-8, Unicode 12.1.0
 
 #define EXT4FS_ENCODING_FLAG_NONE	 0x0000
-#define EXT4FS_ENCODING_FLAG_STRICT_MODE 0x0001 // Reject invalid encoding
+/* Reject invalid encoding. */
+#define EXT4FS_ENCODING_FLAG_STRICT_MODE 0x0001
 
 #define EXT4FS_ERRORS_CONTINUE	1	// Log and keep going
 #define EXT4FS_ERRORS_RO	2	// Remount read-only
@@ -233,7 +237,8 @@ struct ext4fs {
 	u_int32_t	sb_free_inodes_count;
 	u_int32_t	sb_first_data_block;
 	u_int32_t	sb_log_block_size;	// log2(block size) - 10
-	u_int32_t	sb_log_cluster_size;	// log2(cluster size) - 10
+	/* log2(cluster size) - 10 */
+	u_int32_t	sb_log_cluster_size;
 	// 0x20
 	u_int32_t	sb_blocks_per_group;
 	u_int32_t	sb_clusters_per_group;
@@ -270,7 +275,8 @@ struct ext4fs {
 	u_int8_t	sb_preallocate_dir_blocks;
 	u_int16_t	sb_reserved_bgdt_blocks;
 	// 0xD0
-	u_int8_t	sb_journal_uuid[16];     // UUID of journal superblock
+	/* UUID of journal superblock */
+	u_int8_t	sb_journal_uuid[16];
 	// 0xE0
 	u_int32_t	sb_journal_inode_number;
 	u_int32_t	sb_journal_device_number;
@@ -283,7 +289,8 @@ struct ext4fs {
 	u_int32_t	sb_default_mount_opts;
 	u_int32_t	sb_first_meta_block_group;
 	u_int32_t	sb_newfs_time_lo;
-	u_int32_t	sb_jnl_blocks[17];       // Backup of journal inode
+	/* Backup of journal inode */
+	u_int32_t	sb_jnl_blocks[17];
 	// 0x150
 	u_int32_t	sb_blocks_count_hi;
 	u_int32_t	sb_reserved_blocks_count_hi;
@@ -361,7 +368,8 @@ struct m_ext4fs {
 	u_int32_t	m_free_inodes_count;
 	u_int32_t	m_first_data_block;
 	u_int32_t	m_log_block_size;       // log2(block size) - 10
-	u_int32_t	m_log_cluster_size;     // log2(cluster size) - 10
+	/* log2(cluster size) - 10 */
+	u_int32_t	m_log_cluster_size;
 	u_int32_t	m_blocks_per_group;
 	u_int32_t	m_clusters_per_group;
 	u_int32_t	m_inodes_per_group;
@@ -487,13 +495,17 @@ struct ext4fs_directory {
 	char      e4d_name[EXT4FS_MAXNAMLEN];
 } __attribute__((packed));
 
-/* Directory block checksum tail (last 12 bytes of block when metadata_csum) */
+/*
+ * Directory block checksum tail: the final 12 bytes when metadata_csum
+ * is enabled.
+ */
 #define EXT4FS_DIR_TAIL_FT	0xDE
 #define EXT4FS_DIR_TAIL_SIZE	12
 
 struct ext4fs_directory_tail {
 	u_int32_t det_reserved_zero1;	/* must be 0 (fake inode = 0) */
-	u_int16_t det_rec_len;		/* always EXT4FS_DIR_TAIL_SIZE */
+	/* Always EXT4FS_DIR_TAIL_SIZE. */
+	u_int16_t det_rec_len;
 	u_int8_t  det_reserved_zero2;	/* must be 0 (namlen = 0) */
 	u_int8_t  det_reserved_ft;	/* EXT4FS_DIR_TAIL_FT */
 	u_int32_t det_checksum;
@@ -540,32 +552,33 @@ static const struct ext4fs_feature ext4fs_feature_ro_compat[] = {
   {EXT4FS_FEATURE_RO_COMPAT_ORPHAN_PRESENT, "orphan_present"},
 };
 
-#define EXT4FS_ITIMES(ip) do {						\
-	if ((ip)->i_flag & (IN_ACCESS | IN_CHANGE | IN_UPDATE)) {	\
-		struct timespec _ts;					\
-		(ip)->i_flag |= IN_MODIFIED;				\
-		getnanotime(&_ts);					\
-		if ((ip)->i_flag & IN_ACCESS) {				\
-			(ip)->i_e4din->dinode.i_atime =			\
-			    htole32((u_int32_t)_ts.tv_sec);		\
-			(ip)->i_e4din->dinode.i_atime_extra =		\
-			    htole32(_ts.tv_nsec << 2);			\
-		}							\
-		if ((ip)->i_flag & IN_UPDATE) {				\
-			(ip)->i_e4din->dinode.i_mtime =			\
-			    htole32((u_int32_t)_ts.tv_sec);		\
-			(ip)->i_e4din->dinode.i_mtime_extra =		\
-			    htole32(_ts.tv_nsec << 2);			\
-		}							\
-		if ((ip)->i_flag & IN_CHANGE) {				\
-			(ip)->i_e4din->dinode.i_ctime =			\
-			    htole32((u_int32_t)_ts.tv_sec);		\
-			(ip)->i_e4din->dinode.i_ctime_extra =		\
-			    htole32(_ts.tv_nsec << 2);			\
-			(ip)->i_modrev++;				\
-		}							\
-		(ip)->i_flag &= ~(IN_ACCESS | IN_CHANGE | IN_UPDATE);	\
-	}								\
+#define EXT4FS_ITIMES(ip) do { \
+	if ((ip)->i_flag & (IN_ACCESS | IN_CHANGE | IN_UPDATE)) { \
+		struct timespec _ts; \
+		(ip)->i_flag |= IN_MODIFIED; \
+		getnanotime(&_ts); \
+		if ((ip)->i_flag & IN_ACCESS) { \
+			(ip)->i_e4din->dinode.i_atime = \
+			    htole32((u_int32_t)_ts.tv_sec); \
+			(ip)->i_e4din->dinode.i_atime_extra = \
+			    htole32(_ts.tv_nsec << 2); \
+		} \
+		if ((ip)->i_flag & IN_UPDATE) { \
+			(ip)->i_e4din->dinode.i_mtime = \
+			    htole32((u_int32_t)_ts.tv_sec); \
+			(ip)->i_e4din->dinode.i_mtime_extra = \
+			    htole32(_ts.tv_nsec << 2); \
+		} \
+		if ((ip)->i_flag & IN_CHANGE) { \
+			(ip)->i_e4din->dinode.i_ctime = \
+			    htole32((u_int32_t)_ts.tv_sec); \
+			(ip)->i_e4din->dinode.i_ctime_extra = \
+			    htole32(_ts.tv_nsec << 2); \
+			(ip)->i_modrev++; \
+		} \
+		(ip)->i_flag &= \
+		    ~(IN_ACCESS | IN_CHANGE | IN_UPDATE); \
+	} \
 } while (0)
 
 struct ext4fs_sync_args {
@@ -579,49 +592,50 @@ extern struct pool ext4fs_inode_pool;
 extern struct pool ext4fs_dinode_pool;
 
 /* VFS operations */
-int ext4fs_fhtovp (struct mount *, struct fid *, struct vnode **);
-int ext4fs_init (struct vfsconf *);
-int ext4fs_mount (struct mount *, const char *, void *,
+int	ext4fs_fhtovp (struct mount *, struct fid *, struct vnode **);
+int	ext4fs_init (struct vfsconf *);
+int	ext4fs_mount (struct mount *, const char *, void *,
 	struct nameidata *, struct proc *);
-int ext4fs_statfs (struct mount *, struct statfs *, struct proc *);
-int ext4fs_sync (struct mount *, int, int, struct ucred *,
+int	ext4fs_statfs (struct mount *, struct statfs *, struct proc *);
+int	ext4fs_sync (struct mount *, int, int, struct ucred *,
 	struct proc *);
-int ext4fs_sysctl (int *, u_int, void *, size_t *, void *, size_t,
+int	ext4fs_sysctl (int *, u_int, void *, size_t *, void *, size_t,
 	struct proc *);
-int ext4fs_unmount (struct mount *, int, struct proc *);
-int ext4fs_vget (struct mount *, ino_t, struct vnode **);
-int ext4fs_vptofh (struct vnode *, struct fid *);
+int	ext4fs_unmount (struct mount *, int, struct proc *);
+int	ext4fs_vget (struct mount *, ino_t, struct vnode **);
+int	ext4fs_vptofh (struct vnode *, struct fid *);
 
 /* VNode operations */
 
-int ext4fs_lookup (void *);
-int ext4fs_create (void *);
-int ext4fs_mknod (void *);
-int ext4fs_open (void *);
-int ext4fs_access (void *);
-int ext4fs_getattr (void *);
-int ext4fs_setattr (void *);
-int ext4fs_read (void *);
-int ext4fs_write (void *);
-int ext4fs_fsync (void *);
-int ext4fs_remove (void *);
-int ext4fs_link (void *);
-int ext4fs_rename (void *);
-int ext4fs_mkdir (void *);
-int ext4fs_rmdir (void *);
-int ext4fs_symlink (void *);
-int ext4fs_readdir (void *);
-int ext4fs_readlink (void *);
-int ext4fs_inactive (void *);
-int ext4fs_reclaim (void *);
-int ext4fs_bmap (void *);
-int ext4fs_strategy (void *);
-int ext4fs_print (void *);
-int ext4fs_pathconf (void *);
-int ext4fs_advlock (void *);
+int	ext4fs_lookup (void *);
+int	ext4fs_create (void *);
+int	ext4fs_mknod (void *);
+int	ext4fs_open (void *);
+int	ext4fs_access (void *);
+int	ext4fs_getattr (void *);
+int	ext4fs_setattr (void *);
+int	ext4fs_read (void *);
+int	ext4fs_write (void *);
+int	ext4fs_fsync (void *);
+int	ext4fs_remove (void *);
+int	ext4fs_link (void *);
+int	ext4fs_rename (void *);
+int	ext4fs_mkdir (void *);
+int	ext4fs_rmdir (void *);
+int	ext4fs_symlink (void *);
+int	ext4fs_readdir (void *);
+int	ext4fs_readlink (void *);
+int	ext4fs_inactive (void *);
+int	ext4fs_reclaim (void *);
+int	ext4fs_bmap (void *);
+int	ext4fs_strategy (void *);
+int	ext4fs_print (void *);
+int	ext4fs_pathconf (void *);
+int	ext4fs_advlock (void *);
 
-int ext4fs_update (struct inode *, int);
-int ext4fs_update_handle (struct inode *, struct ext4fs_journal_handle *);
+int	ext4fs_update (struct inode *, int);
+int	ext4fs_update_handle (struct inode *,
+    struct ext4fs_journal_handle *);
 
 /* Directory entry size: 8 bytes header + name, rounded up to 4 */
 #define EXT4FS_DIRSIZ(namlen)	(((8 + (namlen)) + 3) & ~3)
@@ -643,37 +657,38 @@ ext4fs_mode_to_ft (u_int16_t mode)
 }
 
 /* Block allocation / free */
-int ext4fs_block_bitmap_csum_verify (struct m_ext4fs *, u_int32_t,
+int	ext4fs_block_bitmap_csum_verify (struct m_ext4fs *, u_int32_t,
     struct ext4fs_block_group_descriptor *, const void *);
-int ext4fs_blkalloc (struct inode *, u_int64_t, u_int32_t, u_int64_t *,
+int	ext4fs_blkalloc (struct inode *, u_int64_t, u_int32_t,
+    u_int64_t *, u_int32_t *);
+int	ext4fs_blkalloc_handle (struct inode *,
+    struct ext4fs_journal_handle *, u_int64_t, u_int32_t, u_int64_t *,
     u_int32_t *);
-int ext4fs_blkalloc_handle (struct inode *, struct ext4fs_journal_handle *,
-    u_int64_t, u_int32_t, u_int64_t *, u_int32_t *);
-int ext4fs_blkfree_handle (struct inode *, struct ext4fs_journal_handle *,
-    u_int64_t);
-void ext4fs_blkfree (struct inode *, u_int64_t);
+int	ext4fs_blkfree_handle (struct inode *,
+    struct ext4fs_journal_handle *, u_int64_t);
+void	ext4fs_blkfree (struct inode *, u_int64_t);
 
 /* Inode allocation / free */
-int ext4fs_inode_alloc (struct inode *, mode_t, struct ucred *,
+int	ext4fs_inode_alloc (struct inode *, mode_t, struct ucred *,
 	struct vnode **);
-int ext4fs_inode_alloc_handle (struct inode *, mode_t,
+int	ext4fs_inode_alloc_handle (struct inode *, mode_t,
 	struct ext4fs_journal_handle *, struct vnode **);
-int ext4fs_inode_bitmap_csum_verify (struct m_ext4fs *, u_int32_t,
+int	ext4fs_inode_bitmap_csum_verify (struct m_ext4fs *, u_int32_t,
 	struct ext4fs_block_group_descriptor *, const void *);
-int ext4fs_inode_free_handle (struct inode *, ufsino_t, mode_t,
+int	ext4fs_inode_free_handle (struct inode *, ufsino_t, mode_t,
 	struct ext4fs_journal_handle *);
-void ext4fs_inode_free (struct inode *, ufsino_t, mode_t);
+void	ext4fs_inode_free (struct inode *, ufsino_t, mode_t);
 
 /* Directory operations */
-int ext4fs_direnter (struct inode *, struct vnode *,
+int	ext4fs_direnter (struct inode *, struct vnode *,
 	struct componentname *);
-int ext4fs_dirremove (struct vnode *, struct componentname *);
-int ext4fs_dirempty (struct inode *, ufsino_t, struct ucred *);
-int ext4fs_dirrewrite (struct inode *, struct inode *,
+int	ext4fs_dirremove (struct vnode *, struct componentname *);
+int	ext4fs_dirempty (struct inode *, ufsino_t, struct ucred *);
+int	ext4fs_dirrewrite (struct inode *, struct inode *,
 	struct componentname *);
 
 /* Truncation */
-int ext4fs_truncate (struct inode *, off_t, int, struct ucred *);
+int	ext4fs_truncate (struct inode *, off_t, int, struct ucred *);
 
 /* Size update */
 void	ext4fs_setsize (struct inode *, u_int64_t);
@@ -681,7 +696,7 @@ void	ext4fs_setsize (struct inode *, u_int64_t);
 /* Superblock */
 int	ext4fs_sbcheck (struct ext4fs *, int);
 int	ext4fs_block_group_has_super_block (int);
-u_int64_t ext4fs_bgd_get_block (struct m_ext4fs *,
+u_int64_t	ext4fs_bgd_get_block (struct m_ext4fs *,
     struct ext4fs_block_group_descriptor *, unsigned int);
 int	ext4fs_mountfs (struct vnode *, struct mount *, struct proc *);
 void	ext4fs_sbload (struct ext4fs *, struct m_ext4fs *);
@@ -689,7 +704,8 @@ int	ext4fs_sbfill (struct vnode *, struct m_ext4fs *);
 
 /* Writes */
 int	ext4fs_bgd_write (struct m_ext4fs *, struct vnode *, u_int32_t);
-int	ext4fs_bgd_write_handle (struct m_ext4fs *, struct vnode *, u_int32_t,
-	    struct ext4fs_journal_handle *);
+int	ext4fs_bgd_write_handle (struct m_ext4fs *, struct vnode *,
+    u_int32_t, struct ext4fs_journal_handle *);
 int	ext4fs_sbwrite (struct mount *);
-int	ext4fs_sbwrite_handle (struct mount *, struct ext4fs_journal_handle *);
+int	ext4fs_sbwrite_handle (struct mount *,
+    struct ext4fs_journal_handle *);

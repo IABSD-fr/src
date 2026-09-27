@@ -1,17 +1,19 @@
 /*
  * Copyright (c) 2026 kmx.io.
  *
- * Permission to use, copy, modify, and distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
+ * Permission to use, copy, modify, and distribute this software for
+ * any purpose with or without fee is hereby granted, provided that the
+ * above copyright notice and this permission notice appear in all
+ * copies.
  *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+ * WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE
+ * AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL
+ * DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA
+ * OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+ * TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+ * PERFORMANCE OF THIS SOFTWARE.
  */
 
 /*
@@ -41,8 +43,10 @@
 
 struct ext4fs_journal_metadata {
 	TAILQ_ENTRY(ext4fs_journal_metadata) jm_entry;
-	struct buf	*jm_buf;	/* kept B_BUSY while journal-owned */
-	struct ext4fs_journal_handle *jm_owner; /* handle until dirtied */
+	/* Kept B_BUSY while journal-owned. */
+	struct buf	*jm_buf;
+	/* Handle until dirtied. */
+	struct ext4fs_journal_handle *jm_owner;
 	u_int64_t	 jm_fsblock;
 	int		 jm_dirty;
 };
@@ -112,33 +116,41 @@ static void	ext4fs_journal_transaction_free (
 		    struct ext4fs_journal_transaction *);
 static int	ext4fs_journal_block_member (struct ext4fs_journal *,
 		    u_int64_t);
-static int	ext4fs_journal_handle_error (struct ext4fs_journal_handle *);
-static void	ext4fs_journal_abort_locked (struct ext4fs_journal *, int);
+static int	ext4fs_journal_handle_error (
+		    struct ext4fs_journal_handle *);
+static void	ext4fs_journal_abort_locked (
+		    struct ext4fs_journal *, int);
 static void	ext4fs_journal_checksum_ctx (struct ext4fs_journal *,
 		    struct jbd2_replay_ctx *);
-static u_int32_t ext4fs_journal_next_block (struct ext4fs_journal *,
-		    u_int32_t);
-static int	ext4fs_journal_write_block (struct ext4fs_journal *, u_int32_t,
-		    const void *);
-static int	ext4fs_journal_write_super (struct ext4fs_journal *, u_int32_t,
-		    u_int32_t, u_int32_t);
+static u_int32_t	ext4fs_journal_next_block (
+		    struct ext4fs_journal *, u_int32_t);
+static int	ext4fs_journal_write_block (struct ext4fs_journal *,
+		    u_int32_t, const void *);
+static int	ext4fs_journal_write_super (struct ext4fs_journal *,
+		    u_int32_t, u_int32_t, u_int32_t);
 static int	ext4fs_journal_set_recover (struct ext4fs_journal *);
-static u_int32_t ext4fs_journal_tag_bytes (struct ext4fs_journal *, int);
-static u_int32_t ext4fs_journal_descriptor_count (
-		    struct ext4fs_journal *, struct ext4fs_journal_metadata *);
+static u_int32_t
+		ext4fs_journal_tag_bytes (struct ext4fs_journal *, int);
+static u_int32_t	ext4fs_journal_descriptor_count (
+		    struct ext4fs_journal *,
+		    struct ext4fs_journal_metadata *);
 static int	ext4fs_journal_log_blocks (struct ext4fs_journal *,
 		    struct ext4fs_journal_transaction *, u_int32_t *);
 static int	ext4fs_journal_write_metadata (struct ext4fs_journal *,
-		    struct ext4fs_journal_transaction *, u_int32_t *, void *,
-		    void *);
+		    struct ext4fs_journal_transaction *, u_int32_t *,
+		    void *, void *);
 static int	ext4fs_journal_write_revokes (struct ext4fs_journal *,
-		    struct ext4fs_journal_transaction *, u_int32_t *, void *);
+		    struct ext4fs_journal_transaction *, u_int32_t *,
+		    void *);
 static int	ext4fs_journal_write_commit (struct ext4fs_journal *,
-		    struct ext4fs_journal_transaction *, u_int32_t *, void *);
+		    struct ext4fs_journal_transaction *, u_int32_t *,
+		    void *);
 static int	ext4fs_journal_flush_ordered (
 		    struct ext4fs_journal_transaction *);
-static int	ext4fs_journal_checkpoint (struct ext4fs_journal_transaction *);
-static int	ext4fs_journal_commit_transaction (struct ext4fs_journal *,
+static int	ext4fs_journal_checkpoint (
+		    struct ext4fs_journal_transaction *);
+static int	ext4fs_journal_commit_transaction (
+		    struct ext4fs_journal *,
 		    struct ext4fs_journal_transaction *, u_int32_t *);
 
 static void
@@ -153,8 +165,9 @@ ext4fs_journal_transaction_free (struct ext4fs_journal_transaction *tx)
 	while ((metadata = TAILQ_FIRST(&tx->jt_metadata)) != NULL) {
 		TAILQ_REMOVE(&tx->jt_metadata, metadata, jm_entry);
 		/*
-		 * Only dirtied, transaction-owned buffers survive a handle.
-		 * Teardown without a checkpoint must discard their contents.
+		 * Only dirtied, transaction-owned buffers survive a
+		 * handle.  Teardown without a checkpoint must discard
+		 * their contents.
 		 */
 		KASSERT(metadata->jm_dirty);
 		KASSERT(metadata->jm_owner == NULL);
@@ -199,7 +212,8 @@ ext4fs_journal_handle_error (struct ext4fs_journal_handle *handle)
 {
 	struct ext4fs_journal *journal;
 
-	if (handle == NULL || handle->jh_journal == NULL || handle->jh_ended)
+	if (handle == NULL || handle->jh_journal == NULL ||
+	    handle->jh_ended)
 		return (EINVAL);
 	journal = handle->jh_journal;
 	if (journal->j_active != handle ||
@@ -215,8 +229,8 @@ ext4fs_journal_abort_locked (struct ext4fs_journal *journal, int error)
 	struct m_ext4fs *fs;
 
 	fs = VFSTOUFS(journal->j_mp)->um_e4fs;
-	ext4fs_journal_state_abort(&journal->j_aborted, &journal->j_error,
-	    error);
+	ext4fs_journal_state_abort(&journal->j_aborted,
+	    &journal->j_error, error);
 	fs->m_state = EXT4FS_STATE_ERROR;
 	fs->m_sble.sb_state = htole16(fs->m_state);
 	fs->m_fs_was_modified = 1;
@@ -241,7 +255,8 @@ ext4fs_journal_checksum_ctx (struct ext4fs_journal *journal,
 }
 
 static u_int32_t
-ext4fs_journal_next_block (struct ext4fs_journal *journal, u_int32_t block)
+ext4fs_journal_next_block (struct ext4fs_journal *journal,
+    u_int32_t block)
 {
 	block++;
 	if (block >= journal->j_maxlen)
@@ -270,7 +285,7 @@ ext4fs_journal_write_block (struct ext4fs_journal *journal,
 	    (daddr_t)EXT4FS_FSBTODB(fs, fsblock), journal->j_blocksize,
 	    0, INFSLP);
 	memcpy(bp->b_data, data, journal->j_blocksize);
-	/* Journal ordering must not be weakened by an asynchronous mount. */
+	/* Do not weaken journal ordering on an asynchronous mount. */
 	SET(bp->b_flags, B_NOCACHE);
 	return (bwrite(bp));
 }
@@ -304,12 +319,14 @@ ext4fs_journal_write_super (struct ext4fs_journal *journal,
 	    betoh32(jsb->s_blocksize) != journal->j_blocksize ||
 	    betoh32(jsb->s_maxlen) != journal->j_maxlen ||
 	    betoh32(jsb->s_first) != journal->j_first ||
-	    betoh32(jsb->s_feature_compat) != journal->j_features_compat ||
+	    betoh32(jsb->s_feature_compat) !=
+	    journal->j_features_compat ||
 	    betoh32(jsb->s_feature_incompat) !=
 	    journal->j_features_incompat ||
 	    betoh32(jsb->s_feature_ro_compat) !=
 	    journal->j_features_ro_compat ||
-	    memcmp(jsb->s_uuid, journal->j_uuid, sizeof(journal->j_uuid)) != 0) {
+	    memcmp(jsb->s_uuid, journal->j_uuid,
+	    sizeof(journal->j_uuid)) != 0) {
 		brelse(bp);
 		return (EINVAL);
 	}
@@ -337,7 +354,8 @@ ext4fs_journal_set_recover (struct ext4fs_journal *journal)
 	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_RECOVER)
 		return (0);
 	fs->m_feature_incompat |= EXT4FS_FEATURE_INCOMPAT_RECOVER;
-	fs->m_sble.sb_feature_incompat = htole32(fs->m_feature_incompat);
+	fs->m_sble.sb_feature_incompat =
+	    htole32(fs->m_feature_incompat);
 	fs->m_fs_was_modified = 1;
 	error = ext4fs_sbwrite(journal->j_mp);
 	if (error == 0)
@@ -364,7 +382,8 @@ ext4fs_journal_tag_bytes (struct ext4fs_journal *journal, int same_uuid)
 {
 	u_int32_t bytes;
 
-	if (journal->j_features_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3)
+	if (journal->j_features_incompat &
+	    JBD2_FEATURE_INCOMPAT_CSUM_V3)
 		bytes = sizeof(struct jbd2_block_tag3);
 	else {
 		bytes = 8;
@@ -394,7 +413,8 @@ ext4fs_journal_descriptor_count (struct ext4fs_journal *journal,
 	count = 0;
 	for (metadata = first; metadata != NULL;
 	    metadata = TAILQ_NEXT(metadata, jm_entry)) {
-		tag_bytes = ext4fs_journal_tag_bytes(journal, count != 0);
+		tag_bytes = ext4fs_journal_tag_bytes(journal,
+		    count != 0);
 		if (bytes > limit || tag_bytes > limit - bytes)
 			break;
 		bytes += tag_bytes;
@@ -420,13 +440,15 @@ ext4fs_journal_log_blocks (struct ext4fs_journal *journal,
 	while (metadata != NULL) {
 		u_int32_t i;
 
-		count = ext4fs_journal_descriptor_count(journal, metadata);
+		count = ext4fs_journal_descriptor_count(journal,
+		    metadata);
 		if (count == 0)
 			return (EINVAL);
 		descriptors++;
 		metadata_blocks += count;
 		for (i = 0; i < count; i++) {
-			if (!metadata->jm_dirty || metadata->jm_owner != NULL ||
+			if (!metadata->jm_dirty ||
+			    metadata->jm_owner != NULL ||
 			    metadata->jm_buf == NULL ||
 			    !ISSET(metadata->jm_buf->b_flags, B_BUSY))
 				return (EINVAL);
@@ -455,10 +477,12 @@ ext4fs_journal_log_blocks (struct ext4fs_journal *journal,
 		revoke_blocks = howmany(revoke_count, revoke_per_block);
 	}
 	if (tx->jt_credits_reserved != 0 ||
-	    (u_int64_t)metadata_blocks + revoke_count != tx->jt_credits_used)
+	    (u_int64_t)metadata_blocks + revoke_count !=
+	    tx->jt_credits_used)
 		return (EINVAL);
 
-	total = (u_int64_t)descriptors + metadata_blocks + revoke_blocks + 1;
+	total = (u_int64_t)descriptors + metadata_blocks +
+	    revoke_blocks + 1;
 	if (total > 0xffffffffU || total > journal->j_free)
 		return (ENOSPC);
 	*blocksp = (u_int32_t)total;
@@ -516,32 +540,40 @@ ext4fs_journal_write_metadata (struct ext4fs_journal *journal,
 			if (has_csum_v3) {
 				ext4fs_journal_put32(descriptor, offset,
 				    (u_int32_t)metadata->jm_fsblock);
-				ext4fs_journal_put32(descriptor, offset + 4,
-				    flags);
-				ext4fs_journal_put32(descriptor, offset + 8,
-				    has_64bit ?
-				    (u_int32_t)(metadata->jm_fsblock >> 32) : 0);
-				ext4fs_journal_put32(descriptor, offset + 12,
-				    checksum);
-				offset += sizeof(struct jbd2_block_tag3);
+				ext4fs_journal_put32(
+				    descriptor, offset + 4, flags);
+				ext4fs_journal_put32(
+				    descriptor, offset + 8,
+				    has_64bit ? (u_int32_t)
+				    (metadata->jm_fsblock >> 32) : 0);
+				ext4fs_journal_put32(
+				    descriptor, offset + 12, checksum);
+				offset +=
+				    sizeof(struct jbd2_block_tag3);
 			} else {
 				ext4fs_journal_put32(descriptor, offset,
 				    (u_int32_t)metadata->jm_fsblock);
-				ext4fs_journal_put16(descriptor, offset + 4,
+				ext4fs_journal_put16(
+				    descriptor, offset + 4,
 				    (u_int16_t)checksum);
-				ext4fs_journal_put16(descriptor, offset + 6,
+				ext4fs_journal_put16(
+				    descriptor, offset + 6,
 				    (u_int16_t)flags);
 				offset += 8;
 				if (has_64bit) {
-					ext4fs_journal_put32(descriptor, offset,
-					    (u_int32_t)(metadata->jm_fsblock >> 32));
+					ext4fs_journal_put32(
+					    descriptor, offset,
+					    (u_int32_t)
+				    (metadata->jm_fsblock >> 32));
 					offset += 4;
 				}
 				if (has_csum_v2)
-					offset += JBD2_CSUM_V2_TAG_EXTRA;
+					offset +=
+					    JBD2_CSUM_V2_TAG_EXTRA;
 			}
 			if (i == 0) {
-				memcpy((char *)descriptor + offset, journal->j_uuid,
+				memcpy((char *)descriptor + offset,
+				    journal->j_uuid,
 				    sizeof(journal->j_uuid));
 				offset += sizeof(journal->j_uuid);
 			}
@@ -549,10 +581,12 @@ ext4fs_journal_write_metadata (struct ext4fs_journal *journal,
 		}
 		KASSERT(offset <= limit);
 		if (jbd2_has_csum_v2or3(&ctx)) {
-			tail = (struct jbd2_block_tail *)((char *)descriptor +
-			    journal->j_blocksize - sizeof(*tail));
-			tail->t_checksum = htobe32(jbd2_block_checksum(&ctx,
-			    descriptor, journal->j_blocksize));
+			tail = (struct jbd2_block_tail *)
+			    ((char *)descriptor + journal->j_blocksize -
+			    sizeof(*tail));
+			tail->t_checksum = htobe32(
+			    jbd2_block_checksum(&ctx, descriptor,
+			    journal->j_blocksize));
 		}
 		error = ext4fs_journal_write_block(journal, *jblockp,
 		    descriptor);
@@ -568,8 +602,8 @@ ext4fs_journal_write_metadata (struct ext4fs_journal *journal,
 			memcpy(&word, data, sizeof(word));
 			if (word == htobe32(JBD2_MAGIC))
 				memset(data, 0, sizeof(word));
-			error = ext4fs_journal_write_block(journal, *jblockp,
-			    data);
+			error = ext4fs_journal_write_block(journal,
+			    *jblockp, data);
 			if (error)
 				return (error);
 			*jblockp = ext4fs_journal_next_block(journal,
@@ -583,7 +617,8 @@ ext4fs_journal_write_metadata (struct ext4fs_journal *journal,
 
 static int
 ext4fs_journal_write_revokes (struct ext4fs_journal *journal,
-    struct ext4fs_journal_transaction *tx, u_int32_t *jblockp, void *block)
+    struct ext4fs_journal_transaction *tx, u_int32_t *jblockp,
+    void *block)
 {
 	struct ext4fs_journal_revoke *revoke;
 	struct jbd2_block_tail *tail;
@@ -595,7 +630,8 @@ ext4fs_journal_write_revokes (struct ext4fs_journal *journal,
 	revoke = TAILQ_FIRST(&tx->jt_revokes);
 	if (revoke == NULL)
 		return (0);
-	if (!(journal->j_features_incompat & JBD2_FEATURE_INCOMPAT_REVOKE))
+	if (!(journal->j_features_incompat &
+	    JBD2_FEATURE_INCOMPAT_REVOKE))
 		return (EOPNOTSUPP);
 	ext4fs_journal_checksum_ctx(journal, &ctx);
 	limit = jbd2_descriptor_limit(&ctx);
@@ -607,13 +643,16 @@ ext4fs_journal_write_revokes (struct ext4fs_journal *journal,
 		memset(block, 0, journal->j_blocksize);
 		header = block;
 		header->r_header.h_magic = htobe32(JBD2_MAGIC);
-		header->r_header.h_blocktype = htobe32(JBD2_REVOKE_BLOCK);
+		header->r_header.h_blocktype =
+		    htobe32(JBD2_REVOKE_BLOCK);
 		header->r_header.h_sequence = htobe32(tx->jt_sequence);
 		offset = sizeof(*header);
-		while (revoke != NULL && record_size <= limit - offset) {
+		while (revoke != NULL &&
+		    record_size <= limit - offset) {
 			if (has_64bit) {
 				ext4fs_journal_put32(block, offset,
-				    (u_int32_t)(revoke->jr_fsblock >> 32));
+				    (u_int32_t)
+				    (revoke->jr_fsblock >> 32));
 				ext4fs_journal_put32(block, offset + 4,
 				    (u_int32_t)revoke->jr_fsblock);
 			} else
@@ -624,12 +663,15 @@ ext4fs_journal_write_revokes (struct ext4fs_journal *journal,
 		}
 		header->r_count = htobe32(offset);
 		if (jbd2_has_csum_v2or3(&ctx)) {
-			tail = (struct jbd2_block_tail *)((char *)block +
-			    journal->j_blocksize - sizeof(*tail));
-			tail->t_checksum = htobe32(jbd2_block_checksum(&ctx,
-			    block, journal->j_blocksize));
+			tail = (struct jbd2_block_tail *)
+			    ((char *)block + journal->j_blocksize -
+			    sizeof(*tail));
+			tail->t_checksum = htobe32(
+			    jbd2_block_checksum(&ctx, block,
+			    journal->j_blocksize));
 		}
-		error = ext4fs_journal_write_block(journal, *jblockp, block);
+		error = ext4fs_journal_write_block(journal,
+		    *jblockp, block);
 		if (error)
 			return (error);
 		*jblockp = ext4fs_journal_next_block(journal, *jblockp);
@@ -639,7 +681,8 @@ ext4fs_journal_write_revokes (struct ext4fs_journal *journal,
 
 static int
 ext4fs_journal_write_commit (struct ext4fs_journal *journal,
-    struct ext4fs_journal_transaction *tx, u_int32_t *jblockp, void *block)
+    struct ext4fs_journal_transaction *tx, u_int32_t *jblockp,
+    void *block)
 {
 	struct jbd2_commit_header *commit;
 	struct jbd2_replay_ctx ctx;
@@ -658,8 +701,9 @@ ext4fs_journal_write_commit (struct ext4fs_journal *journal,
 	if (jbd2_has_csum_v2or3(&ctx)) {
 		commit->h_checksum_type = JBD2_CHECKSUM_CRC32C;
 		commit->h_checksum_size = JBD2_CHECKSUM_SIZE;
-		commit->h_checksum[0] = htobe32(jbd2_block_checksum(&ctx,
-		    block, journal->j_blocksize));
+		commit->h_checksum[0] = htobe32(
+		    jbd2_block_checksum(&ctx, block,
+		    journal->j_blocksize));
 	}
 	error = ext4fs_journal_write_block(journal, *jblockp, block);
 	if (error)
@@ -720,7 +764,8 @@ ext4fs_journal_commit_transaction (struct ext4fs_journal *journal,
 {
 	struct ufsmount *ump;
 	void *block, *data;
-	u_int32_t commit_block, expected_head, jblock, required, start, usable;
+	u_int32_t commit_block, expected_head, jblock, required;
+	u_int32_t start, usable;
 	int error;
 
 	ump = VFSTOUFS(journal->j_mp);
@@ -730,12 +775,14 @@ ext4fs_journal_commit_transaction (struct ext4fs_journal *journal,
 	start = jblock = journal->j_head;
 	usable = journal->j_maxlen - journal->j_first;
 	commit_block = journal->j_first +
-	    ((u_int64_t)(start - journal->j_first) + required - 1) % usable;
-	expected_head = ext4fs_journal_next_block(journal, commit_block);
+	    ((u_int64_t)(start - journal->j_first) + required - 1) %
+	    usable;
+	expected_head = ext4fs_journal_next_block(journal,
+	    commit_block);
 	block = malloc(journal->j_blocksize, M_UFSMNT, M_WAITOK);
 	data = malloc(journal->j_blocksize, M_UFSMNT, M_WAITOK);
 
-	/* Ordered mode: make all earlier data writes durable before metadata. */
+	/* Make earlier ordered-data writes durable before metadata. */
 	error = ext4fs_journal_flush_ordered(tx);
 	if (error)
 		goto out;
@@ -743,18 +790,19 @@ ext4fs_journal_commit_transaction (struct ext4fs_journal *journal,
 	if (error)
 		goto out;
 
-	error = ext4fs_journal_write_metadata(journal, tx, &jblock, block,
-	    data);
+	error = ext4fs_journal_write_metadata(journal, tx, &jblock,
+	    block, data);
 	if (error)
 		goto out;
-	error = ext4fs_journal_write_revokes(journal, tx, &jblock, block);
+	error = ext4fs_journal_write_revokes(journal, tx, &jblock,
+	    block);
 	if (error)
 		goto out;
 	if (jblock != commit_block) {
 		error = EINVAL;
 		goto out;
 	}
-	/* Remove any old commit header before exposing this transaction. */
+	/* Remove an old commit header before exposure. */
 	memset(block, 0, journal->j_blocksize);
 	error = ext4fs_journal_write_block(journal, jblock, block);
 	if (error)
@@ -764,19 +812,21 @@ ext4fs_journal_commit_transaction (struct ext4fs_journal *journal,
 		goto out;
 
 	/*
-	 * Only expose the transaction after every pre-commit record is durable.
-	 * This lets recovery ignore a crash during descriptor construction while
-	 * still making s_start durable before the commit block can reach disk.
+	 * Only expose the transaction after every pre-commit record is
+	 * durable.  This lets recovery ignore a crash during descriptor
+	 * construction while still making s_start durable before the
+	 * commit block can reach disk.
 	 */
-	error = ext4fs_journal_write_super(journal, start, tx->jt_sequence,
-	    journal->j_head);
+	error = ext4fs_journal_write_super(journal, start,
+	    tx->jt_sequence, journal->j_head);
 	if (error)
 		goto out;
 	error = jbd2_flush_device(ump->um_devvp, curproc);
 	if (error)
 		goto out;
 
-	error = ext4fs_journal_write_commit(journal, tx, &jblock, block);
+	error = ext4fs_journal_write_commit(journal, tx, &jblock,
+	    block);
 	if (error)
 		goto out;
 	if (jblock != expected_head) {
@@ -831,7 +881,8 @@ ext4fs_journal_init (struct mount *mp)
 	if (error)
 		return (error);
 	if (ctx.rc_start != 0) {
-		printf("ext4fs: refusing runtime journal with non-empty log\n");
+		printf("ext4fs: refusing runtime journal with "
+		    "non-empty log\n");
 		jbd2_journal_close(&ctx);
 		return (EINVAL);
 	}
@@ -855,8 +906,9 @@ ext4fs_journal_init (struct mount *mp)
 
 	usable = ctx.rc_maxlen - ctx.rc_first;
 	/*
-	 * In the worst case each metadata credit needs one descriptor block
-	 * and one payload block.  Keep one further block for the commit record.
+	 * Each metadata credit may need one descriptor block
+	 * and one payload block.  Keep one further block for the commit
+	 * record.
 	 */
 	journal->j_max_transaction_credits = usable > 1 ?
 	    (usable - 1) / 2 : 0;
@@ -904,11 +956,11 @@ ext4fs_journal_destroy (struct mount *mp)
 	journal->j_shutting_down = 1;
 	wakeup(&journal->j_active);
 	while (journal->j_active != NULL)
-		msleep_nsec(&journal->j_active, &journal->j_lock, PRIBIO,
-		    "e4jdrain", INFSLP);
+		msleep_nsec(&journal->j_active, &journal->j_lock,
+		    PRIBIO, "e4jdrain", INFSLP);
 	while (journal->j_commit_busy)
-		msleep_nsec(&journal->j_committing, &journal->j_lock, PRIBIO,
-		    "e4jiodrn", INFSLP);
+		msleep_nsec(&journal->j_committing,
+		    &journal->j_lock, PRIBIO, "e4jiodrn", INFSLP);
 	running = journal->j_running;
 	committing = journal->j_committing;
 	journal->j_running = NULL;
@@ -924,7 +976,8 @@ ext4fs_journal_destroy (struct mount *mp)
 		    sizeof(*journal->j_blockset));
 	if (journal->j_blockmap != NULL)
 		free(journal->j_blockmap, M_TEMP,
-		    journal->j_blockmap_count * sizeof(*journal->j_blockmap));
+		    journal->j_blockmap_count *
+		    sizeof(*journal->j_blockmap));
 	free(journal, M_UFSMNT, sizeof(*journal));
 }
 
@@ -967,7 +1020,8 @@ ext4fs_journal_begin (struct mount *mp, unsigned int credits,
 		return (EOPNOTSUPP);
 
 	handle = malloc(sizeof(*handle), M_UFSMNT, M_WAITOK | M_ZERO);
-	candidate = malloc(sizeof(*candidate), M_UFSMNT, M_WAITOK | M_ZERO);
+	candidate = malloc(sizeof(*candidate), M_UFSMNT,
+	    M_WAITOK | M_ZERO);
 	TAILQ_INIT(&candidate->jt_metadata);
 	TAILQ_INIT(&candidate->jt_revokes);
 	TAILQ_INIT(&candidate->jt_ordered);
@@ -977,22 +1031,26 @@ ext4fs_journal_begin (struct mount *mp, unsigned int credits,
 		mtx_enter(&journal->j_lock);
 		while ((error = ext4fs_journal_state_admission(
 		    journal->j_active != NULL, journal->j_aborted,
-		    journal->j_error, journal->j_shutting_down)) == EBUSY)
-			msleep_nsec(&journal->j_active, &journal->j_lock, PRIBIO,
-			    "e4jbegin", INFSLP);
+		    journal->j_error,
+		    journal->j_shutting_down)) == EBUSY)
+			msleep_nsec(&journal->j_active,
+			    &journal->j_lock, PRIBIO, "e4jbegin",
+			    INFSLP);
 		if (error == 0) {
-			tx = journal->j_running != NULL ? journal->j_running :
-			    candidate;
+			tx = journal->j_running != NULL ?
+			    journal->j_running : candidate;
 			error = ext4fs_journal_state_reserve(
 			    journal->j_max_transaction_credits,
-			    tx->jt_credits_used, &tx->jt_credits_reserved, credits);
-			if (error == ENOSPC && journal->j_running != NULL)
+			    tx->jt_credits_used,
+			    &tx->jt_credits_reserved, credits);
+			if (error == ENOSPC &&
+			    journal->j_running != NULL)
 				checkpoint = 1;
 			else if (error == 0) {
 				if (journal->j_running == NULL) {
-					/* The commit transition consumes this sequence. */
+					/* Consume this sequence. */
 					tx->jt_sequence =
-					    ext4fs_journal_state_sequence(
+				    ext4fs_journal_state_sequence(
 					    journal->j_next_sequence);
 					journal->j_running = tx;
 					candidate = NULL;
@@ -1035,7 +1093,8 @@ ext4fs_journal_add_ordered (struct ext4fs_journal_handle *handle,
 	if (vp->v_type != VREG || vp->v_mount != journal->j_mp)
 		return (EINVAL);
 
-	candidate = malloc(sizeof(*candidate), M_UFSMNT, M_WAITOK | M_ZERO);
+	candidate = malloc(sizeof(*candidate), M_UFSMNT,
+	    M_WAITOK | M_ZERO);
 	candidate->jo_vnode = vp;
 	vref(vp);
 
@@ -1050,8 +1109,8 @@ ext4fs_journal_add_ordered (struct ext4fs_journal_handle *handle,
 			goto out;
 		}
 	}
-	TAILQ_INSERT_TAIL(&handle->jh_transaction->jt_ordered, candidate,
-	    jo_entry);
+	TAILQ_INSERT_TAIL(&handle->jh_transaction->jt_ordered,
+	    candidate, jo_entry);
 	candidate = NULL;
 	error = 0;
 
@@ -1143,7 +1202,8 @@ ext4fs_journal_get_write_access (struct ext4fs_journal_handle *handle,
 	struct m_ext4fs *fs;
 	int error;
 
-	if (handle == NULL || bp == NULL || handle->jh_journal == NULL ||
+	if (handle == NULL || bp == NULL ||
+	    handle->jh_journal == NULL ||
 	    bp->b_data == NULL || !ISSET(bp->b_flags, B_BUSY))
 		return (EINVAL);
 	journal = handle->jh_journal;
@@ -1156,7 +1216,8 @@ ext4fs_journal_get_write_access (struct ext4fs_journal_handle *handle,
 	if (fsblock > 0xffffffffULL && !(journal->j_features_incompat &
 	    JBD2_FEATURE_INCOMPAT_64BIT))
 		return (EFBIG);
-	candidate = malloc(sizeof(*candidate), M_UFSMNT, M_WAITOK | M_ZERO);
+	candidate = malloc(sizeof(*candidate), M_UFSMNT,
+	    M_WAITOK | M_ZERO);
 	candidate->jm_buf = bp;
 	candidate->jm_owner = handle;
 	candidate->jm_fsblock = fsblock;
@@ -1167,21 +1228,26 @@ ext4fs_journal_get_write_access (struct ext4fs_journal_handle *handle,
 		goto out;
 	TAILQ_FOREACH(metadata, &handle->jh_transaction->jt_metadata,
 	    jm_entry) {
-		error = ext4fs_journal_state_metadata_relation(metadata->jm_buf,
-		    metadata->jm_fsblock, bp, fsblock);
+		error = ext4fs_journal_state_metadata_relation(
+		    metadata->jm_buf, metadata->jm_fsblock, bp,
+		    fsblock);
 		if (error != ENOENT)
 			goto out;
 	}
-	TAILQ_FOREACH(revoke, &handle->jh_transaction->jt_revokes, jr_entry) {
-		if (ext4fs_journal_state_block_relation(revoke->jr_fsblock,
-		    fsblock) == 0) {
+	TAILQ_FOREACH(revoke, &handle->jh_transaction->jt_revokes,
+	    jr_entry) {
+		if (ext4fs_journal_state_block_relation(
+		    revoke->jr_fsblock, fsblock) == 0) {
 			error = EBUSY;
 			goto out;
 		}
 	}
-	TAILQ_INSERT_TAIL(&handle->jh_transaction->jt_metadata, candidate,
-	    jm_entry);
-	/* The handle now owns the busy buffer until dirty_metadata() or end(). */
+	TAILQ_INSERT_TAIL(&handle->jh_transaction->jt_metadata,
+	    candidate, jm_entry);
+	/*
+	 * The handle now owns the busy buffer until dirty_metadata() or
+	 * end().
+	 */
 	candidate = NULL;
 	error = 0;
 
@@ -1200,7 +1266,8 @@ ext4fs_journal_dirty_metadata (struct ext4fs_journal_handle *handle,
 	struct ext4fs_journal *journal;
 	int error;
 
-	if (handle == NULL || bp == NULL || handle->jh_journal == NULL ||
+	if (handle == NULL || bp == NULL ||
+	    handle->jh_journal == NULL ||
 	    !ISSET(bp->b_flags, B_BUSY))
 		return (EINVAL);
 	journal = handle->jh_journal;
@@ -1220,13 +1287,14 @@ ext4fs_journal_dirty_metadata (struct ext4fs_journal_handle *handle,
 			error = EBUSY;
 			goto out;
 		}
-		error = ext4fs_journal_state_consume(&handle->jh_credits,
+		error = ext4fs_journal_state_consume(
+		    &handle->jh_credits,
 		    &handle->jh_transaction->jt_credits_reserved,
 		    &handle->jh_transaction->jt_credits_used);
 		if (error)
 			goto out;
 		metadata->jm_dirty = 1;
-		/* Transfer the busy buffer from the handle to the transaction. */
+		/* Transfer the busy buffer to the transaction. */
 		metadata->jm_owner = NULL;
 		goto out;
 	}
@@ -1273,25 +1341,26 @@ ext4fs_journal_revoke (struct ext4fs_journal_handle *handle,
 		goto out;
 	TAILQ_FOREACH(metadata, &handle->jh_transaction->jt_metadata,
 	    jm_entry) {
-		if (ext4fs_journal_state_block_relation(metadata->jm_fsblock,
-		    fsblock) == 0) {
+		if (ext4fs_journal_state_block_relation(
+		    metadata->jm_fsblock, fsblock) == 0) {
 			error = EBUSY;
 			goto out;
 		}
 	}
 	/*
-	 * The serialized runtime writer checkpoints each committed transaction
-	 * before admitting block reuse.  A journal without the optional revoke
-	 * feature therefore needs no on-disk revoke record, but freeing metadata
-	 * already enlisted in this transaction remains invalid.
+	 * The serialized runtime writer checkpoints each committed
+	 * transaction before block reuse.  A journal without revoke
+	 * feature therefore needs no on-disk revoke record, but freeing
+	 * metadata enlisted in this transaction remains invalid.
 	 */
 	if (!has_revoke) {
 		error = 0;
 		goto out;
 	}
-	TAILQ_FOREACH(revoke, &handle->jh_transaction->jt_revokes, jr_entry) {
-		if (ext4fs_journal_state_block_relation(revoke->jr_fsblock,
-		    fsblock) == 0) {
+	TAILQ_FOREACH(revoke, &handle->jh_transaction->jt_revokes,
+	    jr_entry) {
+		if (ext4fs_journal_state_block_relation(
+		    revoke->jr_fsblock, fsblock) == 0) {
 			error = 0;
 			goto out;
 		}
@@ -1301,8 +1370,8 @@ ext4fs_journal_revoke (struct ext4fs_journal_handle *handle,
 	    &handle->jh_transaction->jt_credits_used);
 	if (error)
 		goto out;
-	TAILQ_INSERT_TAIL(&handle->jh_transaction->jt_revokes, candidate,
-	    jr_entry);
+	TAILQ_INSERT_TAIL(&handle->jh_transaction->jt_revokes,
+	    candidate, jr_entry);
 	candidate = NULL;
 
 out:
@@ -1321,7 +1390,8 @@ ext4fs_journal_end (struct ext4fs_journal_handle *handle)
 	struct ext4fs_journal *journal;
 	int error, release_error;
 
-	if (handle == NULL || handle->jh_journal == NULL || handle->jh_ended)
+	if (handle == NULL || handle->jh_journal == NULL ||
+	    handle->jh_ended)
 		return (EINVAL);
 	journal = handle->jh_journal;
 	empty = NULL;
@@ -1336,12 +1406,12 @@ ext4fs_journal_end (struct ext4fs_journal_handle *handle)
 		mtx_leave(&journal->j_lock);
 		return (EINVAL);
 	}
-	TAILQ_FOREACH_SAFE(metadata, &handle->jh_transaction->jt_metadata,
-	    jm_entry, next) {
+	TAILQ_FOREACH_SAFE(metadata,
+	    &handle->jh_transaction->jt_metadata, jm_entry, next) {
 		if (metadata->jm_owner != handle || metadata->jm_dirty)
 			continue;
-		TAILQ_REMOVE(&handle->jh_transaction->jt_metadata, metadata,
-		    jm_entry);
+		TAILQ_REMOVE(&handle->jh_transaction->jt_metadata,
+		    metadata, jm_entry);
 		TAILQ_INSERT_TAIL(&unused, metadata, jm_entry);
 	}
 	release_error = ext4fs_journal_state_release(
@@ -1355,7 +1425,8 @@ ext4fs_journal_end (struct ext4fs_journal_handle *handle)
 	if (TAILQ_EMPTY(&handle->jh_transaction->jt_metadata) &&
 	    TAILQ_EMPTY(&handle->jh_transaction->jt_revokes)) {
 		KASSERT(handle->jh_transaction->jt_credits_used == 0);
-		KASSERT(handle->jh_transaction->jt_credits_reserved == 0);
+		KASSERT(
+		    handle->jh_transaction->jt_credits_reserved == 0);
 		empty = handle->jh_transaction;
 		journal->j_running = NULL;
 	}
@@ -1397,15 +1468,17 @@ ext4fs_journal_force_commit (struct mount *mp)
 		    journal->j_active != NULL, journal->j_aborted,
 		    journal->j_error, journal->j_shutting_down);
 		if (error == EBUSY) {
-			msleep_nsec(&journal->j_active, &journal->j_lock,
-			    PRIBIO, "e4jcommit", INFSLP);
+			msleep_nsec(&journal->j_active,
+			    &journal->j_lock, PRIBIO, "e4jcommit",
+			    INFSLP);
 			continue;
 		}
 		if (error != 0)
 			break;
 		if (journal->j_committing != NULL) {
-			msleep_nsec(&journal->j_committing, &journal->j_lock,
-			    PRIBIO, "e4jwait", INFSLP);
+			msleep_nsec(&journal->j_committing,
+			    &journal->j_lock, PRIBIO, "e4jwait",
+			    INFSLP);
 			continue;
 		}
 		break;
@@ -1422,7 +1495,8 @@ ext4fs_journal_force_commit (struct mount *mp)
 	if (error != 0 || tx == NULL)
 		return (error);
 
-	error = ext4fs_journal_commit_transaction(journal, tx, &new_head);
+	error = ext4fs_journal_commit_transaction(journal, tx,
+	    &new_head);
 	mtx_enter(&journal->j_lock);
 	KASSERT(journal->j_committing == tx);
 	KASSERT(journal->j_commit_busy);
@@ -1458,15 +1532,17 @@ ext4fs_journal_mark_clean (struct mount *mp)
 	ump = VFSTOUFS(mp);
 	fs = ump->um_e4fs;
 	journal = fs->m_journal;
-	if (journal == NULL || fs->m_read_only || (mp->mnt_flag & MNT_RDONLY))
+	if (journal == NULL || fs->m_read_only ||
+	    (mp->mnt_flag & MNT_RDONLY))
 		return (0);
 	error = ext4fs_journal_force_commit(mp);
 	if (error)
 		return (error);
 
 	mtx_enter(&journal->j_lock);
-	error = ext4fs_journal_state_admission(journal->j_active != NULL,
-	    journal->j_aborted, journal->j_error, journal->j_shutting_down);
+	error = ext4fs_journal_state_admission(
+	    journal->j_active != NULL, journal->j_aborted,
+	    journal->j_error, journal->j_shutting_down);
 	if (error == 0 && (journal->j_running != NULL ||
 	    journal->j_committing != NULL))
 		error = EBUSY;
@@ -1477,7 +1553,8 @@ ext4fs_journal_mark_clean (struct mount *mp)
 	old_incompat = fs->m_feature_incompat;
 	old_state = fs->m_state;
 	fs->m_feature_incompat &= ~EXT4FS_FEATURE_INCOMPAT_RECOVER;
-	fs->m_sble.sb_feature_incompat = htole32(fs->m_feature_incompat);
+	fs->m_sble.sb_feature_incompat =
+	    htole32(fs->m_feature_incompat);
 	fs->m_state = EXT4FS_STATE_VALID;
 	fs->m_fs_was_modified = 1;
 	error = ext4fs_sbwrite(mp);

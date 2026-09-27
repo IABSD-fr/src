@@ -14,24 +14,25 @@
  * are met:
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the University nor the names of its contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
+ * 2. Redistributions in binary form must reproduce the above
+ *    copyright notice, this list of conditions and the following
+ *    disclaimer in the documentation and/or other materials provided
+ *    with the distribution.
+ * 3. Neither the name of the University nor the names of its
+ *    contributors may be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
  *
- * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
+ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS''
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+ * PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR
+ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+ * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * Modified for ext4fs by kmx.io.
  */
@@ -84,8 +85,8 @@ static int	ext4fs_direnter_handle (struct inode *, struct vnode *,
     struct componentname *, struct ext4fs_journal_handle *, int *);
 static int	ext4fs_dirremove_handle (struct inode *, struct vnode *,
     struct ext4fs_journal_handle *, int *);
-static int	ext4fs_dirremove_at_handle (struct inode *, struct vnode *, off_t,
-    struct ext4fs_journal_handle *, int *);
+static int	ext4fs_dirremove_at_handle (struct inode *, struct vnode *,
+    off_t, struct ext4fs_journal_handle *, int *);
 static int	ext4fs_dirrewrite_handle (struct inode *, struct inode *,
     struct inode *, struct componentname *, off_t,
     struct ext4fs_journal_handle *, int *);
@@ -134,13 +135,13 @@ ext4fs_dir_block_check (struct inode *ip, const void *data)
 }
 
 /*
- * Validate an extent node header before using its entries.  bytes is the
- * complete storage available to the node: the inode i_block area for a root,
- * or one filesystem block for an external node.
+ * Validate an extent node header before using its entries.  bytes is
+ * the complete storage available to the node: the inode i_block area
+ * for a root, or one filesystem block for an external node.
  */
 static int
-ext4fs_extent_header_check (struct ext4fs_extent_header *eh, size_t bytes,
-    int expected_depth)
+ext4fs_extent_header_check (struct ext4fs_extent_header *eh,
+    size_t bytes, int expected_depth)
 {
 	size_t capacity;
 	u_int16_t depth, entries, max;
@@ -420,8 +421,9 @@ ext4fs_update_handle (struct inode *ip,
 
 /*
  * Write an inode back to disk.  A journaled standalone update commits
- * synchronously until callers pass a shared handle through compound metadata
- * operations.  Journal-less ext4 retains the legacy direct-write path.
+ * synchronously until callers pass a shared handle through compound
+ * metadata operations.  Journal-less ext4 retains the legacy
+ * direct-write path.
  */
 int
 ext4fs_update (struct inode *ip, int waitfor)
@@ -543,9 +545,10 @@ ext4fs_block_bitmap_mark (struct m_ext4fs *fs, u_int32_t group,
 }
 
 /*
- * Construct the initialized form of a block bitmap.  FLEX_BG permits the
- * bitmaps and inode tables described by one group to reside in another, so
- * reserve metadata by physical location rather than descriptor ownership.
+ * Construct the initialized form of a block bitmap.  FLEX_BG permits
+ * the bitmaps and inode tables described by one group to reside in
+ * another, so reserve metadata by physical location rather than
+ * descriptor ownership.
  */
 static int
 ext4fs_block_bitmap_init (struct inode *ip, u_int32_t group,
@@ -663,8 +666,8 @@ ext4fs_block_bitmap_csum_verify (struct m_ext4fs *fs, u_int32_t group,
  * Tries the group of the goal block first, then scans all groups.
  */
 static int
-ext4fs_blkalloc_direct (struct inode *ip, u_int64_t goal, u_int32_t count,
-    u_int64_t *bnp, u_int32_t *countp)
+ext4fs_blkalloc_direct (struct inode *ip, u_int64_t goal,
+    u_int32_t count, u_int64_t *bnp, u_int32_t *countp)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_block_group_descriptor *gd;
@@ -817,8 +820,8 @@ ext4fs_blkalloc_direct (struct inode *ip, u_int64_t goal, u_int32_t count,
 
 int
 ext4fs_blkalloc_handle (struct inode *ip,
-    struct ext4fs_journal_handle *handle, u_int64_t goal, u_int32_t count,
-    u_int64_t *bnp, u_int32_t *countp)
+    struct ext4fs_journal_handle *handle, u_int64_t goal,
+    u_int32_t count, u_int64_t *bnp, u_int32_t *countp)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_block_group_descriptor saved_gd, *gd;
@@ -1113,8 +1116,8 @@ ext4fs_blkfree_direct (struct inode *ip, u_int64_t bno)
 
 static int
 ext4fs_blkfree_range_handle (struct inode *ip,
-    struct ext4fs_journal_handle *handle, u_int64_t bno, u_int32_t count,
-    int revoke)
+    struct ext4fs_journal_handle *handle, u_int64_t bno,
+    u_int32_t count, int revoke)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_block_group_descriptor saved_gd, *gd;
@@ -1421,8 +1424,9 @@ ext4fs_extent_grow_tree (struct inode *ip,
  * Returns ENOSPC if the parent index is also full (depth 2+ needed).
  */
 static int
-ext4fs_leaf_split (struct inode *ip, struct ext4fs_journal_handle *handle,
-    struct buf *old_bp, struct ext4fs_extent_header *old_eh)
+ext4fs_leaf_split (struct inode *ip,
+    struct ext4fs_journal_handle *handle, struct buf *old_bp,
+    struct ext4fs_extent_header *old_eh)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
@@ -1864,15 +1868,15 @@ ext4fs_buf_alloc (struct inode *ip, u_int64_t lbn, int size,
 }
 
 /*
- * Handle-aware directory-block allocation.  Existing directory blocks are
- * enlisted as journal metadata.  A new block, its extent mapping, allocation
- * accounting, and the directory inode remain owned by the caller's compound
- * transaction.
+ * Handle-aware directory-block allocation.  Existing directory blocks
+ * are enlisted as journal metadata.  A new block, its extent mapping,
+ * allocation accounting, and the directory inode remain owned by the
+ * caller's compound transaction.
  */
 static int
 ext4fs_buf_alloc_handle (struct inode *ip,
-    struct ext4fs_journal_handle *handle, u_int64_t lbn, struct buf **bpp,
-    int flags, int *changedp)
+    struct ext4fs_journal_handle *handle, u_int64_t lbn,
+    struct buf **bpp, int flags, int *changedp)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
@@ -2037,7 +2041,8 @@ ext4fs_free_extents (struct inode *ip, struct ext4fs_extent *ext,
 }
 
 /*
- * Trim extents: free blocks beyond new_nblocks, trim straddling extents.
+ * Trim extents: free blocks beyond new_nblocks, trim straddling
+ * extents.
  * Returns number of filesystem blocks freed.
  */
 static u_int64_t
@@ -2147,8 +2152,8 @@ ext4fs_free_extents_handle (struct inode *ip,
 
 /*
  * Reject physical aliases within a regular file's extent tree.  In
- * particular, data extents must not cover an external extent node which a
- * truncate is about to update or free.
+ * particular, data extents must not cover an external extent node which
+ * a truncate is about to update or free.
  */
 static int
 ext4fs_extent_physical_check (struct ext4fs_extent *ext, size_t entries,
@@ -2218,9 +2223,10 @@ ext4fs_inode_blocks_subtract (struct inode *ip, u_int64_t blocks)
 }
 
 /*
- * Build the retained and released halves of a leaf without modifying the
- * live extent tree.  At most one released extent is produced for each input
- * extent, so both output arrays may be sized to the original entry count.
+ * Build the retained and released halves of a leaf without modifying
+ * the live extent tree.  At most one released extent is produced for
+ * each input extent, so both output arrays may be sized to the original
+ * entry count.
  */
 static int
 ext4fs_extent_plan_shrink (const struct ext4fs_extent *source,
@@ -2905,7 +2911,8 @@ out:
  * Supports both depth-0 (inline) and depth > 0 (tree) extent trees.
  */
 int
-ext4fs_truncate (struct inode *ip, off_t length, int flags, struct ucred *cred)
+ext4fs_truncate (struct inode *ip, off_t length, int flags,
+    struct ucred *cred)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
@@ -3136,33 +3143,33 @@ ext4fs_truncate (struct inode *ip, off_t length, int flags, struct ucred *cred)
 
 /* Forward declarations */
 
-int ext4fs_access (void *);
-int ext4fs_advlock (void *);
-int ext4fs_bmap (void *);
-int ext4fs_chmod (struct vnode *, mode_t, struct ucred *);
-int ext4fs_chown (struct vnode *, uid_t, gid_t, struct ucred *);
-int ext4fs_create (void *);
-int ext4fs_fsync (void *);
-int ext4fs_getattr (void *);
-int ext4fs_inactive (void *);
-int ext4fs_link (void *);
-int ext4fs_lookup (void *);
-int ext4fs_mkdir (void *);
-int ext4fs_mknod (void *);
-int ext4fs_open (void *);
-int ext4fs_pathconf (void *);
-int ext4fs_print (void *);
-int ext4fs_read (void *);
-int ext4fs_readdir (void *);
-int ext4fs_readlink (void *);
-int ext4fs_reclaim (void *);
-int ext4fs_remove (void *);
-int ext4fs_rename (void *);
-int ext4fs_rmdir (void *);
-int ext4fs_setattr (void *);
-int ext4fs_strategy (void *);
-int ext4fs_symlink (void *);
-int ext4fs_write (void *);
+int	ext4fs_access (void *);
+int	ext4fs_advlock (void *);
+int	ext4fs_bmap (void *);
+int	ext4fs_chmod (struct vnode *, mode_t, struct ucred *);
+int	ext4fs_chown (struct vnode *, uid_t, gid_t, struct ucred *);
+int	ext4fs_create (void *);
+int	ext4fs_fsync (void *);
+int	ext4fs_getattr (void *);
+int	ext4fs_inactive (void *);
+int	ext4fs_link (void *);
+int	ext4fs_lookup (void *);
+int	ext4fs_mkdir (void *);
+int	ext4fs_mknod (void *);
+int	ext4fs_open (void *);
+int	ext4fs_pathconf (void *);
+int	ext4fs_print (void *);
+int	ext4fs_read (void *);
+int	ext4fs_readdir (void *);
+int	ext4fs_readlink (void *);
+int	ext4fs_reclaim (void *);
+int	ext4fs_remove (void *);
+int	ext4fs_rename (void *);
+int	ext4fs_rmdir (void *);
+int	ext4fs_setattr (void *);
+int	ext4fs_strategy (void *);
+int	ext4fs_symlink (void *);
+int	ext4fs_write (void *);
 
 const struct vops ext4fs_vops = {
 	.vop_lookup	= ext4fs_lookup,
@@ -3314,7 +3321,8 @@ ext4fs_lookup (void *v)
 	*vpp = NULL;
 
 	/* Check accessibility of directory */
-	if ((error = VOP_ACCESS(vdp, VEXEC, cnp->cn_cred, cnp->cn_proc)) != 0) {
+	if ((error = VOP_ACCESS(vdp, VEXEC, cnp->cn_cred,
+	    cnp->cn_proc)) != 0) {
 		return (error);
 	}
 
@@ -3532,8 +3540,8 @@ found:
 }
 
 static void
-ext4fs_inode_initialize (struct inode *ip, struct inode *pdir, mode_t mode,
-    struct ucred *cred, dev_t rdev)
+ext4fs_inode_initialize (struct inode *ip, struct inode *pdir,
+    mode_t mode, struct ucred *cred, dev_t rdev)
 {
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
 	struct vnode *vp = ITOV(ip);
@@ -3908,7 +3916,8 @@ ext4fs_chmod (struct vnode *vp, mode_t mode, struct ucred *cred)
 }
 
 int
-ext4fs_chown (struct vnode *vp, uid_t uid, gid_t gid, struct ucred *cred)
+ext4fs_chown (struct vnode *vp, uid_t uid, gid_t gid,
+    struct ucred *cred)
 {
 	struct inode *ip = VTOI(vp);
 
@@ -4142,7 +4151,8 @@ ext4fs_read (void *v)
 /*
  * Allocate and expose one regular-file block in a single ordered
  * transaction.  Keeping the transaction open until the data buffer is
- * written prevents a newly mapped hole from exposing stale disk contents.
+ * written prevents a newly mapped hole from exposing stale disk
+ * contents.
  */
 static int
 ext4fs_write_allocated_block (struct inode *ip, struct uio *uio,
@@ -4803,7 +4813,7 @@ out2:
 }
 
 /*
- * Validate an existing rename target before its last name can be removed.
+ * Validate a rename target before its last name can be removed.
  */
 static int
 ext4fs_rename_target_validate (struct inode *ip, int *orphanp)
@@ -4906,8 +4916,8 @@ ext4fs_rename_target_validate (struct inode *ip, int *orphanp)
 
 /*
  * Check if source is an ancestor of target in the directory hierarchy.
- * Prevents creating directory loops via rename.  The target vnode must be
- * locked on entry and is always vput before returning.
+ * Prevents creating directory loops via rename.  The target vnode must
+ * be locked on entry and is always vput before returning.
  */
 static int
 ext4fs_checkpath (struct inode *source, struct inode *target,
@@ -5928,7 +5938,8 @@ ext4fs_mkdir (void *v)
 	dirp->e4d_ino = htole32((u_int32_t)dp->i_number);
 	dirp->e4d_reclen = htole16(fs->m_block_size - 12 -
 	    ((fs->m_feature_ro_compat &
-	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM) ? EXT4FS_DIR_TAIL_SIZE : 0));
+	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM) ?
+	    EXT4FS_DIR_TAIL_SIZE : 0));
 	dirp->e4d_namlen = 2;
 	dirp->e4d_type = EXT4FS_FT_DIR;
 	dirp->e4d_name[0] = '.';
@@ -6586,8 +6597,8 @@ ext4fs_direnter_handle (struct inode *ip, struct vnode *dvp,
  * Remove one name under an existing journal handle.
  */
 static int
-ext4fs_dirremove_at_handle (struct inode *ip, struct vnode *dvp, off_t diroff,
-    struct ext4fs_journal_handle *handle, int *changedp)
+ext4fs_dirremove_at_handle (struct inode *ip, struct vnode *dvp,
+    off_t diroff, struct ext4fs_journal_handle *handle, int *changedp)
 {
 	struct inode *dp = VTOI(dvp);
 	struct m_ext4fs *fs = dp->i_e4fs;
@@ -6753,7 +6764,8 @@ ext4fs_dirrewrite_handle (struct inode *dp, struct inode *oip,
 
 static int
 ext4fs_dotdot_rewrite_handle (struct inode *ip, ufsino_t oldparent,
-    ufsino_t newparent, struct ext4fs_journal_handle *handle, int *changedp)
+    ufsino_t newparent, struct ext4fs_journal_handle *handle,
+    int *changedp)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_directory *dot, *dotdot;
@@ -6995,7 +7007,8 @@ ext4fs_dirremove (struct vnode *dvp, struct componentname *cnp)
  * Check if a directory is empty (contains only "." and "..").
  */
 int
-ext4fs_dirempty (struct inode *ip, ufsino_t parentino, struct ucred *cred)
+ext4fs_dirempty (struct inode *ip, ufsino_t parentino,
+    struct ucred *cred)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;

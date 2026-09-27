@@ -1,17 +1,19 @@
 /*
  * Copyright (c) 2025 kmx.io.
  *
- * Permission to use, copy, modify, and distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
+ * Permission to use, copy, modify, and distribute this software for
+ * any purpose with or without fee is hereby granted, provided that the
+ * above copyright notice and this permission notice appear in all
+ * copies.
  *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+ * WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE
+ * AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL
+ * DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA
+ * OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+ * TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+ * PERFORMANCE OF THIS SOFTWARE.
  */
 
 /*
@@ -45,9 +47,10 @@
 #define JBD2_FEATURE_INCOMPAT_FAST_COMMIT	0x20
 
 /*
- * Recovery currently supports metadata checksums v2/v3, but not the older
- * transaction-wide checksum format, asynchronous commits, or fast commits.
- * Unknown incompatible features must never be silently ignored during replay.
+ * Recovery currently supports metadata checksums v2/v3, but not the
+ * older transaction-wide checksum format, asynchronous commits, or fast
+ * commits.  Unknown incompatible features must never be silently
+ * ignored during replay.
  */
 #define JBD2_FEATURE_COMPAT_SUPPORTED		0
 #define JBD2_FEATURE_RO_COMPAT_SUPPORTED	0
@@ -64,7 +67,7 @@
 #define JBD2_CHECKSUM_CRC32C	4
 #define JBD2_CHECKSUM_SIZE	4
 
-/* Keep a malicious superblock from forcing an unbounded wired allocation. */
+/* Bound wired allocation requested by a malicious superblock. */
 #define JBD2_MAX_BLOCKMAP_ENTRIES	(1U << 20)
 #define JBD2_MAX_REVOKE_ENTRIES		(1U << 18)
 
@@ -115,7 +118,9 @@ struct jbd2_superblock {
 	u_int8_t	s_users[16 * 48];
 } __attribute__((packed));
 
-/* Commit block header.  The rest of the journal block is zero-filled. */
+/*
+ * Commit block header.  The rest of the journal block is zero-filled.
+ */
 struct jbd2_commit_header {
 	struct jbd2_header h_header;
 	u_int8_t	h_checksum_type;
@@ -155,7 +160,8 @@ struct jbd2_revoke_header {
 
 /* Revocation table entry */
 struct jbd2_revoke_entry {
-	u_int64_t	re_block;	/* filesystem block + 1; zero means unused */
+	/* Filesystem block + 1; zero means unused. */
+	u_int64_t	re_block;
 	u_int32_t	re_sequence;
 };
 
@@ -175,7 +181,8 @@ struct jbd2_replay_ctx {
 	u_int32_t		rc_first;
 	u_int32_t		rc_sequence;	/* starting sequence */
 	u_int32_t		rc_start;	/* starting block */
-	u_int32_t		rc_head;	/* next unused block when clean */
+	/* Next unused block when clean. */
+	u_int32_t		rc_head;
 	u_int32_t		rc_max_transaction;
 
 	/* Journal feature flags */
@@ -185,7 +192,8 @@ struct jbd2_replay_ctx {
 	u_int32_t		rc_checksum_seed;
 	u_int8_t		rc_uuid[16];
 	u_int32_t		rc_journal_ino;
-	u_int32_t		rc_journal_gen;	/* little-endian on-disk value */
+	/* Little-endian on-disk value. */
+	u_int32_t		rc_journal_gen;
 
 	/* Block map: journal block number -> filesystem block */
 	struct jbd2_blockmap_entry *rc_blockmap;
@@ -213,8 +221,8 @@ int	jbd2_journal_open (struct vnode *, struct m_ext4fs *,
     struct jbd2_replay_ctx *, u_int64_t *);
 void	jbd2_journal_close (struct jbd2_replay_ctx *);
 int	jbd2_has_csum_v2or3 (struct jbd2_replay_ctx *);
-u_int32_t	jbd2_block_checksum (struct jbd2_replay_ctx *, const void *,
-    size_t);
+u_int32_t	jbd2_block_checksum (struct jbd2_replay_ctx *,
+    const void *, size_t);
 u_int32_t	jbd2_data_block_checksum (struct jbd2_replay_ctx *,
     const void *, u_int32_t);
 u_int32_t	jbd2_descriptor_limit (struct jbd2_replay_ctx *);
@@ -231,14 +239,15 @@ void	ext4fs_journal_destroy (struct mount *);
 void	ext4fs_journal_abort (struct mount *, int);
 
 /*
- * A buffer passed to get_write_access() must be B_BUSY.  On success, the
- * handle owns it and the caller must not bwrite(), bdwrite(), bawrite(), or
- * brelse() it.  get_metadata() combines a filesystem-block read with this
- * registration and reuses a busy buffer already owned by the same running
- * transaction.  dirty_metadata() transfers ownership to the transaction;
- * otherwise journal_end() releases it.  A transaction keeps every dirtied
- * buffer busy until the commit/checkpoint path writes it, or abort teardown
- * invalidates and releases it.
+ * A buffer passed to get_write_access() must be B_BUSY.  On success,
+ * the handle owns it and the caller must not bwrite(), bdwrite(),
+ * bawrite(), or brelse() it.  get_metadata() combines a
+ * filesystem-block read with this registration and reuses a busy buffer
+ * already owned by the same running transaction.  dirty_metadata()
+ * transfers ownership to the transaction; otherwise journal_end()
+ * releases it.  A transaction keeps every dirtied buffer busy until the
+ * commit/checkpoint path writes it, or abort teardown invalidates and
+ * releases it.
  */
 int	ext4fs_journal_begin (struct mount *, unsigned int,
     struct ext4fs_journal_handle **);
@@ -253,4 +262,5 @@ int	ext4fs_journal_get_metadata (struct ext4fs_journal_handle *,
     struct vnode *, u_int64_t, struct buf **);
 int	ext4fs_journal_get_write_access (struct ext4fs_journal_handle *,
     struct buf *, u_int64_t);
-int	ext4fs_journal_revoke (struct ext4fs_journal_handle *, u_int64_t);
+int	ext4fs_journal_revoke (struct ext4fs_journal_handle *,
+    u_int64_t);
