@@ -924,6 +924,7 @@ mutate_filesystem_tree (void)
 {
 	struct statfs before, after;
 	struct statfs orphan_before, orphan_during, orphan_after;
+	struct stat directory, parent_after, parent_before, parent_during;
 	struct timeval times[2];
 	char path[PATH_MAX], other[PATH_MAX];
 	off_t marker, overwrite;
@@ -1195,11 +1196,40 @@ mutate_filesystem_tree (void)
 	if (after.f_ffree <= before.f_ffree)
 		errx(1, "inode counter did not reflect directory-entry churn");
 
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before mkdir");
+	if (stat(root, &parent_before) == -1)
+		err(1, "stat parent before mkdir");
 	make_path(path, sizeof(path), "temporary-directory");
 	if (mkdir(path, 0700) == -1)
 		err(1, "mkdir %s", path);
+	if (stat(path, &directory) == -1)
+		err(1, "stat %s", path);
+	if (!S_ISDIR(directory.st_mode) || directory.st_nlink != 2 ||
+	    directory.st_size != (off_t)block_size ||
+	    (directory.st_mode & 0777) != 0700)
+		errx(1, "new directory metadata mismatch");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after mkdir");
+	if (stat(root, &parent_during) == -1)
+		err(1, "stat parent after mkdir");
+	if (after.f_ffree + 1 != before.f_ffree ||
+	    after.f_bfree + 1 != before.f_bfree)
+		errx(1, "mkdir did not consume exactly one inode and one block");
+	if (parent_during.st_nlink != parent_before.st_nlink + 1)
+		errx(1, "mkdir did not increment the parent link count");
 	if (rmdir(path) == -1)
 		err(1, "rmdir %s", path);
+	check_absent(path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after rmdir");
+	if (stat(root, &parent_after) == -1)
+		err(1, "stat parent after rmdir");
+	if (after.f_ffree != before.f_ffree ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "rmdir did not restore inode and block accounting");
+	if (parent_after.st_nlink != parent_before.st_nlink)
+		errx(1, "rmdir did not restore the parent link count");
 	fsync_path(root);
 }
 

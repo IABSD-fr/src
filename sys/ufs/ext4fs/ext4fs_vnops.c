@@ -5176,6 +5176,147 @@ out:
 	return (error);
 }
 
+static int
+ext4fs_mkdir_journal (struct vop_mkdir_args *ap)
+{
+	struct vnode *dvp = ap->a_dvp;
+	struct vattr *vap = ap->a_vap;
+	struct componentname *cnp = ap->a_cnp;
+	struct inode *dp = VTOI(dvp), *ip;
+	struct m_ext4fs *fs = dp->i_e4fs;
+	struct ext4fs_dinode_256 saved_dir_inode;
+	struct ext4fs_journal_handle *handle;
+	struct ext4fs_directory *dirp;
+	struct vnode *tvp;
+	struct buf *bp;
+	u_int16_t nlink;
+	int changed, end_error, error;
+	int saved_dir_effnlink, saved_dir_flags;
+
+	*ap->a_vpp = NULL;
+	if (letoh32(dp->i_e4din->dinode.i_flags) &
+	    EXTFS_INODE_FLAG_INDEX) {
+		error = EOPNOTSUPP;
+		goto out;
+	}
+	memcpy(&saved_dir_inode, dp->i_e4din, sizeof(saved_dir_inode));
+	saved_dir_flags = dp->i_flag;
+	saved_dir_effnlink = dp->i_effnlink;
+	handle = NULL;
+	tvp = NULL;
+	changed = 0;
+	error = ext4fs_journal_begin(dvp->v_mount, 24, &handle);
+	if (error)
+		goto out;
+	error = ext4fs_inode_alloc_handle(dp, S_IFDIR | vap->va_mode,
+	    handle, &tvp);
+	if (error)
+		goto fail;
+	changed = 1;
+
+	ip = VTOI(tvp);
+	ext4fs_inode_initialize(ip, dp, S_IFDIR | vap->va_mode,
+	    cnp->cn_cred, VNOVAL);
+	ip->i_effnlink = 2;
+	ip->i_e4din->dinode.i_links_count = htole16(2);
+
+	error = ext4fs_buf_alloc_handle(ip, handle, 0, &bp, B_CLRBUF,
+	    &changed);
+	if (error)
+		goto fail;
+	dirp = (struct ext4fs_directory *)bp->b_data;
+	dirp->e4d_ino = htole32((u_int32_t)ip->i_number);
+	dirp->e4d_reclen = htole16(12);
+	dirp->e4d_namlen = 1;
+	dirp->e4d_type = EXT4FS_FT_DIR;
+	dirp->e4d_name[0] = '.';
+	dirp = (struct ext4fs_directory *)((char *)bp->b_data + 12);
+	dirp->e4d_ino = htole32((u_int32_t)dp->i_number);
+	dirp->e4d_reclen = htole16(fs->m_block_size - 12 -
+	    ((fs->m_feature_ro_compat &
+	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM) ?
+	    EXT4FS_DIR_TAIL_SIZE : 0));
+	dirp->e4d_namlen = 2;
+	dirp->e4d_type = EXT4FS_FT_DIR;
+	dirp->e4d_name[0] = '.';
+	dirp->e4d_name[1] = '.';
+	ext4fs_dir_set_csum(fs, ip->i_number,
+	    ip->i_e4din->dinode.i_nfs_generation, bp->b_data);
+	error = ext4fs_dir_block_check(ip, bp->b_data);
+	if (error)
+		goto fail;
+	error = ext4fs_journal_dirty_metadata(handle, bp);
+	if (error)
+		goto fail;
+
+	ext4fs_setsize(ip, fs->m_block_size);
+	ip->i_flag |= IN_CHANGE | IN_UPDATE;
+	error = ext4fs_update_handle(ip, handle);
+	if (error)
+		goto fail;
+
+	nlink = letoh16(dp->i_e4din->dinode.i_links_count);
+	if (nlink >= EXT4FS_LINK_MAX) {
+		error = EMLINK;
+		goto fail;
+	}
+	nlink++;
+	dp->i_e4din->dinode.i_links_count = htole16(nlink);
+	dp->i_effnlink = nlink;
+	dp->i_flag |= IN_CHANGE;
+	error = ext4fs_direnter_handle(ip, dvp, cnp, handle, &changed);
+	if (error)
+		goto fail;
+
+	end_error = ext4fs_journal_end(handle);
+	handle = NULL;
+	if (end_error) {
+		error = end_error;
+		ext4fs_journal_abort(dvp->v_mount, error);
+		goto restore;
+	}
+	error = ext4fs_journal_force_commit(dvp->v_mount);
+	if (error) {
+		ext4fs_journal_abort(dvp->v_mount, error);
+		goto restore;
+	}
+	ip->i_flag &= ~IN_MODIFIED;
+	dp->i_flag &= ~IN_MODIFIED;
+	uvm_vnp_setsize(tvp, fs->m_block_size);
+	if ((cnp->cn_flags & SAVESTART) == 0)
+		pool_put(&namei_pool, cnp->cn_pnbuf);
+	*ap->a_vpp = tvp;
+	vput(dvp);
+	return (0);
+
+fail:
+	if (changed)
+		ext4fs_journal_abort(dvp->v_mount, error);
+	if (handle != NULL) {
+		end_error = ext4fs_journal_end(handle);
+		handle = NULL;
+		if (error == 0)
+			error = end_error;
+	}
+restore:
+	memcpy(dp->i_e4din, &saved_dir_inode, sizeof(saved_dir_inode));
+	dp->i_flag = saved_dir_flags;
+	dp->i_effnlink = saved_dir_effnlink;
+	if (tvp != NULL) {
+		ip = VTOI(tvp);
+		ip->i_effnlink = 0;
+		ip->i_e4din->dinode.i_mode = htole16(0);
+		ip->i_e4din->dinode.i_links_count = htole16(0);
+		ip->i_e4din->dinode.i_dtime = htole32(1);
+		tvp->v_type = VNON;
+		vput(tvp);
+	}
+out:
+	pool_put(&namei_pool, cnp->cn_pnbuf);
+	vput(dvp);
+	return (error);
+}
+
 int
 ext4fs_mkdir (void *v)
 {
@@ -5199,6 +5340,8 @@ ext4fs_mkdir (void *v)
 		pool_put(&namei_pool, cnp->cn_pnbuf);
 		goto out;
 	}
+	if (fs->m_journal != NULL)
+		return (ext4fs_mkdir_journal(ap));
 
 	/* Allocate inode for new directory */
 	error = ext4fs_inode_alloc(dp, S_IFDIR | vap->va_mode,
@@ -5304,6 +5447,109 @@ out:
 	return (error);
 }
 
+static int
+ext4fs_rmdir_journal (struct vop_rmdir_args *ap)
+{
+	struct vnode *vp = ap->a_vp;
+	struct vnode *dvp = ap->a_dvp;
+	struct inode *ip = VTOI(vp);
+	struct inode *dp = VTOI(dvp);
+	struct m_ext4fs *fs = ip->i_e4fs;
+	struct ext4fs_dinode_256 saved_dir_inode, saved_inode;
+	struct ext4fs_journal_handle *handle;
+	struct ext4fs saved_sb;
+	u_int32_t saved_feature_ro_compat, saved_last_orphan;
+	u_int16_t nlink;
+	int changed, end_error, error, orphan_added;
+	int saved_dir_effnlink, saved_dir_flags, saved_effnlink, saved_flags;
+
+	rw_enter_write(&fs->m_runtime_orphan_lock);
+	memcpy(&saved_inode, ip->i_e4din, sizeof(saved_inode));
+	memcpy(&saved_dir_inode, dp->i_e4din, sizeof(saved_dir_inode));
+	saved_flags = ip->i_flag;
+	saved_dir_flags = dp->i_flag;
+	saved_effnlink = ip->i_effnlink;
+	saved_dir_effnlink = dp->i_effnlink;
+	saved_sb = fs->m_sble;
+	saved_feature_ro_compat = fs->m_feature_ro_compat;
+	saved_last_orphan = fs->m_last_orphan;
+	handle = NULL;
+	changed = 0;
+	orphan_added = 0;
+	error = ext4fs_journal_begin(vp->v_mount, 16, &handle);
+	if (error) {
+		rw_exit_write(&fs->m_runtime_orphan_lock);
+		return (error);
+	}
+
+	nlink = letoh16(dp->i_e4din->dinode.i_links_count);
+	if (nlink < 2) {
+		error = EIO;
+		goto fail;
+	}
+	nlink--;
+	dp->i_e4din->dinode.i_links_count = htole16(nlink);
+	dp->i_effnlink = nlink;
+	dp->i_flag |= IN_CHANGE;
+	ip->i_e4din->dinode.i_links_count = htole16(0);
+	ip->i_effnlink = 0;
+	ip->i_flag |= IN_CHANGE;
+
+	error = ext4fs_dirremove_handle(ip, dvp, handle, &changed);
+	if (error)
+		goto fail;
+	error = ext4fs_orphan_add_handle(ip, handle);
+	if (error)
+		goto fail;
+	orphan_added = 1;
+
+	end_error = ext4fs_journal_end(handle);
+	handle = NULL;
+	if (end_error) {
+		error = end_error;
+		ext4fs_journal_abort(vp->v_mount, error);
+		goto restore;
+	}
+	error = ext4fs_journal_force_commit(vp->v_mount);
+	if (error) {
+		ext4fs_journal_abort(vp->v_mount, error);
+		goto restore;
+	}
+	ip->i_flag &= ~IN_MODIFIED;
+	dp->i_flag &= ~IN_MODIFIED;
+	rw_exit_write(&fs->m_runtime_orphan_lock);
+	cache_purge(dvp);
+	cache_purge(vp);
+	return (0);
+
+fail:
+	if (changed || orphan_added)
+		ext4fs_journal_abort(vp->v_mount, error);
+	if (handle != NULL) {
+		end_error = ext4fs_journal_end(handle);
+		handle = NULL;
+		if (error == 0)
+			error = end_error;
+	}
+restore:
+	if (orphan_added) {
+		ext4fs_orphan_add_rollback(ip);
+		fs->m_sble = saved_sb;
+		fs->m_feature_ro_compat = saved_feature_ro_compat;
+		fs->m_last_orphan = saved_last_orphan;
+		fs->m_sble.sb_state = htole16(fs->m_state);
+		fs->m_fs_was_modified = 1;
+	}
+	memcpy(ip->i_e4din, &saved_inode, sizeof(saved_inode));
+	memcpy(dp->i_e4din, &saved_dir_inode, sizeof(saved_dir_inode));
+	ip->i_flag = saved_flags;
+	dp->i_flag = saved_dir_flags;
+	ip->i_effnlink = saved_effnlink;
+	dp->i_effnlink = saved_dir_effnlink;
+	rw_exit_write(&fs->m_runtime_orphan_lock);
+	return (error);
+}
+
 int
 ext4fs_rmdir (void *v)
 {
@@ -5313,13 +5559,66 @@ ext4fs_rmdir (void *v)
 	struct componentname *cnp = ap->a_cnp;
 	struct inode *ip = VTOI(vp);
 	struct inode *dp = VTOI(dvp);
+	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
+	struct ext4fs_extent_header *eh = &din->i_extent_header;
+	u_int32_t flags;
 	u_int16_t nlink;
 	int error;
 
-	/* Directory must be empty */
+	error = 0;
+	if (ip->i_flag & IN_RENAME) {
+		error = EINVAL;
+		goto out;
+	}
+	nlink = letoh16(din->i_links_count);
+	if (nlink != 2 || ip->i_effnlink != 2) {
+		error = ENOTEMPTY;
+		goto out;
+	}
+	flags = letoh32(din->i_flags);
+	if ((letoh32(dp->i_e4din->dinode.i_flags) &
+	    EXTFS_INODE_FLAG_APPEND) ||
+	    (flags & (EXTFS_INODE_FLAG_IMMUTABLE |
+	    EXTFS_INODE_FLAG_APPEND))) {
+		error = EPERM;
+		goto out;
+	}
+	if (fs->m_journal != NULL) {
+		if ((letoh32(dp->i_e4din->dinode.i_flags) &
+		    EXTFS_INODE_FLAG_INDEX) ||
+		    (flags & EXTFS_INODE_FLAG_INDEX)) {
+			error = EOPNOTSUPP;
+			goto out;
+		}
+		if (!(flags & EXTFS_INODE_FLAG_EXTENTS)) {
+			error = EOPNOTSUPP;
+			goto out;
+		}
+		error = ext4fs_extent_header_check(eh, sizeof(din->i_block),
+		    -1);
+		if (error)
+			goto out;
+		if (letoh16(eh->eh_depth) > 1) {
+			error = EOPNOTSUPP;
+			goto out;
+		}
+		if (letoh16(eh->eh_depth) == 0)
+			error = ext4fs_extent_leaf_check(fs, eh);
+		else
+			error = ext4fs_extent_index_check(fs, eh);
+		if (error)
+			goto out;
+		error = ext4fs_orphan_xattr_validate(ip);
+		if (error)
+			goto out;
+	}
 	if (!ext4fs_dirempty(ip, dp->i_number, cnp->cn_cred)) {
 		error = ENOTEMPTY;
+		goto out;
+	}
+	if (fs->m_journal != NULL) {
+		error = ext4fs_rmdir_journal(ap);
 		goto out;
 	}
 
@@ -5665,7 +5964,7 @@ ext4fs_direnter_handle (struct inode *ip, struct vnode *dvp,
 }
 
 /*
- * Remove one non-directory name under an existing journal handle.
+ * Remove one name under an existing journal handle.
  */
 static int
 ext4fs_dirremove_handle (struct inode *ip, struct vnode *dvp,
@@ -5943,69 +6242,76 @@ ext4fs_dirempty (struct inode *ip, ufsino_t parentino, struct ucred *cred)
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
 	struct ext4fs_directory *ep;
 	struct buf *bp;
-	off_t off, filesz;
-	u_int64_t lbn, pblk, blkoff;
+	size_t blkoff, limit;
+	u_int64_t filesz, ino, lbn, off, pblk;
 	u_int16_t reclen;
-	int error;
+	int error, seen_dot, seen_dotdot;
 
-	filesz = (off_t)letoh32(din->i_size_lo) |
-	    ((off_t)letoh32(din->i_size_hi) << 32);
+	(void)cred;
+	filesz = letoh32(din->i_size_lo) |
+	    ((u_int64_t)letoh32(din->i_size_hi) << 32);
+	if (filesz == 0 || EXT4FS_BLKOFF(fs, filesz) != 0)
+		return (0);
+	limit = fs->m_block_size;
+	if (fs->m_feature_ro_compat & EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM)
+		limit -= EXT4FS_DIR_TAIL_SIZE;
+	seen_dot = 0;
+	seen_dotdot = 0;
 
-	for (off = 0; off < filesz; ) {
+	for (off = 0; off < filesz; off += fs->m_block_size) {
 		lbn = EXT4FS_LBLKNO(fs, off);
 
 		error = ext4fs_extent_pblk(ip, lbn, &pblk, NULL);
 		if (error || pblk == 0)
 			return (0);
 
+		bp = NULL;
 		error = bread(ip->i_devvp,
 		    (daddr_t)EXT4FS_FSBTODB(fs, pblk),
 		    fs->m_block_size, &bp);
+		if (error) {
+			if (bp != NULL)
+				brelse(bp);
+			return (0);
+		}
+		error = ext4fs_dir_block_check(ip, bp->b_data);
 		if (error) {
 			brelse(bp);
 			return (0);
 		}
 
-		blkoff = EXT4FS_BLKOFF(fs, off);
-
-		while (blkoff < fs->m_block_size && off < filesz) {
+		for (blkoff = 0; blkoff < limit; blkoff += reclen) {
 			ep = (struct ext4fs_directory *)
 			    ((char *)bp->b_data + blkoff);
 			reclen = letoh16(ep->e4d_reclen);
-
-			if (reclen < 8 || reclen > fs->m_block_size ||
-			    blkoff + reclen > fs->m_block_size) {
-				brelse(bp);
-				return (0);
+			ino = letoh32(ep->e4d_ino);
+			if (ino == 0)
+				continue;
+			if (ep->e4d_type != EXT4FS_FT_UNKNOWN &&
+			    ep->e4d_type != EXT4FS_FT_DIR)
+				goto not_empty;
+			if (ep->e4d_namlen == 1 && ep->e4d_name[0] == '.' &&
+			    ino == ip->i_number && !seen_dot) {
+				seen_dot = 1;
+				continue;
 			}
-
-			if (letoh32(ep->e4d_ino) != 0) {
-				if (ep->e4d_namlen > 2) {
-					brelse(bp);
-					return (0);
-				}
-				if (ep->e4d_name[0] != '.') {
-					brelse(bp);
-					return (0);
-				}
-				if (ep->e4d_namlen == 1) {
-					/* "." - ok */
-				} else if (ep->e4d_name[1] == '.') {
-					/* ".." - ok */
-				} else {
-					brelse(bp);
-					return (0);
-				}
+			if (ep->e4d_namlen == 2 && ep->e4d_name[0] == '.' &&
+			    ep->e4d_name[1] == '.' && ino == parentino &&
+			    !seen_dotdot) {
+				seen_dotdot = 1;
+				continue;
 			}
-
-			off += reclen;
-			blkoff += reclen;
+			goto not_empty;
 		}
 
 		brelse(bp);
 	}
 
-	return (1);
+	return (seen_dot && seen_dotdot);
+
+not_empty:
+	brelse(bp);
+	return (0);
 }
 
 /*

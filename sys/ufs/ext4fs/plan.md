@@ -571,6 +571,21 @@ orphan-file case, and FLEX_BG/BLOCK_UNINIT allocation.  This covers the
 remounted special-inode lookup which previously faulted, so the runtime gate is
 complete.
 
+The `mkdir` and `rmdir` conversion is complete.  Directory creation now
+commits inode allocation, the initialized `.`/`..` block and checksum tail,
+the child inode, the parent link count, and the parent namespace entry in one
+transaction.  Empty-directory removal commits the namespace deletion and
+both link-count changes with a classic-orphan or orphan-file record; the
+existing restartable inactive path then truncates and retires the directory.
+Empty-directory validation now checks every linear directory block and
+checksum, requires exactly one correctly linked `.` and `..`, and fails
+closed on malformed records.  The ordinary-operation regression checks exact
+inode, block, child-size, mode, and parent-link accounting for creation and
+removal, then verifies absence after remount and runs offline `e2fsck -fn`.
+On 2026-09-27, the booted production-kernel matrix passed on 1 KiB, 2 KiB,
+and 4 KiB classic-orphan filesystems, the 1 KiB orphan-file filesystem, and
+the FLEX_BG/BLOCK_UNINIT allocation fixture.
+
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only for
 regular-file data, the journal's own I/O, recovery, checkpointing, or another
 explicitly documented exception.
@@ -580,7 +595,7 @@ Wrap each compound namespace operation in one transaction:
 - [x] create and mknod;
 - [x] link;
 - [x] unlink;
-- [ ] mkdir and rmdir;
+- [x] mkdir and rmdir;
 - [ ] rename;
 - [ ] symlink;
 - [x] truncate and extent allocation/free for supported depth-0 and depth-1
