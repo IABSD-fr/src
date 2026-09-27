@@ -196,7 +196,8 @@ journal_sequence()
 	*[!0-9]*|'') fail "could not locate the journal inode" ;;
 	esac
 	journal_blocks=$("$DEBUGFS" -R "blocks <$journal_inode>" \
-	    "$image" 2>/dev/null) || fail "could not map the journal inode"
+	    "$image" 2>/dev/null) ||
+	    fail "could not map the journal inode"
 	set -- $journal_blocks
 	[ "$#" -gt 0 ] || fail "journal inode has no blocks"
 	case "$1" in
@@ -208,6 +209,18 @@ journal_sequence()
 	[ "${#sequence}" -eq 8 ] ||
 	    fail "could not read the journal sequence"
 	printf '%s\n' "$sequence"
+}
+
+inode_probe_number()
+{
+	inode_number=$("$DEBUGFS" -R \
+	    'stat /inode-bitmap/inode-probe' "$image" 2>/dev/null |
+	    awk '$1 == "Inode:" { print $2; exit }')
+	case "$inode_number" in
+	*[!0-9]*|'') fail "could not read the inode probe number" ;;
+	esac
+	[ "$inode_number" -gt 0 ] || fail "invalid inode probe number"
+	printf '%s\n' "$inode_number"
 }
 
 xattr_block()
@@ -524,6 +537,99 @@ run_bitmap_case()
 	echo " ok"
 }
 
+run_inode_bitmap_case()
+{
+	block_size=$1
+	case_dir=$work/inode-bitmap-$block_size
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	test_name="inode-bitmap transactions ($block_size byte blocks)"
+	print_test_name "$test_name"
+
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O 'metadata_csum,^orphan_file' "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs failed"
+	fi
+	if [ "$block_size" -eq 1024 ]; then
+		"$DUMPE2FS" "$image" >"$case_dir/dumpe2fs-before.log" \
+		    2>&1 || fail "dumpe2fs rejected the fresh image"
+		grep -q '^Group 1:.*INODE_UNINIT' \
+		    "$case_dir/dumpe2fs-before.log" ||
+		    fail "fixture group 1 is not INODE_UNINIT"
+	fi
+	sequence_before=$(journal_sequence)
+
+	attach_image
+	mount_image ""
+	run_step inode-allocate "$mountpoint/inode-bitmap"
+	unmount_image inode-allocate
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "inode allocation did not advance the journal sequence"
+	check_image inode-allocate
+	if [ "$block_size" -eq 1024 ]; then
+		"$DUMPE2FS" "$image" >"$case_dir/dumpe2fs-allocate.log" \
+		    2>&1 || fail "dumpe2fs rejected the allocated image"
+		if grep -q '^Group 1:.*INODE_UNINIT' \
+		    "$case_dir/dumpe2fs-allocate.log"; then
+			fail "kernel did not initialize inode bitmap group 1"
+		fi
+	fi
+	first_inode=$(inode_probe_number)
+	sequence_before=$sequence_after
+
+	attach_image
+	mount_image ""
+	run_step inode-verify "$mountpoint/inode-bitmap"
+	run_step inode-free "$mountpoint/inode-bitmap"
+	unmount_image inode-free
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "inode free did not advance the journal sequence"
+	check_image inode-free
+	sequence_before=$sequence_after
+
+	attach_image
+	mount_image ""
+	run_step inode-verify-retired "$mountpoint/inode-bitmap"
+	run_step inode-reuse "$mountpoint/inode-bitmap"
+	unmount_image inode-reuse
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "inode reuse did not advance the journal sequence"
+	check_image inode-reuse
+	reused_inode=$(inode_probe_number)
+	[ "$reused_inode" -eq "$first_inode" ] ||
+	    fail "freed inode was not immediately reused"
+	sequence_before=$sequence_after
+
+	attach_image
+	mount_image ""
+	run_step inode-verify "$mountpoint/inode-bitmap"
+	run_step inode-free "$mountpoint/inode-bitmap"
+	unmount_image inode-retire
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "inode retirement did not advance the journal sequence"
+	check_image inode-retire
+
+	attach_image
+	mount_image ""
+	run_step inode-verify-retired "$mountpoint/inode-bitmap"
+	unmount_image inode-final
+	detach_image
+	check_image inode-final
+	echo " ok"
+}
+
 run_special_case()
 {
 	case_dir=$work/special-inodes
@@ -577,6 +683,20 @@ bitmap)
 	done
 	exit 0
 	;;
+inode-bitmap)
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		case "$block_size" in
+		1024|2048|4096) ;;
+		*)
+			echo "unsupported filesystem block size: " \
+			    "$block_size" >&2
+			exit 1
+			;;
+		esac
+		run_inode_bitmap_case "$block_size"
+	done
+	exit 0
+	;;
 full) ;;
 *)
 	echo "unsupported ext4fsops mode: $EXT4FSOPS_MODE" >&2
@@ -588,7 +708,8 @@ for block_size in $EXT4FS_BLOCK_SIZES; do
 	case "$block_size" in
 	1024|2048|4096) ;;
 	*)
-		echo "unsupported filesystem block size: $block_size" >&2
+		echo "unsupported filesystem block size: " \
+		    "$block_size" >&2
 		exit 1
 		;;
 	esac

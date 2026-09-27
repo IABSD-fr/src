@@ -92,6 +92,9 @@ static void	verify_bitmap_probe (int);
 static void	free_bitmap_probe (void);
 static void	reuse_bitmap_probe (void);
 static void	retire_bitmap_probe (void);
+static void	allocate_inode_probe (void);
+static void	verify_inode_probe (void);
+static void	free_inode_probe (void);
 
 static void
 make_path (char *path, size_t pathlen, const char *suffix)
@@ -1767,6 +1770,65 @@ retire_bitmap_probe (void)
 	check_absent(path);
 }
 
+static void
+allocate_inode_probe (void)
+{
+	struct statfs before, after;
+	char path[PATH_MAX];
+	int fd;
+
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before inode allocation");
+	make_path(path, sizeof(path), "inode-probe");
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after inode allocation");
+	if (after.f_bfree != before.f_bfree ||
+	    after.f_ffree + 1 != before.f_ffree)
+		errx(1, "inode allocation accounting mismatch");
+	verify_inode_probe();
+}
+
+static void
+verify_inode_probe (void)
+{
+	struct stat st;
+	char path[PATH_MAX];
+
+	make_path(path, sizeof(path), "inode-probe");
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (!S_ISREG(st.st_mode) || st.st_size != 0 ||
+	    st.st_blocks != 0 || st.st_nlink != 1)
+		errx(1, "inode probe has wrong shape");
+}
+
+static void
+free_inode_probe (void)
+{
+	struct statfs before, after;
+	char path[PATH_MAX];
+
+	verify_inode_probe();
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before inode free");
+	make_path(path, sizeof(path), "inode-probe");
+	if (unlink(path) == -1)
+		err(1, "unlink %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after inode free");
+	if (after.f_bfree != before.f_bfree ||
+	    after.f_ffree != before.f_ffree + 1)
+		errx(1, "inode free accounting mismatch");
+	check_absent(path);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -1796,6 +1858,14 @@ main (int argc, char **argv)
 			err(1, "statfs %s", root);
 		block_size = (size_t)sfs.f_bsize;
 		allocate_bitmap_probe();
+	} else if (strcmp(argv[1], "inode-allocate") == 0) {
+		block_size = 0;
+		if (mkdir(root, 0755) == -1)
+			err(1, "mkdir %s", root);
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs %s", root);
+		block_size = (size_t)sfs.f_bsize;
+		allocate_inode_probe();
 	} else if (strcmp(argv[1], "create-special") == 0) {
 		block_size = 0;
 		if (mkdir(root, 0755) == -1)
@@ -1837,6 +1907,18 @@ main (int argc, char **argv)
 			char path[PATH_MAX];
 
 			make_path(path, sizeof(path), "bitmap-probe");
+			check_absent(path);
+		} else if (strcmp(argv[1], "inode-verify") == 0)
+			verify_inode_probe();
+		else if (strcmp(argv[1], "inode-free") == 0)
+			free_inode_probe();
+		else if (strcmp(argv[1], "inode-reuse") == 0)
+			allocate_inode_probe();
+		else if (strcmp(argv[1],
+		    "inode-verify-retired") == 0) {
+			char path[PATH_MAX];
+
+			make_path(path, sizeof(path), "inode-probe");
 			check_absent(path);
 		} else if (strcmp(argv[1], "verify-special") == 0)
 			verify_special_files();

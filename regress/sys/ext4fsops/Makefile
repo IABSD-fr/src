@@ -7,6 +7,7 @@ CFLAGS+=	-Wall -Werror -Wextra
 
 REGRESS_TARGETS=	run-regress-ext4fsops \
 			run-regress-ext4fsops-bitmap \
+			run-regress-ext4fsops-inode-bitmap \
 			run-regress-ext4fsops-special
 REGRESS_ROOT_TARGETS=	${REGRESS_TARGETS}
 
@@ -20,6 +21,14 @@ run-regress-ext4fsops-bitmap: ${PROG}
 	    EXT4FS_IMAGE_MB='${EXT4FS_IMAGE_MB}' \
 	    EXT4FS_BLOCK_SIZES='${EXT4FS_BLOCK_SIZES}' \
 	    EXT4FSOPS_MODE='bitmap' \
+	    sh ${.CURDIR}/operations.sh
+
+run-regress-ext4fsops-inode-bitmap: ${PROG}
+	env EXT4FSOPS='${.OBJDIR}/${PROG}' \
+	    EXT4FS_TIMEOUT='${EXT4FS_TIMEOUT}' \
+	    EXT4FS_IMAGE_MB='${EXT4FS_IMAGE_MB}' \
+	    EXT4FS_BLOCK_SIZES='${EXT4FS_BLOCK_SIZES}' \
+	    EXT4FSOPS_MODE='inode-bitmap' \
 	    sh ${.CURDIR}/operations.sh
 
 run-regress-ext4fsops-special: ${PROG}

@@ -509,7 +509,7 @@ journal handle. This includes:
 
 - [x] inode-table blocks and inode timestamps;
 - [x] block bitmaps;
-- [ ] inode bitmaps;
+- [x] inode bitmaps;
 - [ ] block-group descriptors;
 - [ ] extent-tree roots, index blocks, and leaf blocks;
 - [ ] directory blocks and checksum tails;
@@ -685,6 +685,20 @@ preserves exact block and inode accounting across remount, and passes
 offline `e2fsck -fn`.  On 2026-09-27, this matrix passed against the
 booted production kernel together with the complete ordinary-operation
 and special-inode suites.
+
+The inode-bitmap writer audit and focused production-kernel gate are
+complete.  Journaled allocation and retirement use handle-owned inode
+bitmap buffers, validate initialized bitmap checksums and free counts,
+reconstruct uninitialized bitmaps with reserved and padding bits set,
+and update descriptor and superblock counters in the same transaction.
+Legacy direct allocation and free fail closed if reached on a
+journal-bearing mount.  The focused regression checks empty-file inode
+allocation, free, immediate reuse, and final retirement on all three
+block sizes.  Each mutation advances the JBD2 sequence, preserves exact
+block and inode accounting across remount, and passes offline
+`e2fsck -fn`.  On 2026-09-27, this matrix passed against the booted
+production kernel, including `INODE_UNINIT` reconstruction, together
+with the ordinary, block-bitmap, and special-inode suites.
 
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only
 for regular-file data, the journal's own I/O, recovery, checkpointing,

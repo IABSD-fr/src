@@ -1022,7 +1022,8 @@ ext4fs_sbwrite_handle (struct mount *mp,
 static u_long ext4fs_gennumber;
 
 /*
- * Allocate an inode in the file system.
+ * Allocate an inode on journal-less ext4.  Journal-bearing mounts use
+ * ext4fs_inode_alloc_handle() through their compound operation.
  */
 int
 ext4fs_inode_alloc (struct inode *pip, mode_t mode, struct ucred *cred,
@@ -1044,6 +1045,8 @@ ext4fs_inode_alloc (struct inode *pip, mode_t mode, struct ucred *cred,
 	int error, i;
 
 	*vpp = NULL;
+	if (fs->m_journal != NULL)
+		return (EIO);
 
 	if (fs->m_free_inodes_count == 0)
 		return (ENOSPC);
@@ -1685,7 +1688,8 @@ restore:
 }
 
 /*
- * Free an inode.
+ * Free an inode on journal-less ext4.  Journal-bearing mounts retire
+ * inodes through ext4fs_inode_free_handle().
  */
 void
 ext4fs_inode_free (struct inode *pip, ufsino_t ino, mode_t mode)
@@ -1698,6 +1702,10 @@ ext4fs_inode_free (struct inode *pip, ufsino_t ino, mode_t mode)
 	char *ibp;
 	int error;
 
+	if (fs->m_journal != NULL) {
+		ext4fs_journal_abort(ITOV(pip)->v_mount, EIO);
+		return;
+	}
 	group = (ino - 1) / fs->m_inodes_per_group;
 	ino_in_group = (ino - 1) % fs->m_inodes_per_group;
 	gd = &fs->m_gd[group];
