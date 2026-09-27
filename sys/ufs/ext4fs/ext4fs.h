@@ -701,12 +701,7 @@ int	ext4fs_inode_free_handle (struct inode *, ufsino_t, mode_t,
 void	ext4fs_inode_free (struct inode *, ufsino_t, mode_t);
 
 /* Directory operations */
-int	ext4fs_direnter (struct inode *, struct vnode *,
-	struct componentname *);
-int	ext4fs_dirremove (struct vnode *, struct componentname *);
 int	ext4fs_dirempty (struct inode *, ufsino_t, struct ucred *);
-int	ext4fs_dirrewrite (struct inode *, struct inode *,
-	struct componentname *);
 
 /* Truncation */
 int	ext4fs_truncate (struct inode *, off_t, int, struct ucred *);

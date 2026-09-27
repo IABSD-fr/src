@@ -512,7 +512,7 @@ journal handle. This includes:
 - [x] inode bitmaps;
 - [x] block-group descriptors;
 - [x] extent-tree roots, index blocks, and leaf blocks;
-- [ ] directory blocks and checksum tails;
+- [x] directory blocks and checksum tails;
 - [ ] orphan-list and orphan-file updates;
 - [ ] allocation and free counters;
 - [ ] the ext4 superblock.
@@ -737,6 +737,26 @@ a block, changing descriptor counters, or starting a transaction.  On
 2026-09-27, these cases passed against the rebuilt booted production
 kernel with 1 KiB, 2 KiB, and 4 KiB blocks.  The ordinary, bitmap,
 descriptor, and special-inode targets passed in the same complete run.
+
+The directory-block and checksum-tail writer audit is complete.  Every
+linear directory block is authenticated before a namespace mutation,
+including operations reached through the name cache.  Create, link,
+unlink, mkdir, rmdir, rename, and symlink use handle-owned buffers on a
+journaled mount.  The checksum tail is regenerated and the complete
+block is revalidated before it joins the transaction.  Indexed-directory
+mutation remains unsupported and fails closed.  Legacy direct helpers
+are private, explicitly named, guarded against journal mounts, and
+revalidate the completed block before their journal-less write.
+
+The focused `run-regress-ext4fsops-directory` target exercises directory
+creation, insertion, removal, replacement, same-parent rename, and
+cross-parent directory movement with and without `metadata_csum` on
+1 KiB, 2 KiB, and 4 KiB filesystems.  It checks journal-sequence
+advancement, remount persistence, read-only non-mutation, and offline
+`e2fsck -fn` acceptance.  A damaged checksum-tail fixture proves that
+lookup and creation fail without changing the directory block or
+starting a transaction.  On 2026-09-27, every case passed against the
+rebuilt and booted production kernel.
 
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only
 for regular-file data, the journal's own I/O, recovery, checkpointing,

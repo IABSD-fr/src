@@ -103,6 +103,10 @@ static void	extent_prune_fixture (void);
 static void	extent_zero_fixture (void);
 static void	extent_verify_zero_fixture (void);
 static void	extent_reject_deep_growth (void);
+static void	create_directory_fixture (void);
+static void	verify_directory_fixture (int);
+static void	mutate_directory_fixture (void);
+static void	reject_corrupt_directory (void);
 static void	allocate_bitmap_probe (void);
 static void	verify_bitmap_probe (int);
 static void	free_bitmap_probe (void);
@@ -851,6 +855,171 @@ extent_reject_deep_growth (void)
 		errx(1, "rejected extent growth changed free counts");
 	if (close(fd) == -1)
 		err(1, "close rejected extent fixture");
+}
+
+static void
+create_directory_fixture (void)
+{
+	char path[PATH_MAX];
+
+	if (mkdir(root, 0755) == -1)
+		err(1, "mkdir %s", root);
+	make_path(path, sizeof(path), "first");
+	write_text_file(path, "first-data");
+	make_path(path, sizeof(path), "replace-source");
+	write_text_file(path, "replacement-data");
+	make_path(path, sizeof(path), "replace-target");
+	write_text_file(path, "retired-data");
+	make_path(path, sizeof(path), "remove");
+	if (mkdir(path, 0755) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "remove/one");
+	write_text_file(path, "one-data");
+	make_path(path, sizeof(path), "remove/two");
+	write_text_file(path, "two-data");
+	make_path(path, sizeof(path), "remove/three");
+	write_text_file(path, "three-data");
+	make_path(path, sizeof(path), "old-parent");
+	if (mkdir(path, 0755) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "new-parent");
+	if (mkdir(path, 0755) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "old-parent/moved");
+	if (mkdir(path, 0710) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "empty-dir");
+	if (mkdir(path, 0755) == -1)
+		err(1, "mkdir %s", path);
+	create_link_growth_tree();
+	make_path(path, sizeof(path), "remove");
+	fsync_path(path);
+	make_path(path, sizeof(path), "old-parent");
+	fsync_path(path);
+	make_path(path, sizeof(path), "new-parent");
+	fsync_path(path);
+	fsync_path(root);
+}
+
+static void
+verify_directory_fixture (int mutated)
+{
+	char path[PATH_MAX];
+
+	check_directory(root);
+	make_path(path, sizeof(path), mutated ? "renamed" : "first");
+	check_text_file(path, "first-data");
+	make_path(path, sizeof(path),
+	    mutated ? "first" : "renamed");
+	check_absent(path);
+	make_path(path, sizeof(path), "replace-target");
+	check_text_file(path,
+	    mutated ? "replacement-data" : "retired-data");
+	make_path(path, sizeof(path), "replace-source");
+	if (mutated)
+		check_absent(path);
+	else
+		check_text_file(path, "replacement-data");
+	make_path(path, sizeof(path), "remove/one");
+	check_text_file(path, "one-data");
+	make_path(path, sizeof(path), "remove/two");
+	if (mutated)
+		check_absent(path);
+	else
+		check_text_file(path, "two-data");
+	make_path(path, sizeof(path), "remove/three");
+	check_text_file(path, "three-data");
+	make_path(path, sizeof(path), "old-parent/moved");
+	if (mutated)
+		check_absent(path);
+	else
+		check_directory(path);
+	make_path(path, sizeof(path), "new-parent/moved");
+	if (mutated)
+		check_directory(path);
+	else
+		check_absent(path);
+	make_path(path, sizeof(path), "empty-dir");
+	if (mutated)
+		check_absent(path);
+	else
+		check_directory(path);
+	make_path(path, sizeof(path), "new-entry");
+	if (mutated)
+		check_text_file(path, "new-entry-data");
+	else
+		check_absent(path);
+	check_link_growth_tree(mutated);
+}
+
+static void
+mutate_directory_fixture (void)
+{
+	char from[PATH_MAX], path[PATH_MAX], to[PATH_MAX];
+
+	verify_directory_fixture(0);
+	make_path(from, sizeof(from), "first");
+	make_path(to, sizeof(to), "renamed");
+	if (rename(from, to) == -1)
+		err(1, "rename first");
+	make_path(from, sizeof(from), "replace-source");
+	make_path(to, sizeof(to), "replace-target");
+	if (rename(from, to) == -1)
+		err(1, "rename replacement");
+	make_path(from, sizeof(from), "old-parent/moved");
+	make_path(to, sizeof(to), "new-parent/moved");
+	if (rename(from, to) == -1)
+		err(1, "rename moved directory");
+	make_path(path, sizeof(path), "remove/two");
+	if (unlink(path) == -1)
+		err(1, "unlink %s", path);
+	make_path(path, sizeof(path),
+	    "link-grow/journal-growth-link");
+	if (unlink(path) == -1)
+		err(1, "unlink %s", path);
+	make_path(path, sizeof(path), "empty-dir");
+	if (rmdir(path) == -1)
+		err(1, "rmdir %s", path);
+	make_path(path, sizeof(path), "new-entry");
+	write_text_file(path, "new-entry-data");
+	make_path(path, sizeof(path), "remove");
+	fsync_path(path);
+	make_path(path, sizeof(path), "old-parent");
+	fsync_path(path);
+	make_path(path, sizeof(path), "new-parent");
+	fsync_path(path);
+	fsync_path(root);
+	verify_directory_fixture(1);
+}
+
+static void
+reject_corrupt_directory (void)
+{
+	char path[PATH_MAX];
+	int fd, saved_errno;
+
+	make_path(path, sizeof(path), "one");
+	errno = 0;
+	fd = open(path, O_RDONLY);
+	saved_errno = errno;
+	if (fd != -1) {
+		(void)close(fd);
+		errx(1, "lookup accepted a corrupt directory tail");
+	}
+	if (saved_errno != EINVAL && saved_errno != EIO)
+		errx(1, "corrupt lookup failed with %s",
+		    strerror(saved_errno));
+	make_path(path, sizeof(path), "new");
+	errno = 0;
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+	saved_errno = errno;
+	if (fd != -1) {
+		(void)close(fd);
+		errx(1, "create accepted a corrupt directory tail");
+	}
+	if (saved_errno != EINVAL && saved_errno != EIO)
+		errx(1, "corrupt create failed with %s",
+		    strerror(saved_errno));
 }
 
 static void
@@ -2156,6 +2325,16 @@ main (int argc, char **argv)
 			err(1, "statfs %s", root);
 		block_size = (size_t)sfs.f_bsize;
 		create_special_files();
+	} else if (strcmp(argv[1], "directory-create") == 0) {
+		block_size = 0;
+		if (mkdir(root, 0755) == -1)
+			err(1, "mkdir %s", root);
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs %s", root);
+		if (rmdir(root) == -1)
+			err(1, "rmdir %s", root);
+		block_size = (size_t)sfs.f_bsize;
+		create_directory_fixture();
 	} else {
 		if (statfs(root, &sfs) == -1)
 			err(1, "statfs %s", root);
@@ -2220,6 +2399,14 @@ main (int argc, char **argv)
 			extent_verify_zero_fixture();
 		else if (strcmp(argv[1], "extent-reject") == 0)
 			extent_reject_deep_growth();
+		else if (strcmp(argv[1], "directory-verify") == 0)
+			verify_directory_fixture(0);
+		else if (strcmp(argv[1], "directory-mutate") == 0)
+			mutate_directory_fixture();
+		else if (strcmp(argv[1], "directory-verify-final") == 0)
+			verify_directory_fixture(1);
+		else if (strcmp(argv[1], "directory-reject") == 0)
+			reject_corrupt_directory();
 		else
 			errx(1, "unknown mode: %s", argv[1]);
 	}

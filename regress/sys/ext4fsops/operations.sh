@@ -24,7 +24,7 @@ EXT4FSOPS_MODE=${EXT4FSOPS_MODE:-full}
 for tool in "$MKE2FS" "$E2FSCK" "$DEBUGFS" "$DUMPE2FS" \
 	    "$VNCONFIG" "$MOUNT_EXT4FS" \
 	    "$UMOUNT" "$TIMEOUT" "$EXT4FSOPS" cmp dd diff hexdump id \
-	    rmdir sha256; do
+	    cp rmdir sha256; do
 	if ! command -v "$tool" >/dev/null 2>&1; then
 		echo "SKIPPED: ext4fs operations regress requires $tool"
 		exit 0
@@ -213,6 +213,20 @@ journal_sequence()
 	[ "${#sequence}" -eq 8 ] ||
 	    fail "could not read the journal sequence"
 	printf '%s\n' "$sequence"
+}
+
+write_image_byte()
+{
+	byte_image=$1
+	byte_offset=$2
+	byte_value=$3
+	case "$byte_offset:$byte_value" in
+	*[!0-9:]*) fail "invalid image-byte write" ;;
+	esac
+	[ "$byte_value" -le 255 ] || fail "image byte exceeds 255"
+	byte_octal=$(printf '%03o' "$byte_value")
+	printf "\\$byte_octal" | dd of="$byte_image" bs=1 \
+	    seek="$byte_offset" count=1 conv=notrunc status=none
 }
 
 inode_probe_number()
@@ -893,6 +907,137 @@ run_extent_reject_case()
 	echo " ok"
 }
 
+run_directory_case()
+{
+	block_size=$1
+	checksum=$2
+	case_dir=$work/directory-$checksum-$block_size
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	case "$checksum" in
+	enabled)
+		features='metadata_csum,^orphan_file'
+		;;
+	disabled)
+		features='^metadata_csum,^orphan_file'
+		;;
+	*)
+		fail "unknown directory checksum mode: $checksum"
+		;;
+	esac
+	test_name="directory tails $checksum ($block_size byte blocks)"
+	print_test_name "$test_name"
+
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O "$features" "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs failed"
+	fi
+	"$DUMPE2FS" -h "$image" >"$case_dir/dumpe2fs.log" \
+	    2>&1 || fail "dumpe2fs rejected the directory image"
+	if [ "$checksum" = enabled ]; then
+		grep -q '^Filesystem features:.*metadata_csum' \
+		    "$case_dir/dumpe2fs.log" ||
+		    fail "directory image lacks metadata_csum"
+	elif grep -q '^Filesystem features:.*metadata_csum' \
+	    "$case_dir/dumpe2fs.log"; then
+		fail "directory image unexpectedly has metadata_csum"
+	fi
+	sequence_before=$(journal_sequence)
+
+	attach_image
+	mount_image ""
+	run_step directory-create "$mountpoint/directory"
+	unmount_image directory-create
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "directory creation did not advance the journal"
+	check_image directory-create
+	sequence_before=$sequence_after
+
+	attach_image
+	mount_image ""
+	run_step directory-verify "$mountpoint/directory"
+	run_step directory-mutate "$mountpoint/directory"
+	unmount_image directory-mutate
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "directory mutation did not advance the journal"
+	check_image directory-mutate
+
+	before=$(sha256 -q "$image")
+	attach_image
+	mount_image ro
+	run_step directory-verify-final "$mountpoint/directory"
+	unmount_image directory-final
+	detach_image
+	after=$(sha256 -q "$image")
+	[ "$before" = "$after" ] ||
+	    fail "read-only directory verification changed the image"
+	check_image directory-final
+	echo " ok"
+}
+
+run_directory_corrupt_case()
+{
+	block_size=1024
+	case_dir=$work/directory-corrupt-tail
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	test_name="corrupt directory tail is non-mutating"
+	print_test_name "$test_name"
+	cp "$work/directory-enabled-1024/ext4.img" "$image"
+
+	directory_blocks=$(
+		"$DEBUGFS" -R 'blocks /directory/remove' "$image" \
+		    2>/dev/null
+	) || fail "could not locate the directory block"
+	set -- $directory_blocks
+	[ "$#" -eq 1 ] || fail "directory fixture is not one block"
+	case "$1" in
+	*[!0-9]*|'') fail "invalid directory block number" ;;
+	esac
+	directory_block=$1
+	tail_offset=$(((directory_block + 1) * block_size - 1))
+	tail_byte=$(dd if="$image" bs=1 skip="$tail_offset" count=1 \
+	    status=none | hexdump -ve '1/1 "%u"')
+	case "$tail_byte" in
+	*[!0-9]*|'') fail "could not read directory checksum byte" ;;
+	esac
+	write_image_byte "$image" "$tail_offset" $((tail_byte ^ 1))
+	dd if="$image" of="$case_dir/block-before" bs="$block_size" \
+	    skip="$directory_block" count=1 status=none
+	set +e
+	"$TIMEOUT" -k 2 "$EXT4FS_TIMEOUT" "$E2FSCK" -fn \
+	    "$image" >"$case_dir/e2fsck-corrupt.log" 2>&1
+	fsck_status=$?
+	set -e
+	if [ "$fsck_status" -ne 4 ]; then
+		cat "$case_dir/e2fsck-corrupt.log" >&2
+		fail "unexpected corrupt-directory e2fsck status"
+	fi
+	sequence_before=$(journal_sequence)
+
+	attach_image
+	mount_image noatime
+	run_step directory-reject "$mountpoint/directory/remove"
+	unmount_image directory-reject
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" = "$sequence_before" ] ||
+	    fail "corrupt directory lookup started a transaction"
+	dd if="$image" of="$case_dir/block-after" bs="$block_size" \
+	    skip="$directory_block" count=1 status=none
+	cmp -s "$case_dir/block-before" "$case_dir/block-after" ||
+	    fail "corrupt directory block changed"
+	echo " ok"
+}
+
 run_special_case()
 {
 	case_dir=$work/special-inodes
@@ -988,6 +1133,24 @@ extents)
 	done
 	case " $EXT4FS_BLOCK_SIZES " in
 	*' 1024 '*) run_extent_reject_case ;;
+	esac
+	exit 0
+	;;
+directory)
+	for checksum in enabled disabled; do
+		for block_size in $EXT4FS_BLOCK_SIZES; do
+			case "$block_size" in
+			1024|2048|4096) ;;
+			*)
+				echo "bad block size: $block_size" >&2
+				exit 1
+				;;
+			esac
+			run_directory_case "$block_size" "$checksum"
+		done
+	done
+	case " $EXT4FS_BLOCK_SIZES " in
+	*' 1024 '*) run_directory_corrupt_case ;;
 	esac
 	exit 0
 	;;
