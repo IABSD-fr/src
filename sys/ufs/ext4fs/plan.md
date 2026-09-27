@@ -586,6 +586,21 @@ On 2026-09-27, the booted production-kernel matrix passed on 1 KiB, 2 KiB,
 and 4 KiB classic-orphan filesystems, the 1 KiB orphan-file filesystem, and
 the FLEX_BG/BLOCK_UNINIT allocation fixture.
 
+The `rename` conversion is staged for production-kernel validation.  Linear
+source and destination directories are fully checksum- and structure-checked
+before mutation, and explicit entry offsets prevent a destination lookup from
+overwriting the source location during a same-directory rename.  One journal
+transaction now covers destination insertion or replacement, source removal,
+source and target inode changes, parent link counts, cross-parent `..`, and a
+classic-orphan or orphan-file record when replacement removes the target's
+last name.  The ancestry walk validates every `.`/`..` block and has a hard
+cycle bound.  The ordinary-operation regression now checks exact inode/block
+and parent-link accounting for file and directory moves, final and non-final
+replacement, same-inode no-op semantics, non-empty-target rejection, and
+same- and cross-parent directory replacement across remount.  The checklist
+item remains open until the rebuilt production kernel passes the full root
+matrix.
+
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only for
 regular-file data, the journal's own I/O, recovery, checkpointing, or another
 explicitly documented exception.

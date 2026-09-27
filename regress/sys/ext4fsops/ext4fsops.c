@@ -988,7 +988,7 @@ mutate_filesystem_tree (void)
 	    after.f_bfree != before.f_bfree + 1)
 		errx(1, "last shared xattr unlink accounting mismatch");
 
-	/* Isolate non-final unlink from the legacy rename path below. */
+	/* Exercise non-final unlink independently of rename replacement. */
 	make_path(path, sizeof(path),
 	    "link-grow/journal-growth-link");
 	if (unlink(path) == -1)
@@ -996,8 +996,15 @@ mutate_filesystem_tree (void)
 
 	make_path(path, sizeof(path), "data");
 	make_path(other, sizeof(other), "a/renamed");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before cross-directory file rename");
 	if (rename(path, other) == -1)
 		err(1, "rename data");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after cross-directory file rename");
+	if (after.f_ffree != before.f_ffree ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "cross-directory file rename changed accounting");
 	make_path(path, sizeof(path), "data.link");
 	if (unlink(path) == -1)
 		err(1, "unlink data.link");
@@ -1024,12 +1031,74 @@ mutate_filesystem_tree (void)
 	write_text_file(path, "replacement-data");
 	make_path(other, sizeof(other), "b/replaced");
 	write_text_file(other, "obsolete-data");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before replacement rename");
 	if (rename(path, other) == -1)
 		err(1, "replacement rename");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after replacement rename");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree + 1)
+		errx(1, "replacement rename retirement accounting mismatch");
+	check_absent(path);
+	check_text_file(other, "replacement-data");
+
+	/* Replacing one of several target names must not orphan its inode. */
+	make_path(path, sizeof(path), "a/multilink-source");
+	write_text_file(path, "new-multilink-data");
+	make_path(other, sizeof(other), "b/multilink-target");
+	write_text_file(other, "old-multilink-data");
+	make_path(path, sizeof(path), "b/multilink-alias");
+	if (link(other, path) == -1)
+		err(1, "link multilink replacement target");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before multilink replacement rename");
+	make_path(path, sizeof(path), "a/multilink-source");
+	if (rename(path, other) == -1)
+		err(1, "multilink replacement rename");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after multilink replacement rename");
+	if (after.f_ffree != before.f_ffree ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "multilink replacement rename changed accounting");
+	check_absent(path);
+	check_text_file(other, "new-multilink-data");
+	make_path(path, sizeof(path), "b/multilink-alias");
+	check_text_file(path, "old-multilink-data");
+
+	/* POSIX same-inode rename is a no-op which preserves both names. */
+	make_path(path, sizeof(path), "a/same-inode-source");
+	write_text_file(path, "same-inode-rename");
+	make_path(other, sizeof(other), "b/same-inode-target");
+	if (link(path, other) == -1)
+		err(1, "link same-inode rename target");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before same-inode rename");
+	if (rename(path, other) == -1)
+		err(1, "same-inode rename");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after same-inode rename");
+	if (after.f_ffree != before.f_ffree ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "same-inode rename changed accounting");
+	if (stat(path, &parent_before) == -1 ||
+	    stat(other, &parent_after) == -1)
+		err(1, "stat same-inode rename names");
+	if (parent_before.st_ino != parent_after.st_ino ||
+	    parent_before.st_nlink != 2 || parent_after.st_nlink != 2)
+		errx(1, "same-inode rename changed link identity");
+
 	make_path(path, sizeof(path), "a/same-old");
 	make_path(other, sizeof(other), "a/same-new");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before same-directory rename");
 	if (rename(path, other) == -1)
 		err(1, "same-directory rename");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after same-directory rename");
+	if (after.f_ffree != before.f_ffree ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "same-directory rename changed accounting");
 
 	make_path(path, sizeof(path), "a/move");
 	if (mkdir(path, 0750) == -1)
@@ -1038,8 +1107,121 @@ mutate_filesystem_tree (void)
 	write_text_file(path, "moved-child");
 	make_path(path, sizeof(path), "a/move");
 	make_path(other, sizeof(other), "b/moved");
+	make_path(path, sizeof(path), "a");
+	if (stat(path, &parent_before) == -1)
+		err(1, "stat old parent before directory rename");
+	make_path(path, sizeof(path), "b");
+	if (stat(path, &parent_during) == -1)
+		err(1, "stat new parent before directory rename");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before cross-directory rename");
+	make_path(path, sizeof(path), "a/move");
 	if (rename(path, other) == -1)
 		err(1, "cross-directory rename");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after cross-directory rename");
+	if (after.f_ffree != before.f_ffree ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "cross-directory rename changed accounting");
+	make_path(path, sizeof(path), "a");
+	if (stat(path, &parent_after) == -1)
+		err(1, "stat old parent after directory rename");
+	if (parent_after.st_nlink != parent_before.st_nlink - 1)
+		errx(1, "directory rename did not decrement old parent links");
+	make_path(path, sizeof(path), "b");
+	if (stat(path, &parent_after) == -1)
+		err(1, "stat new parent after directory rename");
+	if (parent_after.st_nlink != parent_during.st_nlink + 1)
+		errx(1, "directory rename did not increment new parent links");
+
+	/* Same-parent directory replacement retires exactly one directory. */
+	make_path(path, sizeof(path), "a/dir-replace-source");
+	if (mkdir(path, 0710) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "a/dir-replace-source/child");
+	write_text_file(path, "same-parent-directory-replacement");
+	make_path(path, sizeof(path), "a/dir-replace-target");
+	if (mkdir(path, 0700) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "a");
+	if (stat(path, &parent_before) == -1)
+		err(1, "stat parent before directory replacement");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before directory replacement");
+	make_path(path, sizeof(path), "a/dir-replace-source");
+	make_path(other, sizeof(other), "a/dir-replace-target");
+	if (rename(path, other) == -1)
+		err(1, "same-parent directory replacement");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after directory replacement");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree + 1)
+		errx(1, "directory replacement retirement accounting mismatch");
+	make_path(path, sizeof(path), "a");
+	if (stat(path, &parent_after) == -1)
+		err(1, "stat parent after directory replacement");
+	if (parent_after.st_nlink != parent_before.st_nlink - 1)
+		errx(1, "directory replacement parent link mismatch");
+	make_path(path, sizeof(path), "a/dir-replace-source");
+	check_absent(path);
+	make_path(path, sizeof(path), "a/dir-replace-target/child");
+	check_text_file(path, "same-parent-directory-replacement");
+
+	/* Cross-parent replacement changes '..' but not the new parent's links. */
+	make_path(path, sizeof(path), "a/cross-replace-source");
+	if (mkdir(path, 0751) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "a/cross-replace-source/child");
+	write_text_file(path, "cross-parent-directory-replacement");
+	make_path(path, sizeof(path), "b/cross-replace-target");
+	if (mkdir(path, 0701) == -1)
+		err(1, "mkdir %s", path);
+	make_path(path, sizeof(path), "a");
+	if (stat(path, &parent_before) == -1)
+		err(1, "stat old parent before cross replacement");
+	make_path(path, sizeof(path), "b");
+	if (stat(path, &parent_during) == -1)
+		err(1, "stat new parent before cross replacement");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before cross-parent directory replacement");
+	make_path(path, sizeof(path), "a/cross-replace-source");
+	make_path(other, sizeof(other), "b/cross-replace-target");
+	if (rename(path, other) == -1)
+		err(1, "cross-parent directory replacement");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after cross-parent directory replacement");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree + 1)
+		errx(1, "cross-parent replacement accounting mismatch");
+	make_path(path, sizeof(path), "a");
+	if (stat(path, &parent_after) == -1)
+		err(1, "stat old parent after cross replacement");
+	if (parent_after.st_nlink != parent_before.st_nlink - 1)
+		errx(1, "cross replacement old-parent link mismatch");
+	make_path(path, sizeof(path), "b");
+	if (stat(path, &parent_after) == -1)
+		err(1, "stat new parent after cross replacement");
+	if (parent_after.st_nlink != parent_during.st_nlink)
+		errx(1, "cross replacement new-parent link mismatch");
+	make_path(path, sizeof(path), "a/cross-replace-source");
+	check_absent(path);
+	make_path(path, sizeof(path), "b/cross-replace-target/child");
+	check_text_file(path, "cross-parent-directory-replacement");
+
+	/* A non-empty target and an ancestor move must leave both trees intact. */
+	make_path(path, sizeof(path), "a/rejected-directory");
+	if (mkdir(path, 0755) == -1)
+		err(1, "mkdir %s", path);
+	make_path(other, sizeof(other), "b/cross-replace-target");
+	errno = 0;
+	if (rename(path, other) != -1 || errno != ENOTEMPTY)
+		errx(1, "non-empty directory replacement did not fail");
+	check_directory(path);
+	make_path(other, sizeof(other), "b/cross-replace-target/child");
+	check_text_file(other, "cross-parent-directory-replacement");
+	if (rmdir(path) == -1)
+		err(1, "rmdir %s", path);
+
 	make_path(path, sizeof(path), "b");
 	make_path(other, sizeof(other), "b/moved/loop");
 	errno = 0;
@@ -1252,6 +1434,28 @@ verify_final_tree (void)
 
 	make_path(path, sizeof(path), "b/replaced");
 	check_text_file(path, "replacement-data");
+	make_path(path, sizeof(path), "a/multilink-source");
+	check_absent(path);
+	make_path(path, sizeof(path), "b/multilink-target");
+	check_text_file(path, "new-multilink-data");
+	if (stat(path, &first) == -1)
+		err(1, "stat %s", path);
+	make_path(other, sizeof(other), "b/multilink-alias");
+	check_text_file(other, "old-multilink-data");
+	if (stat(other, &second) == -1)
+		err(1, "stat %s", other);
+	if (first.st_ino == second.st_ino || first.st_nlink != 1 ||
+	    second.st_nlink != 1)
+		errx(1, "multilink replacement identity mismatch");
+	make_path(path, sizeof(path), "a/same-inode-source");
+	make_path(other, sizeof(other), "b/same-inode-target");
+	check_text_file(path, "same-inode-rename");
+	check_text_file(other, "same-inode-rename");
+	if (stat(path, &first) == -1 || stat(other, &second) == -1)
+		err(1, "stat remounted same-inode rename names");
+	if (first.st_ino != second.st_ino || first.st_nlink != 2 ||
+	    second.st_nlink != 2)
+		errx(1, "remounted same-inode rename identity mismatch");
 	make_path(path, sizeof(path), "a/same-old");
 	check_absent(path);
 	make_path(path, sizeof(path), "a/same-new");
@@ -1266,6 +1470,33 @@ verify_final_tree (void)
 		err(1, "stat %s", other);
 	if (first.st_ino != second.st_ino)
 		errx(1, "moved directory has incorrect parent");
+	make_path(path, sizeof(path), "a/dir-replace-source");
+	check_absent(path);
+	make_path(path, sizeof(path), "a/dir-replace-target/child");
+	check_text_file(path, "same-parent-directory-replacement");
+	make_path(path, sizeof(path), "a/dir-replace-target");
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (!S_ISDIR(st.st_mode) || (st.st_mode & 0777) != 0710)
+		errx(1, "same-parent replacement lost source directory mode");
+	make_path(path, sizeof(path), "a/cross-replace-source");
+	check_absent(path);
+	make_path(path, sizeof(path), "b/cross-replace-target/child");
+	check_text_file(path, "cross-parent-directory-replacement");
+	make_path(path, sizeof(path), "b/cross-replace-target");
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (!S_ISDIR(st.st_mode) || (st.st_mode & 0777) != 0751)
+		errx(1, "cross-parent replacement lost source directory mode");
+	make_path(path, sizeof(path), "b/replaced");
+	if (stat(path, &first) == -1)
+		err(1, "stat %s", path);
+	make_path(other, sizeof(other),
+	    "b/cross-replace-target/../replaced");
+	if (stat(other, &second) == -1)
+		err(1, "stat %s", other);
+	if (first.st_ino != second.st_ino)
+		errx(1, "replaced directory has incorrect parent");
 
 	make_path(path, sizeof(path), "open-unlinked");
 	check_absent(path);
