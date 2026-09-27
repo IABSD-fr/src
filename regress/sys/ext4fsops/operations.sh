@@ -215,6 +215,14 @@ journal_sequence()
 	printf '%s\n' "$sequence"
 }
 
+check_last_orphan_clear()
+{
+	last_orphan=$(dd if="$image" bs=1 skip=$((1024 + 232)) \
+	    count=4 status=none | hexdump -ve '1/1 "%02x"')
+	[ "$last_orphan" = 00000000 ] ||
+	    fail "classic orphan head was not cleared"
+}
+
 write_image_byte()
 {
 	byte_image=$1
@@ -1038,6 +1046,171 @@ run_directory_corrupt_case()
 	echo " ok"
 }
 
+run_orphan_case()
+{
+	block_size=$1
+	orphan_format=$2
+	case_dir=$work/orphan-$orphan_format-$block_size
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	case "$orphan_format" in
+	classic)
+		features='metadata_csum,^orphan_file'
+		;;
+	orphan-file)
+		features='metadata_csum,orphan_file'
+		;;
+	*)
+		fail "unknown orphan format: $orphan_format"
+		;;
+	esac
+	test_name="$orphan_format metadata ($block_size byte blocks)"
+	print_test_name "$test_name"
+
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O "$features" "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs failed"
+	fi
+	"$DUMPE2FS" -h "$image" >"$case_dir/dumpe2fs.log" \
+	    2>&1 || fail "dumpe2fs rejected the orphan image"
+	if [ "$orphan_format" = orphan-file ]; then
+		grep -q '^Filesystem features:.*orphan_file' \
+		    "$case_dir/dumpe2fs.log" ||
+		    fail "orphan-file feature is missing"
+	else
+		if grep -q '^Filesystem features:.*orphan_file' \
+		    "$case_dir/dumpe2fs.log"; then
+			fail "classic fixture has an orphan file"
+		fi
+	fi
+
+	attach_image
+	mount_image ""
+	run_step orphan-create "$mountpoint/orphan"
+	unmount_image orphan-create
+	detach_image
+	check_image orphan-create
+	if [ "$orphan_format:$block_size" = orphan-file:1024 ]; then
+		cp "$image" "$case_dir/base.img"
+	fi
+	sequence_before=$(journal_sequence)
+
+	attach_image
+	mount_image ""
+	run_step orphan-cycle "$mountpoint/orphan"
+	unmount_image orphan-cycle
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "orphan lifecycle did not advance the journal"
+	check_last_orphan_clear
+	"$DUMPE2FS" -h "$image" >"$case_dir/dumpe2fs-after.log" \
+	    2>&1 || fail "dumpe2fs rejected the retired orphan image"
+	if grep -q '^Filesystem features:.*orphan_present' \
+	    "$case_dir/dumpe2fs-after.log"; then
+		fail "orphan retirement retained ORPHAN_PRESENT"
+	fi
+	check_image orphan-cycle
+
+	before=$(sha256 -q "$image")
+	attach_image
+	mount_image ro
+	run_step orphan-verify "$mountpoint/orphan"
+	unmount_image orphan-verify
+	detach_image
+	after=$(sha256 -q "$image")
+	[ "$before" = "$after" ] ||
+	    fail "read-only orphan verification changed the image"
+	check_image orphan-verify
+	echo " ok"
+}
+
+run_orphan_corrupt_case()
+{
+	block_size=1024
+	case_dir=$work/orphan-corrupt-file
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	test_name="corrupt orphan file is non-mutating"
+	print_test_name "$test_name"
+	cp "$work/orphan-orphan-file-1024/base.img" "$image"
+
+	orphan_inode=$("$DUMPE2FS" -h "$image" 2>/dev/null | awk '
+	    $1 == "Orphan" && $2 == "file" && $3 == "inode:" {
+		print $4
+		exit
+	    }
+	')
+	case "$orphan_inode" in
+	*[!0-9]*|'') fail "could not locate the orphan-file inode" ;;
+	esac
+	orphan_blocks=$(
+		"$DEBUGFS" -R "blocks <$orphan_inode>" "$image" \
+		    2>/dev/null
+	) || fail "could not map the orphan file"
+	set -- $orphan_blocks
+	[ "$#" -gt 0 ] || fail "orphan file has no blocks"
+	case "$1" in
+	*[!0-9]*|'') fail "invalid orphan-file block" ;;
+	esac
+	orphan_block=$1
+	tail_offset=$(((orphan_block + 1) * block_size - 1))
+	tail_byte=$(dd if="$image" bs=1 skip="$tail_offset" count=1 \
+	    status=none | hexdump -ve '1/1 "%u"')
+	case "$tail_byte" in
+	*[!0-9]*|'') fail "could not read orphan checksum byte" ;;
+	esac
+	write_image_byte "$image" "$tail_offset" $((tail_byte ^ 1))
+	dd if="$image" of="$case_dir/orphan-before" bs="$block_size" \
+	    skip="$orphan_block" count=1 status=none
+
+	directory_blocks=$(
+		"$DEBUGFS" -R 'blocks /orphan' "$image" 2>/dev/null
+	) || fail "could not locate the orphan fixture directory"
+	set -- $directory_blocks
+	[ "$#" -eq 1 ] ||
+	    fail "orphan fixture directory is not one block"
+	case "$1" in
+	*[!0-9]*|'') fail "invalid orphan directory block" ;;
+	esac
+	directory_block=$1
+	dd if="$image" of="$case_dir/directory-before" \
+	    bs="$block_size" skip="$directory_block" count=1 status=none
+	set +e
+	"$TIMEOUT" -k 2 "$EXT4FS_TIMEOUT" "$E2FSCK" -fn \
+	    "$image" >"$case_dir/e2fsck-corrupt.log" 2>&1
+	fsck_status=$?
+	set -e
+	if [ "$fsck_status" -ne 4 ]; then
+		cat "$case_dir/e2fsck-corrupt.log" >&2
+		fail "unexpected corrupt orphan-file e2fsck status"
+	fi
+	sequence_before=$(journal_sequence)
+
+	attach_image
+	mount_image noatime
+	run_step orphan-reject "$mountpoint/orphan"
+	unmount_image orphan-reject
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" = "$sequence_before" ] ||
+	    fail "corrupt orphan-file unlink started a transaction"
+	dd if="$image" of="$case_dir/orphan-after" bs="$block_size" \
+	    skip="$orphan_block" count=1 status=none
+	cmp -s "$case_dir/orphan-before" "$case_dir/orphan-after" ||
+	    fail "corrupt orphan-file block changed"
+	dd if="$image" of="$case_dir/directory-after" \
+	    bs="$block_size" skip="$directory_block" count=1 status=none
+	cmp -s "$case_dir/directory-before" \
+	    "$case_dir/directory-after" ||
+	    fail "rejected orphan-file unlink changed the namespace"
+	echo " ok"
+}
+
 run_special_case()
 {
 	case_dir=$work/special-inodes
@@ -1151,6 +1324,24 @@ directory)
 	done
 	case " $EXT4FS_BLOCK_SIZES " in
 	*' 1024 '*) run_directory_corrupt_case ;;
+	esac
+	exit 0
+	;;
+orphan)
+	for orphan_format in classic orphan-file; do
+		for block_size in $EXT4FS_BLOCK_SIZES; do
+			case "$block_size" in
+			1024|2048|4096) ;;
+			*)
+				echo "bad block size: $block_size" >&2
+				exit 1
+				;;
+			esac
+			run_orphan_case "$block_size" "$orphan_format"
+		done
+	done
+	case " $EXT4FS_BLOCK_SIZES " in
+	*' 1024 '*) run_orphan_corrupt_case ;;
 	esac
 	exit 0
 	;;

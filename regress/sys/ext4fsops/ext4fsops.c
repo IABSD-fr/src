@@ -14,6 +14,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <sys/param.h>
 #include <sys/types.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
@@ -42,6 +43,7 @@
 #define EXTENT_PARTIAL_BYTES	37
 #define DIR_TAIL_BYTES	12
 #define FAST_SYMLINK_BYTES	60
+#define ORPHAN_INODE_BYTES	256
 #define IO_CHUNK	4096
 
 #define DATA_SEED	0x31U
@@ -107,6 +109,10 @@ static void	create_directory_fixture (void);
 static void	verify_directory_fixture (int);
 static void	mutate_directory_fixture (void);
 static void	reject_corrupt_directory (void);
+static void	create_orphan_fixture (void);
+static void	cycle_orphan_fixture (void);
+static void	verify_orphan_fixture (void);
+static void	reject_corrupt_orphan_file (void);
 static void	allocate_bitmap_probe (void);
 static void	verify_bitmap_probe (int);
 static void	free_bitmap_probe (void);
@@ -1020,6 +1026,235 @@ reject_corrupt_directory (void)
 	if (saved_errno != EINVAL && saved_errno != EIO)
 		errx(1, "corrupt create failed with %s",
 		    strerror(saved_errno));
+}
+
+static u_int64_t
+orphan_file_blocks (const struct stat *st)
+{
+	u_int64_t ratio;
+
+	ratio = block_size / DEV_BSIZE;
+	if (ratio == 0 || st->st_blocks < 0 ||
+	    (u_int64_t)st->st_blocks % ratio != 0)
+		errx(1, "invalid orphan fixture block accounting");
+	return ((u_int64_t)st->st_blocks / ratio);
+}
+
+static void
+create_orphan_fixture (void)
+{
+	char path[PATH_MAX];
+
+	if (mkdir(root, 0755) == -1)
+		err(1, "mkdir %s", root);
+	make_path(path, sizeof(path), "held-first");
+	write_text_file(path, "");
+	make_path(path, sizeof(path), "held-second");
+	write_text_file(path, "");
+	make_path(path, sizeof(path), "corrupt-target");
+	write_text_file(path, "orphan-target-data");
+	make_path(path, sizeof(path), "rename-source");
+	write_text_file(path, "rename-source-data");
+	make_path(path, sizeof(path), "rename-target");
+	write_text_file(path, "rename-target-data");
+	make_path(path, sizeof(path), "empty-dir");
+	if (mkdir(path, 0755) == -1)
+		err(1, "mkdir %s", path);
+	fsync_path(root);
+}
+
+static void
+cycle_orphan_fixture (void)
+{
+	struct stat first, parent, second, target;
+	struct statfs after, before;
+	char path[PATH_MAX], other[PATH_MAX];
+	u_int64_t first_blocks, second_blocks, target_blocks;
+	int fd, fd2;
+
+	make_path(path, sizeof(path), "corrupt-target");
+	if (stat(path, &target) == -1)
+		err(1, "stat %s", path);
+	target_blocks = orphan_file_blocks(&target);
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before closed orphan retirement");
+	if (unlink(path) == -1)
+		err(1, "unlink %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after closed orphan retirement");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree + target_blocks)
+		errx(1, "closed orphan retirement accounting mismatch");
+
+	make_path(path, sizeof(path), "rename-target");
+	if (stat(path, &target) == -1)
+		err(1, "stat %s", path);
+	target_blocks = orphan_file_blocks(&target);
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before orphan replacement");
+	make_path(other, sizeof(other), "rename-source");
+	if (rename(other, path) == -1)
+		err(1, "rename orphan replacement");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after orphan replacement");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree + target_blocks)
+		errx(1, "orphan replacement accounting mismatch");
+	check_text_file(path, "rename-source-data");
+	check_absent(other);
+
+	make_path(path, sizeof(path), "empty-dir");
+	if (stat(path, &target) == -1)
+		err(1, "stat %s", path);
+	target_blocks = orphan_file_blocks(&target);
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before orphan directory retirement");
+	if (rmdir(path) == -1)
+		err(1, "rmdir %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after orphan directory retirement");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree + target_blocks)
+		errx(1, "orphan directory accounting mismatch");
+
+	make_path(path, sizeof(path), "held-first");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	make_path(other, sizeof(other), "held-second");
+	fd2 = open(other, O_RDWR);
+	if (fd2 == -1)
+		err(1, "open %s", other);
+	write_pattern_fd(fd, 0, block_size + 7, 0x71U);
+	write_pattern_fd(fd2, 0, 2 * block_size + 11, 0x82U);
+	if (fsync(fd) == -1 || fsync(fd2) == -1)
+		err(1, "fsync orphan fixtures");
+	if (fstat(fd, &first) == -1 || fstat(fd2, &second) == -1)
+		err(1, "fstat orphan fixtures");
+	if (stat(root, &parent) == -1)
+		err(1, "stat %s", root);
+	if (((u_int64_t)parent.st_ino - 1) /
+	    (block_size / ORPHAN_INODE_BYTES) !=
+	    ((u_int64_t)first.st_ino - 1) /
+	    (block_size / ORPHAN_INODE_BYTES))
+		errx(1, "orphan fixture does not share an inode block");
+	first_blocks = orphan_file_blocks(&first);
+	second_blocks = orphan_file_blocks(&second);
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before open orphan retirement");
+	if (unlink(path) == -1 || unlink(other) == -1)
+		err(1, "unlink open orphan fixtures");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs while orphan fixtures are open");
+	if (after.f_ffree != before.f_ffree ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "open orphan was retired before final close");
+
+	if (close(fd) == -1)
+		err(1, "close first inserted orphan");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after non-head orphan close");
+	if (after.f_ffree != before.f_ffree + 1 ||
+	    after.f_bfree != before.f_bfree + first_blocks)
+		errx(1, "non-head orphan accounting mismatch");
+	check_pattern_fd(fd2, 0, 2 * block_size + 11, 0x82U);
+	if (close(fd2) == -1)
+		err(1, "close second inserted orphan");
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after final orphan close");
+	if (after.f_ffree != before.f_ffree + 2 ||
+	    after.f_bfree != before.f_bfree + first_blocks +
+	    second_blocks)
+		errx(1, "final orphan retirement accounting mismatch");
+
+	before = after;
+	make_path(path, sizeof(path), "reuse");
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after orphan inode reuse");
+	if (after.f_ffree + 1 != before.f_ffree ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "orphan inode was not reusable exactly once");
+	fsync_path(root);
+}
+
+static void
+verify_orphan_fixture (void)
+{
+	char path[PATH_MAX];
+
+	make_path(path, sizeof(path), "corrupt-target");
+	check_absent(path);
+	make_path(path, sizeof(path), "held-first");
+	check_absent(path);
+	make_path(path, sizeof(path), "held-second");
+	check_absent(path);
+	make_path(path, sizeof(path), "rename-source");
+	check_absent(path);
+	make_path(path, sizeof(path), "rename-target");
+	check_text_file(path, "rename-source-data");
+	make_path(path, sizeof(path), "empty-dir");
+	check_absent(path);
+	make_path(path, sizeof(path), "reuse");
+	check_empty_file(path);
+}
+
+static void
+check_orphan_reject_errno (const char *operation)
+{
+	int saved_errno;
+
+	saved_errno = errno;
+	if (saved_errno != EINVAL && saved_errno != EIO)
+		errx(1, "corrupt orphan %s failed with %s", operation,
+		    strerror(saved_errno));
+}
+
+static void
+reject_corrupt_orphan_file (void)
+{
+	struct stat st;
+	struct statfs after, before;
+	char other[PATH_MAX], path[PATH_MAX];
+
+	make_path(path, sizeof(path), "corrupt-target");
+	check_text_file(path, "orphan-target-data");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before corrupt orphan-file unlink");
+	errno = 0;
+	if (unlink(path) != -1)
+		errx(1, "unlink accepted a corrupt orphan file");
+	check_orphan_reject_errno("unlink");
+	check_text_file(path, "orphan-target-data");
+
+	make_path(path, sizeof(path), "rename-source");
+	make_path(other, sizeof(other), "rename-target");
+	errno = 0;
+	if (rename(path, other) != -1)
+		errx(1, "rename accepted a corrupt orphan file");
+	check_orphan_reject_errno("rename");
+	check_text_file(path, "rename-source-data");
+	check_text_file(other, "rename-target-data");
+
+	make_path(path, sizeof(path), "empty-dir");
+	errno = 0;
+	if (rmdir(path) != -1)
+		errx(1, "rmdir accepted a corrupt orphan file");
+	check_orphan_reject_errno("rmdir");
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (!S_ISDIR(st.st_mode))
+		errx(1, "rejected orphan rmdir changed file type");
+
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after corrupt orphan operations");
+	if (after.f_ffree != before.f_ffree ||
+	    after.f_bfree != before.f_bfree)
+		errx(1, "rejected orphan operation changed accounting");
 }
 
 static void
@@ -2335,6 +2570,16 @@ main (int argc, char **argv)
 			err(1, "rmdir %s", root);
 		block_size = (size_t)sfs.f_bsize;
 		create_directory_fixture();
+	} else if (strcmp(argv[1], "orphan-create") == 0) {
+		block_size = 0;
+		if (mkdir(root, 0755) == -1)
+			err(1, "mkdir %s", root);
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs %s", root);
+		if (rmdir(root) == -1)
+			err(1, "rmdir %s", root);
+		block_size = (size_t)sfs.f_bsize;
+		create_orphan_fixture();
 	} else {
 		if (statfs(root, &sfs) == -1)
 			err(1, "statfs %s", root);
@@ -2407,6 +2652,12 @@ main (int argc, char **argv)
 			verify_directory_fixture(1);
 		else if (strcmp(argv[1], "directory-reject") == 0)
 			reject_corrupt_directory();
+		else if (strcmp(argv[1], "orphan-cycle") == 0)
+			cycle_orphan_fixture();
+		else if (strcmp(argv[1], "orphan-verify") == 0)
+			verify_orphan_fixture();
+		else if (strcmp(argv[1], "orphan-reject") == 0)
+			reject_corrupt_orphan_file();
 		else
 			errx(1, "unknown mode: %s", argv[1]);
 	}

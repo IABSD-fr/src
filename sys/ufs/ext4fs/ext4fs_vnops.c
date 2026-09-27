@@ -4905,6 +4905,7 @@ ext4fs_remove (void *v)
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
 	struct ext4fs_dinode_256 saved_dir_inode, saved_inode;
 	struct ext4fs_journal_handle *handle;
+	struct ext4fs_orphan_add_state orphan_state;
 	struct ext4fs saved_sb;
 	u_int64_t blocks, blockless_units, size, xattr;
 	u_int32_t inode_flags;
@@ -5028,6 +5029,14 @@ ext4fs_remove (void *v)
 		if (journal_final) {
 			rw_enter_write(&fs->m_runtime_orphan_lock);
 			orphan_locked = 1;
+			error = ext4fs_orphan_add_preflight(ip,
+			    &orphan_state);
+			if (error) {
+				rw_exit_write(
+				    &fs->m_runtime_orphan_lock);
+				orphan_locked = 0;
+				goto out;
+			}
 			saved_sb = fs->m_sble;
 			saved_feature_ro_compat =
 			    fs->m_feature_ro_compat;
@@ -5051,7 +5060,8 @@ ext4fs_remove (void *v)
 		ip->i_effnlink = nlink;
 		ip->i_flag |= IN_CHANGE;
 		if (journal_final) {
-			error = ext4fs_orphan_add_handle(ip, handle);
+			error = ext4fs_orphan_add_handle(ip,
+			    &orphan_state, handle);
 			if (error == 0)
 				orphan_added = 1;
 		} else
@@ -5477,6 +5487,7 @@ ext4fs_rename_journal (struct vop_rename_args *ap)
 	struct ext4fs_dinode_256 saved_fdir_inode, saved_inode;
 	struct ext4fs_dinode_256 saved_tdir_inode, saved_target_inode;
 	struct ext4fs_journal_handle *handle;
+	struct ext4fs_orphan_add_state orphan_state;
 	struct m_ext4fs *fs;
 	off_t source_offset, target_offset;
 	uid_t dir_uid, target_uid;
@@ -5688,6 +5699,13 @@ ext4fs_rename_journal (struct vop_rename_args *ap)
 		    M_WAITOK);
 		rw_enter_write(&fs->m_runtime_orphan_lock);
 		orphan_locked = 1;
+		error = ext4fs_orphan_add_preflight(xp,
+		    &orphan_state);
+		if (error) {
+			rw_exit_write(&fs->m_runtime_orphan_lock);
+			orphan_locked = 0;
+			goto fail;
+		}
 		*saved_sb = fs->m_sble;
 		saved_feature_ro_compat = fs->m_feature_ro_compat;
 		saved_last_orphan = fs->m_last_orphan;
@@ -5739,7 +5757,8 @@ ext4fs_rename_journal (struct vop_rename_args *ap)
 		xp->i_effnlink = xnlink;
 		xp->i_flag |= IN_CHANGE;
 		if (target_orphan) {
-			error = ext4fs_orphan_add_handle(xp, handle);
+			error = ext4fs_orphan_add_handle(xp,
+			    &orphan_state, handle);
 			if (error == 0)
 				orphan_added = 1;
 		} else
@@ -6496,6 +6515,7 @@ ext4fs_rmdir_journal (struct vop_rmdir_args *ap)
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_dinode_256 saved_dir_inode, saved_inode;
 	struct ext4fs_journal_handle *handle;
+	struct ext4fs_orphan_add_state orphan_state;
 	struct ext4fs saved_sb;
 	u_int32_t saved_feature_ro_compat, saved_last_orphan;
 	u_int16_t nlink;
@@ -6504,6 +6524,11 @@ ext4fs_rmdir_journal (struct vop_rmdir_args *ap)
 	int saved_flags;
 
 	rw_enter_write(&fs->m_runtime_orphan_lock);
+	error = ext4fs_orphan_add_preflight(ip, &orphan_state);
+	if (error) {
+		rw_exit_write(&fs->m_runtime_orphan_lock);
+		return (error);
+	}
 	memcpy(&saved_inode, ip->i_e4din, sizeof(saved_inode));
 	memcpy(&saved_dir_inode, dp->i_e4din, sizeof(saved_dir_inode));
 	saved_flags = ip->i_flag;
@@ -6538,7 +6563,7 @@ ext4fs_rmdir_journal (struct vop_rmdir_args *ap)
 	error = ext4fs_dirremove_handle(ip, dvp, handle, &changed);
 	if (error)
 		goto fail;
-	error = ext4fs_orphan_add_handle(ip, handle);
+	error = ext4fs_orphan_add_handle(ip, &orphan_state, handle);
 	if (error)
 		goto fail;
 	orphan_added = 1;
