@@ -515,7 +515,7 @@ journal handle. This includes:
 - [x] directory blocks and checksum tails;
 - [x] orphan-list and orphan-file updates;
 - [x] allocation and free counters;
-- [ ] the ext4 superblock.
+- [x] the ext4 superblock.
 
 The first Phase 4 path was validated on 2026-09-25 against the booted
 amd64 production kernel.  Inode-table updates now use a runtime journal
@@ -811,6 +811,24 @@ block or inode allocation without changing accounting or advancing the
 journal.  On 2026-09-27, the focused target and complete ext4fs suite
 passed against the rebuilt and booted production kernel, so this
 checklist item is complete.
+
+The ext4 superblock writer audit is complete.  Runtime allocation,
+free, and orphan updates attach the primary superblock block to their
+journal handle.  A single preparation path encodes mutable fields and
+regenerates the checksum.  Direct writes are guarded and limited to
+journal-less operation or restartable recovery.  RECOVER and clean or
+dirty mount-state transitions use a separate lifecycle path because
+they must bracket the journal rather than enter it.
+
+The focused `run-regress-ext4fsops-superblock` target exercises
+transactional free-block and free-inode updates with 1 KiB, 2 KiB, and
+4 KiB filesystem blocks.  It verifies journal advancement, exact
+counter restoration, stable identity fields, clean journal state,
+empty writable-mount behavior, read-only non-mutation, and offline
+`e2fsck -fn` acceptance.  Checksummed corrupt and validly checksummed
+dirty superblocks are rejected without modifying their images.  On
+2026-09-27, the rebuilt production kernel and complete ext4fs tests
+passed, completing Phase 4.
 
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only
 for regular-file data, the journal's own I/O, recovery, checkpointing,

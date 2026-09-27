@@ -833,7 +833,7 @@ ext4fs_recovery_recount (struct mount *mp, int64_t dir_group)
 	fs->m_free_blocks_count = free_blocks;
 	fs->m_free_inodes_count = free_inodes64;
 	fs->m_fs_was_modified = 1;
-	error = ext4fs_sbwrite(mp);
+	error = ext4fs_sbwrite_direct(mp);
 	if (error)
 		return (error);
 	return (ext4fs_recovery_flush(mp));
@@ -2583,7 +2583,7 @@ ext4fs_recovery_classic_orphans (struct mount *mp, int *count)
 			fs->m_last_orphan = 0;
 			fs->m_sble.sb_last_orphan = 0;
 			fs->m_fs_was_modified = 1;
-			error = ext4fs_sbwrite(mp);
+			error = ext4fs_sbwrite_direct(mp);
 		} else {
 			error = ext4fs_orphan_inode_read(fs,
 			    ump->um_devvp,
@@ -2642,7 +2642,7 @@ ext4fs_orphan_cleanup (struct mount *mp)
 		fs->m_feature_ro_compat = ro;
 		fs->m_sble.sb_feature_ro_compat = htole32(ro);
 		fs->m_fs_was_modified = 1;
-		error = ext4fs_sbwrite(mp);
+		error = ext4fs_sbwrite_direct(mp);
 		if (error)
 			return (error);
 		error = ext4fs_recovery_flush(mp);

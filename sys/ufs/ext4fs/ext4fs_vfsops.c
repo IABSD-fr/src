@@ -640,7 +640,10 @@ ext4fs_mountfs (struct vnode *devvp, struct mount *mp, struct proc *p)
 		else
 			mfs->m_state = EXT4FS_STATE_ERROR;
 		mfs->m_fs_was_modified = 1;
-		error = ext4fs_sbwrite(mp);
+		if (mfs->m_journal != NULL)
+			error = ext4fs_sbwrite_lifecycle(mp);
+		else
+			error = ext4fs_sbwrite_direct(mp);
 		if (error)
 			goto out;
 	}
@@ -1141,9 +1144,8 @@ ext4fs_bgd_write_handle (struct m_ext4fs *fs, struct vnode *devvp,
 }
 
 static void
-ext4fs_sbprepare (struct m_ext4fs *fs)
+ext4fs_sbprepare (struct m_ext4fs *fs, struct ext4fs *sble)
 {
-	struct ext4fs *sble = &fs->m_sble;
 	struct timespec ts;
 
 	sble->sb_free_blocks_count_lo =
@@ -1151,17 +1153,18 @@ ext4fs_sbprepare (struct m_ext4fs *fs)
 	sble->sb_free_blocks_count_hi =
 	    htole32((u_int32_t)(fs->m_free_blocks_count >> 32));
 	sble->sb_free_inodes_count = htole32(fs->m_free_inodes_count);
+	sble->sb_feature_compat = htole32(fs->m_feature_compat);
+	sble->sb_feature_incompat = htole32(fs->m_feature_incompat);
+	sble->sb_feature_ro_compat = htole32(fs->m_feature_ro_compat);
+	sble->sb_last_orphan = htole32(fs->m_last_orphan);
 	getnanotime(&ts);
 	sble->sb_write_time_lo = htole32((u_int32_t)ts.tv_sec);
 	sble->sb_state = htole16(fs->m_state);
 	sble->sb_checksum = htole32(ext4fs_sb_csum(sble));
 }
 
-/*
- * Write the superblock to disk with updated counters and checksum.
- */
-int
-ext4fs_sbwrite (struct mount *mp)
+static int
+ext4fs_sbwrite_raw (struct mount *mp)
 {
 	struct ufsmount *ump = VFSTOUFS(mp);
 	struct m_ext4fs *fs = ump->um_e4fs;
@@ -1169,19 +1172,53 @@ ext4fs_sbwrite (struct mount *mp)
 	struct buf *bp;
 	int error;
 
-	ext4fs_sbprepare(fs);
+	ext4fs_sbprepare(fs, sble);
 
 	/* Write to disk at the fixed superblock offset */
 	error = bread(ump->um_devvp,
 	    (daddr_t)(EXT4FS_SUPER_BLOCK_OFFSET / DEV_BSIZE),
 	    EXT4FS_SUPER_BLOCK_SIZE, &bp);
 	if (error) {
-		brelse(bp);
+		if (bp != NULL)
+			brelse(bp);
 		return (error);
 	}
 
 	memcpy(bp->b_data, sble, sizeof(struct ext4fs));
 	return (bwrite(bp));
+}
+
+/*
+ * Write the superblock without a journal.  This path is limited to a
+ * journal-less mount or restartable recovery before journal startup.
+ */
+int
+ext4fs_sbwrite_direct (struct mount *mp)
+{
+	struct m_ext4fs *fs;
+
+	fs = VFSTOUFS(mp)->um_e4fs;
+	if (fs->m_journal != NULL)
+		return (EIO);
+	return (ext4fs_sbwrite_raw(mp));
+}
+
+/*
+ * RECOVER and clean/dirty mount state surround the journal itself and
+ * therefore cannot be journaled.  Callers must serialize these writes
+ * outside any runtime transaction.
+ */
+int
+ext4fs_sbwrite_lifecycle (struct mount *mp)
+{
+	struct m_ext4fs *fs;
+
+	fs = VFSTOUFS(mp)->um_e4fs;
+	if (fs->m_journal == NULL)
+		return (EINVAL);
+	if (fs->m_read_only || (mp->mnt_flag & MNT_RDONLY))
+		return (EROFS);
+	return (ext4fs_sbwrite_raw(mp));
 }
 
 int
@@ -1190,13 +1227,14 @@ ext4fs_sbwrite_handle (struct mount *mp,
 {
 	struct ufsmount *ump = VFSTOUFS(mp);
 	struct m_ext4fs *fs = ump->um_e4fs;
-	struct ext4fs saved;
+	struct ext4fs saved_disk;
+	struct ext4fs *sble;
 	struct buf *bp;
 	u_int64_t fsblock;
 	u_int32_t offset;
 	int error;
 
-	if (handle == NULL)
+	if (handle == NULL || fs->m_journal == NULL)
 		return (EINVAL);
 	fsblock = EXT4FS_SUPER_BLOCK_OFFSET / fs->m_block_size;
 	offset = EXT4FS_SUPER_BLOCK_OFFSET % fs->m_block_size;
@@ -1207,14 +1245,15 @@ ext4fs_sbwrite_handle (struct mount *mp,
 	    fsblock, &bp);
 	if (error)
 		return (error);
-	memcpy(&saved, (char *)bp->b_data + offset, sizeof(saved));
-	ext4fs_sbprepare(fs);
-	memcpy((char *)bp->b_data + offset, &fs->m_sble,
-	    sizeof(fs->m_sble));
+	sble = (struct ext4fs *)((char *)bp->b_data + offset);
+	memcpy(&saved_disk, sble, sizeof(saved_disk));
+	memcpy(sble, &fs->m_sble, sizeof(*sble));
+	ext4fs_sbprepare(fs, sble);
 	error = ext4fs_journal_dirty_metadata(handle, bp);
 	if (error)
-		memcpy((char *)bp->b_data + offset, &saved,
-		    sizeof(saved));
+		memcpy(sble, &saved_disk, sizeof(saved_disk));
+	else
+		memcpy(&fs->m_sble, sble, sizeof(fs->m_sble));
 	return (error);
 }
 
@@ -1976,7 +2015,7 @@ ext4fs_sync (struct mount *mp, int waitfor, int stall,
 
 	/* Runtime journal transactions own their superblock updates. */
 	if (fs->m_journal == NULL && fs->m_fs_was_modified) {
-		if ((error = ext4fs_sbwrite(mp)))
+		if ((error = ext4fs_sbwrite_direct(mp)))
 			esa.allerror = error;
 	}
 
@@ -2019,7 +2058,7 @@ ext4fs_unmount (struct mount *mp, int mntflags, struct proc *p)
 			return (error);
 	} else if (!mfs->m_read_only && mfs->m_fs_was_modified) {
 		mfs->m_state = EXT4FS_STATE_VALID;
-		if ((error = ext4fs_sbwrite(mp)) != 0)
+		if ((error = ext4fs_sbwrite_direct(mp)) != 0)
 			return (error);
 	}
 	ext4fs_journal_destroy(mp);

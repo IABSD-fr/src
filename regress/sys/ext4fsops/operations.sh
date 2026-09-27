@@ -1071,6 +1071,170 @@ run_counter_local_reject_case()
 	echo " ok"
 }
 
+superblock_identity()
+{
+	"$DUMPE2FS" -h "$image" 2>/dev/null | awk '
+	    /^Filesystem UUID:/ ||
+	    /^Filesystem magic number:/ ||
+	    /^Filesystem revision #:/ ||
+	    /^Filesystem features:/ ||
+	    /^Inode count:/ ||
+	    /^Block count:/ ||
+	    /^Reserved block count:/ ||
+	    /^First block:/ ||
+	    /^Block size:/ ||
+	    /^Group descriptor size:/ ||
+	    /^Blocks per group:/ ||
+	    /^Inodes per group:/ ||
+	    /^Inode size:/ ||
+	    /^Journal inode:/ { print }
+	'
+}
+
+check_superblock_clean()
+{
+	stage=$1
+	output=$case_dir/dumpe2fs-$stage.log
+	if ! "$DUMPE2FS" -h "$image" >"$output" 2>&1; then
+		cat "$output" >&2
+		fail "dumpe2fs rejected the superblock after $stage"
+	fi
+	grep -q '^Filesystem state: *clean$' "$output" ||
+	    fail "filesystem is not clean after $stage"
+	if grep -q '^Filesystem features:.*needs_recovery' "$output" ||
+	    grep -q '^Filesystem features:.*orphan_present' "$output"; then
+		fail "recovery feature remains after $stage"
+	fi
+	grep -q '^Journal start: *0$' "$output" ||
+	    fail "journal is not empty after $stage"
+}
+
+run_superblock_case()
+{
+	block_size=$1
+	case_dir=$work/superblock-$block_size
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	test_name="superblock transactions ($block_size byte blocks)"
+	print_test_name "$test_name"
+
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O 'metadata_csum,^orphan_file' "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs failed"
+	fi
+	superblock_identity >"$case_dir/identity-before"
+	filesystem_counts >"$case_dir/counts-before"
+	[ -s "$case_dir/identity-before" ] &&
+	    [ -s "$case_dir/counts-before" ] ||
+	    fail "could not read the initial superblock"
+	check_superblock_clean initial
+	sequence_before=$(journal_sequence)
+
+	attach_image
+	mount_image ""
+	run_step bitmap-allocate "$mountpoint/super-blocks"
+	run_step inode-allocate "$mountpoint/super-inodes"
+	run_step inode-free "$mountpoint/super-inodes"
+	run_step bitmap-retire "$mountpoint/super-blocks"
+	rmdir "$mountpoint/super-blocks" \
+	    "$mountpoint/super-inodes" ||
+	    fail "could not retire superblock probes"
+	unmount_image superblock-transactions
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "superblock transactions did not advance the journal"
+	check_superblock_clean transactions
+	check_image superblock-transactions
+	superblock_identity >"$case_dir/identity-after"
+	filesystem_counts >"$case_dir/counts-after"
+	cmp -s "$case_dir/identity-before" \
+	    "$case_dir/identity-after" ||
+	    fail "superblock identity fields changed"
+	cmp -s "$case_dir/counts-before" "$case_dir/counts-after" ||
+	    fail "balanced operations changed superblock counts"
+
+	sequence_before=$sequence_after
+	attach_image
+	mount_image ""
+	unmount_image empty-writable-cycle
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" = "$sequence_before" ] ||
+	    fail "empty lifecycle created a journal transaction"
+	check_superblock_clean empty-writable-cycle
+	check_image empty-writable-cycle
+
+	before=$(sha256 -q "$image")
+	attach_image
+	mount_image ro
+	unmount_image read-only-cycle
+	detach_image
+	after=$(sha256 -q "$image")
+	[ "$before" = "$after" ] ||
+	    fail "read-only lifecycle changed the superblock"
+	check_superblock_clean read-only-cycle
+	echo " ok"
+}
+
+expect_superblock_mount_failure()
+{
+	stage=$1
+	before=$(sha256 -q "$image")
+	attach_image
+	if "$TIMEOUT" -k 2 "$EXT4FS_TIMEOUT" \
+	    "$MOUNT_EXT4FS" "/dev/${vnd}c" "$mountpoint" \
+	    >"$case_dir/mount-$stage.log" 2>&1; then
+		mounted=1
+		fail "kernel accepted the malformed superblock"
+	fi
+	detach_image
+	after=$(sha256 -q "$image")
+	[ "$before" = "$after" ] ||
+	    fail "failed mount changed the malformed superblock"
+}
+
+run_superblock_reject_case()
+{
+	kind=$1
+	case_dir=$work/superblock-reject-$kind
+	image=$case_dir/ext4.img
+	block_size=1024
+	mkdir "$case_dir"
+	cp "$work/superblock-1024/ext4.img" "$image"
+
+	case "$kind" in
+	checksum)
+		test_name="bad superblock checksum is non-mutating"
+		offset=$((1024 + 1020))
+		value=$(dd if="$image" bs=1 skip="$offset" count=1 \
+		    status=none | hexdump -ve '1/1 "%u"')
+		case "$value" in
+		*[!0-9]*|'')
+			fail "could not read superblock checksum"
+			;;
+		esac
+		write_image_byte "$image" "$offset" $((value ^ 1))
+		;;
+	dirty)
+		test_name="dirty superblock mount is non-mutating"
+		if ! "$DEBUGFS" -w -R 'ssv state 0' "$image" \
+		    >"$case_dir/debugfs.log" 2>&1; then
+			cat "$case_dir/debugfs.log" >&2
+			fail "could not create a dirty superblock"
+		fi
+		;;
+	*) fail "unknown superblock rejection case: $kind" ;;
+	esac
+	print_test_name "$test_name"
+	expect_superblock_mount_failure "$kind"
+	echo " ok"
+}
+
 extent_leaf_count()
 {
 	stage=$1
@@ -1615,6 +1779,26 @@ counters)
 		done
 		for kind in blocks inodes; do
 			run_counter_local_reject_case "$kind"
+		done
+		;;
+	esac
+	exit 0
+	;;
+superblock)
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		case "$block_size" in
+		1024|2048|4096) ;;
+		*)
+			echo "bad block size: $block_size" >&2
+			exit 1
+			;;
+		esac
+		run_superblock_case "$block_size"
+	done
+	case " $EXT4FS_BLOCK_SIZES " in
+	*' 1024 '*)
+		for kind in checksum dirty; do
+			run_superblock_reject_case "$kind"
 		done
 		;;
 	esac

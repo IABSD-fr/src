@@ -357,7 +357,7 @@ ext4fs_journal_set_recover (struct ext4fs_journal *journal)
 	fs->m_sble.sb_feature_incompat =
 	    htole32(fs->m_feature_incompat);
 	fs->m_fs_was_modified = 1;
-	error = ext4fs_sbwrite(journal->j_mp);
+	error = ext4fs_sbwrite_lifecycle(journal->j_mp);
 	if (error == 0)
 		error = jbd2_flush_device(ump->um_devvp, curproc);
 	return (error);
@@ -1557,7 +1557,7 @@ ext4fs_journal_mark_clean (struct mount *mp)
 	    htole32(fs->m_feature_incompat);
 	fs->m_state = EXT4FS_STATE_VALID;
 	fs->m_fs_was_modified = 1;
-	error = ext4fs_sbwrite(mp);
+	error = ext4fs_sbwrite_lifecycle(mp);
 	if (error == 0)
 		error = jbd2_flush_device(ump->um_devvp, curproc);
 	if (error) {
