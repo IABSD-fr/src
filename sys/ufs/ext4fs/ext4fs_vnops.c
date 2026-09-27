@@ -3721,14 +3721,74 @@ ext4fs_inode_initialize (struct inode *ip, struct inode *pdir,
 	ip->i_flag |= IN_ACCESS | IN_CHANGE | IN_UPDATE;
 }
 
+/*
+ * Prepare a new symlink while its inode-allocation transaction is still
+ * active.  A slow symlink's data reaches its home block before the
+ * transaction can expose the extent and directory entry.
+ */
+static int
+ext4fs_symlink_initialize_handle (struct inode *ip,
+    const char *target, struct ext4fs_journal_handle *handle,
+    int *changedp)
+{
+	struct m_ext4fs *fs = ip->i_e4fs;
+	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
+	struct buf *bp;
+	size_t len;
+	u_int64_t pblk;
+	u_int32_t got;
+	int error;
+
+	if (target == NULL || handle == NULL || changedp == NULL)
+		return (EINVAL);
+	len = strlen(target);
+	if (len <= EXT4FS_SYMLINK_LEN_MAX) {
+		memset(din->i_block, 0, sizeof(din->i_block));
+		memcpy(din->i_block, target, len);
+		din->i_flags = htole32(letoh32(din->i_flags) &
+		    ~EXTFS_INODE_FLAG_EXTENTS);
+	} else {
+		if (len > fs->m_block_size)
+			return (ENAMETOOLONG);
+		error = ext4fs_blkalloc_handle(ip, handle, 0, 1,
+		    &pblk, &got);
+		if (error)
+			return (error);
+		*changedp = 1;
+		if (got != 1)
+			return (EIO);
+		error = ext4fs_extent_insert_handle(ip, handle, 0,
+		    pblk, 1);
+		if (error)
+			return (error);
+		error = ext4fs_inode_blocks_add(ip, 1);
+		if (error)
+			return (error);
+
+		bp = getblk(ip->i_devvp,
+		    (daddr_t)EXT4FS_FSBTODB(fs, pblk),
+		    fs->m_block_size, 0, INFSLP);
+		clrbuf(bp);
+		memcpy(bp->b_data, target, len);
+		error = bwrite(bp);
+		if (error)
+			return (error);
+	}
+
+	ext4fs_setsize(ip, len);
+	ip->i_flag |= IN_CHANGE | IN_UPDATE;
+	return (0);
+}
+
 static int
 ext4fs_makeinode_journal (mode_t mode, dev_t rdev, struct vnode *dvp,
-    struct vnode **vpp, struct componentname *cnp)
+    struct vnode **vpp, struct componentname *cnp, const char *target)
 {
 	struct inode *ip, *pdir = VTOI(dvp);
 	struct ext4fs_dinode_256 saved_dir_inode;
 	struct ext4fs_journal_handle *handle;
 	struct vnode *tvp;
+	unsigned int credits;
 	int changed, end_error, error, original_error, rollback_error;
 	int saved_dir_flags;
 
@@ -3744,7 +3804,9 @@ ext4fs_makeinode_journal (mode_t mode, dev_t rdev, struct vnode *dvp,
 	handle = NULL;
 	tvp = NULL;
 	changed = 0;
-	error = ext4fs_journal_begin(dvp->v_mount, 16, &handle);
+	credits = target != NULL &&
+	    strlen(target) > EXT4FS_SYMLINK_LEN_MAX ? 24 : 16;
+	error = ext4fs_journal_begin(dvp->v_mount, credits, &handle);
 	if (error)
 		goto out;
 	error = ext4fs_inode_alloc_handle(pdir, mode, handle, &tvp);
@@ -3753,6 +3815,12 @@ ext4fs_makeinode_journal (mode_t mode, dev_t rdev, struct vnode *dvp,
 
 	ip = VTOI(tvp);
 	ext4fs_inode_initialize(ip, pdir, mode, cnp->cn_cred, rdev);
+	if (target != NULL) {
+		error = ext4fs_symlink_initialize_handle(ip, target,
+		    handle, &changed);
+		if (error)
+			goto fail;
+	}
 	error = ext4fs_update_handle(ip, handle);
 	if (error)
 		goto fail;
@@ -3774,6 +3842,8 @@ ext4fs_makeinode_journal (mode_t mode, dev_t rdev, struct vnode *dvp,
 	}
 	ip->i_flag &= ~IN_MODIFIED;
 	pdir->i_flag &= ~IN_MODIFIED;
+	if (target != NULL)
+		uvm_vnp_setsize(tvp, strlen(target));
 	if ((cnp->cn_flags & SAVESTART) == 0)
 		pool_put(&namei_pool, cnp->cn_pnbuf);
 	*vpp = tvp;
@@ -3835,7 +3905,8 @@ out:
  */
 static int
 ext4fs_makeinode (int mode, dev_t rdev, struct vnode *dvp,
-    struct vnode **vpp, struct componentname *cnp)
+    struct vnode **vpp, struct componentname *cnp,
+    const char *target)
 {
 	struct inode *ip, *pdir;
 	struct vnode *tvp;
@@ -3849,7 +3920,7 @@ ext4fs_makeinode (int mode, dev_t rdev, struct vnode *dvp,
 		mode |= S_IFREG;
 	if (pdir->i_e4fs->m_journal != NULL)
 		return (ext4fs_makeinode_journal(mode, rdev, dvp,
-		    vpp, cnp));
+		    vpp, cnp, target));
 
 	error = ext4fs_inode_alloc(pdir, mode, cnp->cn_cred, &tvp);
 	if (error) {
@@ -3892,7 +3963,7 @@ ext4fs_create (void *v)
 	struct vop_create_args *ap = v;
 	return (ext4fs_makeinode(
 	    MAKEIMODE(ap->a_vap->va_type, ap->a_vap->va_mode),
-	    VNOVAL, ap->a_dvp, ap->a_vpp, ap->a_cnp));
+	    VNOVAL, ap->a_dvp, ap->a_vpp, ap->a_cnp, NULL));
 }
 
 int
@@ -3904,7 +3975,7 @@ ext4fs_mknod (void *v)
 
 	error = ext4fs_makeinode(
 	    MAKEIMODE(ap->a_vap->va_type, ap->a_vap->va_mode),
-	    ap->a_vap->va_rdev, ap->a_dvp, vpp, ap->a_cnp);
+	    ap->a_vap->va_rdev, ap->a_dvp, vpp, ap->a_cnp, NULL);
 	if (error)
 		return (error);
 
@@ -6413,13 +6484,20 @@ ext4fs_symlink (void *v)
 	struct componentname *cnp = ap->a_cnp;
 	struct vnode **vpp = ap->a_vpp;
 	struct inode *ip;
+	int journaled;
 	int error, len;
 
+	journaled = VTOI(dvp)->i_e4fs->m_journal != NULL;
 	error = ext4fs_makeinode(S_IFLNK | vap->va_mode, VNOVAL,
-	    dvp, vpp, cnp);
+	    dvp, vpp, cnp, ap->a_target);
 	if (error) {
 		vput(dvp);
 		return (error);
+	}
+	if (journaled) {
+		vput(*vpp);
+		vput(dvp);
+		return (0);
 	}
 
 	ip = VTOI(*vpp);
@@ -6432,8 +6510,9 @@ ext4fs_symlink (void *v)
 		memcpy(ip->i_e4din->dinode.i_block, ap->a_target, len);
 		ext4fs_setsize(ip, len);
 		/* Clear EXTENTS flag for fast symlinks */
-		ip->i_e4din->dinode.i_flags &=
-		    ~htole32(EXTFS_INODE_FLAG_EXTENTS);
+		ip->i_e4din->dinode.i_flags = htole32(letoh32(
+		    ip->i_e4din->dinode.i_flags) &
+		    ~EXTFS_INODE_FLAG_EXTENTS);
 		ip->i_flag |= IN_CHANGE | IN_UPDATE;
 		error = ext4fs_update(ip, 1);
 	} else {

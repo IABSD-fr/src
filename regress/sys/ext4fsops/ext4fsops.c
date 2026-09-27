@@ -38,6 +38,7 @@
 #define SHRINK_EXTENT_LBN	10
 #define SHRINK_EXTENT_BYTES	37
 #define DIR_TAIL_BYTES	12
+#define FAST_SYMLINK_BYTES	60
 #define IO_CHUNK	4096
 
 #define DATA_SEED	0x31U
@@ -282,12 +283,24 @@ static void
 check_symlink (const char *path, const char *target)
 {
 	char buf[PATH_MAX];
+	struct stat st;
+	blkcnt_t blocks;
 	ssize_t n;
+	size_t target_len;
 
+	target_len = strlen(target);
+	if (lstat(path, &st) == -1)
+		err(1, "lstat %s", path);
+	blocks = target_len <= FAST_SYMLINK_BYTES ? 0 :
+	    (blkcnt_t)(block_size / 512);
+	if (!S_ISLNK(st.st_mode) || st.st_size != (off_t)target_len ||
+	    st.st_blocks != blocks)
+		errx(1, "symlink inode shape mismatch for %s", path);
 	n = readlink(path, buf, sizeof(buf));
 	if (n == -1)
 		err(1, "readlink %s", path);
-	if ((size_t)n != strlen(target) || memcmp(buf, target, (size_t)n) != 0)
+	if ((size_t)n != target_len ||
+	    memcmp(buf, target, (size_t)n) != 0)
 		errx(1, "symlink target mismatch for %s", path);
 }
 

@@ -661,6 +661,17 @@ directory replacement across remount.  On 2026-09-27, the rebuilt and
 booted production kernel passed the complete ext4fs regression matrix
 with this path active.
 
+The symlink conversion is complete.  It shares the new-inode
+transaction used by `create` and `mknod`.  Fast targets are stored in
+the journaled inode before their name becomes visible.  Block-backed
+targets allocate their data block and extent in the same transaction,
+and write the target to its home block before the metadata commit
+exposes it.  The ordinary-operation regression checks both inode forms,
+exact size and block accounting, target contents after remount, and
+offline `e2fsck -fn` acceptance.  On 2026-09-27, the complete ext4fs
+regression matrix passed against the rebuilt and booted production
+kernel with this path active.
+
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only
 for regular-file data, the journal's own I/O, recovery, checkpointing,
 or another explicitly documented exception.
@@ -672,7 +683,7 @@ Wrap each compound namespace operation in one transaction:
 - [x] unlink;
 - [x] mkdir and rmdir;
 - [x] rename;
-- [ ] symlink;
+- [x] symlink;
 - [x] truncate and extent allocation/free for supported depth-0 and
       depth-1 regular-file extent trees.
 
