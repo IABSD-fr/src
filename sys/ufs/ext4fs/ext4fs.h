@@ -68,6 +68,9 @@ struct ext4fs_runtime_orphan;
 #define EXT4FS_SUPER_BLOCK_SIZE		1024
 #define EXT4FS_VOLUME_NAME_MAX		16
 
+#define EXT4FS_BGD_SIZE_32		32
+#define EXT4FS_BGD_SIZE_64		64
+
 #define	EXT4FS_DIRECT_ADDR_IN_INODE	12
 #define	EXT4FS_INDIRECT_ADDR_IN_INODE	3
 #define EXT4FS_SYMLINK_LEN_MAX \
@@ -716,12 +719,15 @@ int	ext4fs_sbcheck (struct ext4fs *, int);
 int	ext4fs_block_group_has_super_block (int);
 u_int64_t	ext4fs_bgd_get_block (struct m_ext4fs *,
     struct ext4fs_block_group_descriptor *, unsigned int);
+int	ext4fs_bgd_location (struct m_ext4fs *, u_int32_t,
+    u_int64_t *, size_t *);
 int	ext4fs_mountfs (struct vnode *, struct mount *, struct proc *);
 void	ext4fs_sbload (struct ext4fs *, struct m_ext4fs *);
 int	ext4fs_sbfill (struct vnode *, struct m_ext4fs *);
 
 /* Writes */
-int	ext4fs_bgd_write (struct m_ext4fs *, struct vnode *, u_int32_t);
+int	ext4fs_bgd_write_direct (struct m_ext4fs *, struct vnode *,
+    u_int32_t);
 int	ext4fs_bgd_write_handle (struct m_ext4fs *, struct vnode *,
     u_int32_t, struct ext4fs_journal_handle *);
 int	ext4fs_sbwrite (struct mount *);

@@ -142,6 +142,32 @@ ext4fs_bgd_get_block (struct m_ext4fs *fs,
 	return (block);
 }
 
+/*
+ * Locate a group descriptor in the primary descriptor table.  The
+ * in-memory array always uses the complete structure, while an ext4
+ * filesystem without the 64BIT feature stores 32-byte descriptors.
+ */
+int
+ext4fs_bgd_location (struct m_ext4fs *fs, u_int32_t group,
+    u_int64_t *block, size_t *offset)
+{
+	u_int32_t per_block, size;
+
+	if (group >= fs->m_block_group_count)
+		return (EINVAL);
+	size = fs->m_block_group_descriptor_size;
+	if (size != EXT4FS_BGD_SIZE_32 &&
+	    size != EXT4FS_BGD_SIZE_64)
+		return (EINVAL);
+	per_block = fs->m_block_size / size;
+	if (per_block == 0)
+		return (EINVAL);
+	*block = (u_int64_t)fs->m_first_data_block + 1 +
+	    group / per_block;
+	*offset = (size_t)(group % per_block) * size;
+	return (0);
+}
+
 int
 ext4fs_fhtovp (struct mount *mp, struct fid *fhp, struct vnode **vpp)
 {
@@ -495,6 +521,8 @@ out:
 int
 ext4fs_sbcheck (struct ext4fs *sble, int ronly)
 {
+	u_int16_t desc_size;
+	u_int32_t incompat;
 	u_int32_t mask, tmp;
 	int i;
 
@@ -550,14 +578,18 @@ ext4fs_sbcheck (struct ext4fs *sble, int ronly)
 		return (EINVAL);
 	}
 
-	tmp = letoh32(sble->sb_block_group_descriptor_size);
-	if (tmp != sizeof(struct ext4fs_block_group_descriptor)) {
+	incompat = letoh32(sble->sb_feature_incompat);
+	desc_size = letoh16(sble->sb_block_group_descriptor_size);
+	if (((incompat & EXT4FS_FEATURE_INCOMPAT_64BIT) &&
+	    desc_size != EXT4FS_BGD_SIZE_64) ||
+	    (!(incompat & EXT4FS_FEATURE_INCOMPAT_64BIT) &&
+	    desc_size != 0 && desc_size != EXT4FS_BGD_SIZE_32)) {
 		printf("ext4fs: block group descriptor size is 0x%x\n",
-		       tmp);
+		    desc_size);
 		return (EINVAL);
 	}
 
-	tmp = letoh32(sble->sb_feature_incompat);
+	tmp = incompat;
 	mask = tmp & ~EXT4FS_FEATURE_INCOMPAT_SUPPORTED;
 	if (mask) {
 		printf("ext4fs: unsupported incompat features: 0x%x ",
@@ -605,10 +637,11 @@ ext4fs_sbfill (struct vnode *devvp, struct m_ext4fs *mfs)
 	struct ext4fs_dinode *rdp;
 	struct buf *bp;
 	daddr_t dblk;
-	u_int64_t ritb, rblk;
+	u_int64_t first, ritb, rblk;
+	u_int32_t desc_size, descs_per_block, i, j, ndesc;
 	u_int32_t rgroup, rindex, roff;
 	size_t gd_size;
-	int error, i;
+	int error;
 
 	mfs->m_block_group_count = howmany(mfs->m_blocks_count -
 					   mfs->m_first_data_block,
@@ -617,10 +650,20 @@ ext4fs_sbfill (struct vnode *devvp, struct m_ext4fs *mfs)
 	mfs->m_block_size_shift = EXT4FS_LOG_MIN_BLOCK_SIZE +
 		mfs->m_log_block_size;
 	mfs->m_block_size = 1 << mfs->m_block_size_shift;
+	desc_size = mfs->m_block_group_descriptor_size;
+	if (desc_size != EXT4FS_BGD_SIZE_32 &&
+	    desc_size != EXT4FS_BGD_SIZE_64)
+		return (EINVAL);
+	descs_per_block = mfs->m_block_size / desc_size;
+	if (mfs->m_block_group_count == 0 ||
+	    mfs->m_block_group_count > UINT32_MAX ||
+	    descs_per_block == 0 ||
+	    mfs->m_block_group_count > (size_t)-1 /
+	    sizeof(struct ext4fs_block_group_descriptor))
+		return (EFBIG);
 	mfs->m_block_group_descriptor_blocks_count =
 		howmany(mfs->m_block_group_count,
-			mfs->m_block_size /
-			sizeof(struct ext4fs_block_group_descriptor));
+		    descs_per_block);
 	mfs->m_fs_block_to_disk_block = mfs->m_log_block_size + 1;
 	mfs->m_inodes_per_block = mfs->m_block_size / mfs->m_inode_size;
 	mfs->m_inode_table_blocks_per_group = mfs->m_inodes_per_group /
@@ -629,20 +672,15 @@ ext4fs_sbfill (struct vnode *devvp, struct m_ext4fs *mfs)
 	gd_size = mfs->m_block_group_count *
 	    sizeof(struct ext4fs_block_group_descriptor);
 	mfs->m_gd = malloc(gd_size, M_UFSMNT, M_WAITOK);
+	memset(mfs->m_gd, 0, gd_size);
 
-	dblk = (mfs->m_first_data_block + 1) <<
-	    mfs->m_fs_block_to_disk_block;
+	dblk = (daddr_t)EXT4FS_FSBTODB(mfs,
+	    (u_int64_t)mfs->m_first_data_block + 1);
 	for (i = 0;
 	    i < mfs->m_block_group_descriptor_blocks_count; i++) {
-		size_t off = (size_t)i * mfs->m_block_size;
-		size_t n = mfs->m_block_size;
-
-		/* Don't copy past end of m_gd allocation */
-		if (off + n > gd_size)
-			n = gd_size - off;
-
 		error = bread(devvp,
-		    dblk + (i << mfs->m_fs_block_to_disk_block),
+		    dblk + ((daddr_t)i <<
+		    mfs->m_fs_block_to_disk_block),
 		    mfs->m_block_size, &bp);
 		if (error) {
 			printf("ext4fs_sbfill: failed to read "
@@ -652,7 +690,14 @@ ext4fs_sbfill (struct vnode *devvp, struct m_ext4fs *mfs)
 			mfs->m_gd = NULL;
 			return (error);
 		}
-		memcpy((char *)mfs->m_gd + off, bp->b_data, n);
+		first = (u_int64_t)i * descs_per_block;
+		ndesc = descs_per_block;
+		if (ndesc > mfs->m_block_group_count - first)
+			ndesc = mfs->m_block_group_count - first;
+		for (j = 0; j < ndesc; j++)
+			memcpy(&mfs->m_gd[first + j],
+			    (char *)bp->b_data + j * desc_size,
+			    desc_size);
 		brelse(bp);
 	}
 
@@ -747,8 +792,12 @@ ext4fs_sbload (struct ext4fs *sble, struct m_ext4fs *dest)
 	dest->m_journal_device_number =
 	    letoh32(sble->sb_journal_device_number);
 	dest->m_last_orphan = letoh32(sble->sb_last_orphan);
-	dest->m_block_group_descriptor_size =
-	    letoh16(sble->sb_block_group_descriptor_size);
+	if (feature_incompat_64bit)
+		dest->m_block_group_descriptor_size =
+		    letoh16(sble->sb_block_group_descriptor_size);
+	else
+		dest->m_block_group_descriptor_size =
+		    EXT4FS_BGD_SIZE_32;
 	dest->m_default_mount_opts =
 	    letoh32(sble->sb_default_mount_opts);
 	dest->m_first_meta_block_group =
@@ -865,27 +914,28 @@ ext4fs_statfs (struct mount *mp, struct statfs *sbp, struct proc *p)
  * Write a block group descriptor back to disk with updated checksum.
  */
 int
-ext4fs_bgd_write (struct m_ext4fs *fs, struct vnode *devvp,
+ext4fs_bgd_write_direct (struct m_ext4fs *fs, struct vnode *devvp,
     u_int32_t group)
 {
-	struct buf *bp;
+	struct buf *bp = NULL;
 	struct ext4fs_block_group_descriptor *gd;
-	u_int32_t bgds_per_block, bgd_block, bgd_off;
+	u_int64_t fsblock;
+	size_t bgd_off, size;
 	daddr_t dblk;
 	int error;
 
-	bgds_per_block = fs->m_block_size /
-	    sizeof(struct ext4fs_block_group_descriptor);
-	bgd_block = group / bgds_per_block;
-	bgd_off = (group % bgds_per_block) *
-	    sizeof(struct ext4fs_block_group_descriptor);
-
-	dblk = (fs->m_first_data_block + 1 + bgd_block) <<
-	    fs->m_fs_block_to_disk_block;
+	if (fs->m_journal != NULL)
+		return (EIO);
+	error = ext4fs_bgd_location(fs, group, &fsblock, &bgd_off);
+	if (error)
+		return (error);
+	size = fs->m_block_group_descriptor_size;
+	dblk = (daddr_t)EXT4FS_FSBTODB(fs, fsblock);
 
 	error = bread(devvp, dblk, fs->m_block_size, &bp);
 	if (error) {
-		brelse(bp);
+		if (bp != NULL)
+			brelse(bp);
 		return (error);
 	}
 
@@ -894,8 +944,7 @@ ext4fs_bgd_write (struct m_ext4fs *fs, struct vnode *devvp,
 	gd->bgd_checksum = htole16(ext4fs_bgd_csum(fs, gd, group));
 
 	/* Copy to buffer and write */
-	memcpy((char *)bp->b_data + bgd_off, gd,
-	    sizeof(struct ext4fs_block_group_descriptor));
+	memcpy((char *)bp->b_data + bgd_off, gd, size);
 
 	bdwrite(bp);
 	return (0);
@@ -908,34 +957,30 @@ ext4fs_bgd_write_handle (struct m_ext4fs *fs, struct vnode *devvp,
 	struct ext4fs_block_group_descriptor saved, *gd;
 	struct buf *bp;
 	u_int64_t fsblock;
-	u_int32_t bgds_per_block, bgd_block, bgd_off;
 	u_int16_t saved_checksum;
+	size_t bgd_off, size;
 	int error;
 
-	if (handle == NULL || group >= fs->m_block_group_count)
+	if (handle == NULL)
 		return (EINVAL);
-	bgds_per_block = fs->m_block_size /
-	    sizeof(struct ext4fs_block_group_descriptor);
-	if (bgds_per_block == 0)
-		return (EINVAL);
-	bgd_block = group / bgds_per_block;
-	bgd_off = (group % bgds_per_block) *
-	    sizeof(struct ext4fs_block_group_descriptor);
-	fsblock = (u_int64_t)fs->m_first_data_block + 1 + bgd_block;
+	error = ext4fs_bgd_location(fs, group, &fsblock, &bgd_off);
+	if (error)
+		return (error);
+	size = fs->m_block_group_descriptor_size;
 
 	error = ext4fs_journal_get_metadata(handle, devvp, fsblock,
 	    &bp);
 	if (error)
 		return (error);
-	memcpy(&saved, (char *)bp->b_data + bgd_off, sizeof(saved));
+	memcpy(&saved, (char *)bp->b_data + bgd_off, size);
 	gd = &fs->m_gd[group];
 	saved_checksum = gd->bgd_checksum;
 	gd->bgd_checksum = htole16(ext4fs_bgd_csum(fs, gd, group));
-	memcpy((char *)bp->b_data + bgd_off, gd, sizeof(*gd));
+	memcpy((char *)bp->b_data + bgd_off, gd, size);
 	error = ext4fs_journal_dirty_metadata(handle, bp);
 	if (error) {
 		memcpy((char *)bp->b_data + bgd_off, &saved,
-		    sizeof(saved));
+		    size);
 		gd->bgd_checksum = saved_checksum;
 	}
 	return (error);
@@ -1222,7 +1267,8 @@ ext4fs_inode_alloc (struct inode *pip, mode_t mode, struct ucred *cred,
 					    0xFFFF);
 				}
 
-				ext4fs_bgd_write(fs, pip->i_devvp, g);
+				ext4fs_bgd_write_direct(fs,
+				    pip->i_devvp, g);
 
 				/* Update superblock counters */
 				fs->m_free_inodes_count--;
@@ -1764,7 +1810,7 @@ ext4fs_inode_free (struct inode *pip, ufsino_t ino, mode_t mode)
 			    htole16((dirs >> 16) & 0xFFFF);
 	}
 
-	ext4fs_bgd_write(fs, pip->i_devvp, group);
+	ext4fs_bgd_write_direct(fs, pip->i_devvp, group);
 
 	/* Update superblock counters */
 	fs->m_free_inodes_count++;

@@ -1,8 +1,8 @@
 #!/bin/sh
 #
-# Exercise ordinary ext4fs operations through the production kernel.  Every
-# stage is followed by an offline e2fsck pass so failures are attributed to the
-# operation batch that caused them.
+# Exercise ordinary ext4fs operations through the production kernel.
+# Every stage is followed by an offline e2fsck pass so failures are
+# attributed to the operation batch that caused them.
 
 set -eu
 
@@ -22,8 +22,9 @@ EXT4FS_BLOCK_SIZES=${EXT4FS_BLOCK_SIZES:-"1024 2048 4096"}
 EXT4FSOPS_MODE=${EXT4FSOPS_MODE:-full}
 
 for tool in "$MKE2FS" "$E2FSCK" "$DEBUGFS" "$DUMPE2FS" \
-    "$VNCONFIG" "$MOUNT_EXT4FS" \
-    "$UMOUNT" "$TIMEOUT" "$EXT4FSOPS" dd hexdump id sha256; do
+	    "$VNCONFIG" "$MOUNT_EXT4FS" \
+	    "$UMOUNT" "$TIMEOUT" "$EXT4FSOPS" cmp dd diff hexdump id \
+	    rmdir sha256; do
 	if ! command -v "$tool" >/dev/null 2>&1; then
 		echo "SKIPPED: ext4fs operations regress requires $tool"
 		exit 0
@@ -119,7 +120,8 @@ run_step()
 group_free_blocks()
 {
 	group_number=$1
-	"$DUMPE2FS" "$image" 2>/dev/null | awk -v group="$group_number:" '
+	"$DUMPE2FS" "$image" 2>/dev/null |
+	    awk -v group="$group_number:" '
 	    $1 == "Group" && $2 == group { selected = 1; next }
 	    selected && /free blocks,/ { print $1; exit }
 	'
@@ -147,7 +149,8 @@ mount_image()
 {
 	options=$1
 	if [ -n "$options" ]; then
-		"$MOUNT_EXT4FS" -o "$options" "/dev/${vnd}c" "$mountpoint" ||
+		"$MOUNT_EXT4FS" -o "$options" "/dev/${vnd}c" \
+		    "$mountpoint" ||
 		    fail "mount_ext4fs failed"
 	else
 		"$MOUNT_EXT4FS" "/dev/${vnd}c" "$mountpoint" ||
@@ -161,7 +164,8 @@ unmount_image()
 	stage=$1
 	if ! "$UMOUNT" "$mountpoint"; then
 		if command -v "$PSTAT" >/dev/null 2>&1; then
-			"$PSTAT" -v >"$case_dir/pstat-unmount.log" 2>&1 || :
+			"$PSTAT" -v \
+			    >"$case_dir/pstat-unmount.log" 2>&1 || :
 			awk -v mountpoint="$mountpoint" '
 			    /^\*\*\* MOUNT / {
 				if (printing)
@@ -223,6 +227,19 @@ inode_probe_number()
 	printf '%s\n' "$inode_number"
 }
 
+group_descriptor_counts()
+{
+	"$DUMPE2FS" "$image" 2>/dev/null | awk '
+	    $1 == "Group" {
+		group = $2
+		sub(/:$/, "", group)
+	    }
+	    /free blocks, .*free inodes, .*directories/ {
+		print group, $1, $4, $7
+	    }
+	'
+}
+
 xattr_block()
 {
 	xattr_path=$1
@@ -237,12 +254,12 @@ prepare_xattr_fixture()
 	xattr_commands=$case_dir/xattr.debugfs
 	dd if=/dev/zero of="$xattr_value" bs=1 count=300 status=none
 	{
-		printf 'ea_set -f %s /tree/xattr-unique user.regress\n' \
-		    "$xattr_value"
-		printf 'ea_set -f %s /tree/xattr-shared-a user.regress\n' \
-		    "$xattr_value"
-		printf 'ea_set -f %s /tree/xattr-shared-b user.regress\n' \
-		    "$xattr_value"
+		printf 'ea_set -f %s %s user.regress\n' \
+		    "$xattr_value" /tree/xattr-unique
+		printf 'ea_set -f %s %s user.regress\n' \
+		    "$xattr_value" /tree/xattr-shared-a
+		printf 'ea_set -f %s %s user.regress\n' \
+		    "$xattr_value" /tree/xattr-shared-b
 	} >"$xattr_commands"
 	if ! "$DEBUGFS" -w -f "$xattr_commands" "$image" \
 	    >"$case_dir/debugfs-xattr.log" 2>&1; then
@@ -263,8 +280,9 @@ prepare_xattr_fixture()
 	[ "$unique_block" -ne "$shared_a_block" ] &&
 	    [ "$shared_a_block" -ne "$shared_b_block" ] ||
 	    fail "fresh xattr blocks unexpectedly alias"
-	if ! "$DEBUGFS" -w -R \
-	    "set_inode_field /tree/xattr-shared-b file_acl $shared_a_block" \
+	share_command="set_inode_field /tree/xattr-shared-b"
+	share_command="$share_command file_acl $shared_a_block"
+	if ! "$DEBUGFS" -w -R "$share_command" \
 	    "$image" >"$case_dir/debugfs-xattr-share.log" 2>&1; then
 		cat "$case_dir/debugfs-xattr-share.log" >&2
 		fail "could not construct shared xattr fixture"
@@ -349,8 +367,10 @@ run_case()
 	detach_image
 	check_image mutate
 	if [ "$orphan_format" = orphan-file ]; then
-		"$DUMPE2FS" "$image" >"$case_dir/dumpe2fs-after-mutate.log" \
-		    2>&1 || fail "dumpe2fs rejected the mutated orphan-file image"
+		if ! "$DUMPE2FS" "$image" \
+		    >"$case_dir/dumpe2fs-after-mutate.log" 2>&1; then
+			fail "dumpe2fs rejected mutated orphan image"
+		fi
 		if grep -q '^Filesystem features:.*orphan_present' \
 		    "$case_dir/dumpe2fs-after-mutate.log"; then
 			fail "clean close retained ORPHAN_PRESENT"
@@ -371,7 +391,8 @@ run_case()
 	unmount_image read-only
 	detach_image
 	after=$(sha256 -q "$image")
-	[ "$before" = "$after" ] || fail "read-only mount changed the image"
+	[ "$before" = "$after" ] ||
+	    fail "read-only mount changed the image"
 	check_image read-only
 
 	echo " ok"
@@ -390,7 +411,8 @@ run_flex_uninit_case()
 	dd if=/dev/zero of="$image" bs=1m count=0 \
 	    seek="$EXT4FS_IMAGE_MB" status=none
 	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b 1024 \
-	    -O '^orphan_file' "$image" >"$case_dir/mke2fs.log" 2>&1; then
+	    -O '^orphan_file' "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
 		cat "$case_dir/mke2fs.log" >&2
 		fail "mke2fs failed"
 	fi
@@ -409,10 +431,12 @@ run_flex_uninit_case()
 	*[!0-9:]*) fail "could not read group free-block counts" ;;
 	esac
 	reserve_count=$((free0 + free1))
-	[ "$reserve_count" -gt 0 ] || fail "fixture has no blocks to reserve"
+	[ "$reserve_count" -gt 0 ] ||
+	    fail "fixture has no blocks to reserve"
+	reserve_last=$((reserve_count - 1))
 	{
 		printf 'write %s /reservoir\n' "$empty"
-		printf 'fallocate /reservoir 0 %s\n' $((reserve_count - 1))
+		printf 'fallocate /reservoir 0 %s\n' "$reserve_last"
 	} >"$case_dir/debugfs.cmd"
 	if ! "$DEBUGFS" -w -f "$case_dir/debugfs.cmd" "$image" \
 	    >"$case_dir/debugfs.log" 2>&1; then
@@ -442,16 +466,20 @@ run_flex_uninit_case()
 	    "$case_dir/dumpe2fs-after.log"; then
 		fail "kernel did not initialize block group 2"
 	fi
-	probe_blocks=$($DEBUGFS -R 'blocks /allocation-probe' "$image" \
-	    2>/dev/null) || fail "could not locate allocation probe blocks"
+	probe_blocks=$(
+	    "$DEBUGFS" -R 'blocks /allocation-probe' "$image" \
+		2>/dev/null
+	) || fail "could not locate allocation probe blocks"
 	set -- $probe_blocks
-	[ "$#" -eq 2 ] || fail "allocation probe does not use two blocks"
+	[ "$#" -eq 2 ] ||
+	    fail "allocation probe does not use two blocks"
 	for probe_block in "$@"; do
 		case "$probe_block" in
 		*[!0-9]*|'') fail "invalid allocation probe block" ;;
 		esac
-		[ "$probe_block" -ge 16385 ] && [ "$probe_block" -le 24576 ] ||
-		    fail "allocation probe block is outside block group 2"
+		[ "$probe_block" -ge 16385 ] &&
+		    [ "$probe_block" -le 24576 ] ||
+		    fail "allocation probe block is outside group 2"
 	done
 
 	attach_image
@@ -573,11 +601,14 @@ run_inode_bitmap_case()
 	    fail "inode allocation did not advance the journal sequence"
 	check_image inode-allocate
 	if [ "$block_size" -eq 1024 ]; then
-		"$DUMPE2FS" "$image" >"$case_dir/dumpe2fs-allocate.log" \
-		    2>&1 || fail "dumpe2fs rejected the allocated image"
+		if ! "$DUMPE2FS" "$image" \
+		    >"$case_dir/dumpe2fs-allocate.log" 2>&1; then
+			fail "dumpe2fs rejected the allocated image"
+		fi
 		if grep -q '^Group 1:.*INODE_UNINIT' \
 		    "$case_dir/dumpe2fs-allocate.log"; then
-			fail "kernel did not initialize inode bitmap group 1"
+			reason="group 1 inode bitmap is uninitialized"
+			fail "$reason"
 		fi
 	fi
 	first_inode=$(inode_probe_number)
@@ -627,6 +658,92 @@ run_inode_bitmap_case()
 	unmount_image inode-final
 	detach_image
 	check_image inode-final
+	echo " ok"
+}
+
+run_bgd_case()
+{
+	block_size=$1
+	descriptor_size=$2
+	case_dir=$work/bgd-$descriptor_size-$block_size
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	test_name="group descriptors $descriptor_size-byte "
+	test_name="$test_name($block_size byte blocks)"
+	print_test_name "$test_name"
+
+	case "$descriptor_size" in
+	32) features='metadata_csum,^64bit,^orphan_file' ;;
+	64) features='metadata_csum,^orphan_file' ;;
+	*) fail "unsupported descriptor size: $descriptor_size" ;;
+	esac
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O "$features" "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs failed"
+	fi
+	"$DUMPE2FS" -h "$image" >"$case_dir/dumpe2fs.log" \
+	    2>&1 || fail "dumpe2fs rejected the fresh image"
+	if [ "$descriptor_size" -eq 64 ]; then
+		grep -q '^Filesystem features:.*64bit' \
+		    "$case_dir/dumpe2fs.log" ||
+		    fail "fixture does not use 64-byte descriptors"
+		grep -q '^Group descriptor size: *64$' \
+		    "$case_dir/dumpe2fs.log" ||
+		    fail "fixture descriptor size is not 64"
+	elif grep -q '^Filesystem features:.*64bit' \
+	    "$case_dir/dumpe2fs.log"; then
+		fail "fixture does not use 32-byte descriptors"
+	fi
+	group_descriptor_counts >"$case_dir/counts-before"
+	[ -s "$case_dir/counts-before" ] ||
+	    fail "could not read group descriptor counters"
+	sequence_before=$(journal_sequence)
+
+	attach_image
+	mount_image ""
+	run_step bitmap-allocate "$mountpoint/bgd"
+	unmount_image bgd-allocate
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "allocation did not advance the journal sequence"
+	check_image bgd-allocate
+	sequence_before=$sequence_after
+
+	attach_image
+	mount_image ""
+	run_step bitmap-verify "$mountpoint/bgd"
+	run_step bitmap-retire "$mountpoint/bgd"
+	if ! "$TIMEOUT" -k 2 "$EXT4FS_TIMEOUT" \
+	    rmdir "$mountpoint/bgd" \
+	    >"$case_dir/rmdir.log" 2>&1; then
+		cat "$case_dir/rmdir.log" >&2
+		fail "descriptor probe directory removal failed"
+	fi
+	unmount_image bgd-retire
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "retirement did not advance the journal sequence"
+	check_image bgd-retire
+	group_descriptor_counts >"$case_dir/counts-after"
+	cmp -s "$case_dir/counts-before" "$case_dir/counts-after" || {
+		diff -u "$case_dir/counts-before" \
+		    "$case_dir/counts-after" >&2 || :
+		fail "group descriptor counters were not restored"
+	}
+
+	attach_image
+	mount_image ""
+	[ ! -e "$mountpoint/bgd" ] ||
+	    fail "retired descriptor probe survived remount"
+	unmount_image bgd-final
+	detach_image
+	check_image bgd-final
 	echo " ok"
 }
 
@@ -694,6 +811,21 @@ inode-bitmap)
 			;;
 		esac
 		run_inode_bitmap_case "$block_size"
+	done
+	exit 0
+	;;
+bgd)
+	for descriptor_size in 32 64; do
+		for block_size in $EXT4FS_BLOCK_SIZES; do
+			case "$block_size" in
+			1024|2048|4096) ;;
+			*)
+				echo "bad block size: $block_size" >&2
+				exit 1
+				;;
+			esac
+			run_bgd_case "$block_size" "$descriptor_size"
+		done
 	done
 	exit 0
 	;;

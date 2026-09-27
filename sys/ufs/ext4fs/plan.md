@@ -510,7 +510,7 @@ journal handle. This includes:
 - [x] inode-table blocks and inode timestamps;
 - [x] block bitmaps;
 - [x] inode bitmaps;
-- [ ] block-group descriptors;
+- [x] block-group descriptors;
 - [ ] extent-tree roots, index blocks, and leaf blocks;
 - [ ] directory blocks and checksum tails;
 - [ ] orphan-list and orphan-file updates;
@@ -699,6 +699,24 @@ block and inode accounting across remount, and passes offline
 `e2fsck -fn`.  On 2026-09-27, this matrix passed against the booted
 production kernel, including `INODE_UNINIT` reconstruction, together
 with the ordinary, block-bitmap, and special-inode suites.
+
+The block-group descriptor writer audit and production-kernel gate are
+complete.  Mount now accepts both ext4 descriptor
+formats: 32-byte descriptors without the `64bit` feature and 64-byte
+descriptors with it.  Each on-disk descriptor is unpacked into the full
+in-memory structure, and every writer copies only the selected on-disk
+width.  One shared location helper is used by journaled, journal-less,
+and restartable-recovery writes.  Runtime journal mounts use only the
+handle-owned writer; the journal-less writer is named and guarded as a
+direct path.  The focused `run-regress-ext4fsops-bgd` target covers
+both descriptor formats with 1 KiB, 2 KiB, and 4 KiB blocks.  It checks
+allocation and complete retirement, JBD2 sequence advancement,
+per-group counter restoration, remount persistence, descriptor
+checksums, and offline `e2fsck -fn`.  On 2026-09-27, all six descriptor
+format and block-size combinations passed against the rebuilt booted
+production kernel.  The ordinary, block-bitmap, inode-bitmap, and
+special-inode suites passed in the same run, so this checklist item is
+complete.
 
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only
 for regular-file data, the journal's own I/O, recovery, checkpointing,

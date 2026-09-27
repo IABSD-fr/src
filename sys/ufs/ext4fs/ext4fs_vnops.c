@@ -829,7 +829,8 @@ ext4fs_blkalloc_direct (struct inode *ip, u_int64_t goal,
 					    (free_blocks >> 16) &
 					    0xFFFF);
 
-				ext4fs_bgd_write(fs, ip->i_devvp, g);
+				ext4fs_bgd_write_direct(fs,
+				    ip->i_devvp, g);
 
 				/* Update superblock counters */
 				fs->m_free_blocks_count -= nalloced;
@@ -1162,7 +1163,7 @@ ext4fs_blkfree_direct (struct inode *ip, u_int64_t bno)
 		gd->bgd_free_blocks_count_hi =
 		    htole16((free_blocks >> 16) & 0xFFFF);
 
-	ext4fs_bgd_write(fs, ip->i_devvp, group);
+	ext4fs_bgd_write_direct(fs, ip->i_devvp, group);
 
 	/* Update superblock counters */
 	fs->m_free_blocks_count++;
@@ -2123,7 +2124,7 @@ ext4fs_free_extents_direct (struct inode *ip,
 				gd->bgd_free_blocks_count_hi =
 				    htole16((free_blocks >> 16) &
 				    0xFFFF);
-			ext4fs_bgd_write(fs, ip->i_devvp, group);
+			ext4fs_bgd_write_direct(fs, ip->i_devvp, group);
 
 			fs->m_free_blocks_count += n;
 			fs->m_sble.sb_free_blocks_count_lo =

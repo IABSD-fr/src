@@ -615,17 +615,16 @@ ext4fs_orphan_bgd_write (struct m_ext4fs *fs, struct vnode *devvp,
 {
 	struct ext4fs_block_group_descriptor *gd;
 	struct buf *bp = NULL;
-	u_int32_t per_block, block, offset;
+	u_int64_t fsblock;
+	size_t offset, size;
 	daddr_t dblk;
 	int error;
 
-	per_block = fs->m_block_size /
-	    sizeof(struct ext4fs_block_group_descriptor);
-	block = group / per_block;
-	offset = (group % per_block) *
-	    sizeof(struct ext4fs_block_group_descriptor);
-	dblk = (fs->m_first_data_block + 1 + block) <<
-	    fs->m_fs_block_to_disk_block;
+	error = ext4fs_bgd_location(fs, group, &fsblock, &offset);
+	if (error)
+		return (error);
+	size = fs->m_block_group_descriptor_size;
+	dblk = (daddr_t)EXT4FS_FSBTODB(fs, fsblock);
 	error = bread(devvp, dblk, fs->m_block_size, &bp);
 	if (error) {
 		if (bp != NULL)
@@ -634,7 +633,7 @@ ext4fs_orphan_bgd_write (struct m_ext4fs *fs, struct vnode *devvp,
 	}
 	gd = &fs->m_gd[group];
 	gd->bgd_checksum = htole16(ext4fs_bgd_csum(fs, gd, group));
-	memcpy((char *)bp->b_data + offset, gd, sizeof(*gd));
+	memcpy((char *)bp->b_data + offset, gd, size);
 	return (bwrite(bp));
 }
 
