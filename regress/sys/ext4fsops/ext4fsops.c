@@ -121,6 +121,8 @@ static void	retire_bitmap_probe (void);
 static void	allocate_inode_probe (void);
 static void	verify_inode_probe (void);
 static void	free_inode_probe (void);
+static void	reject_block_counter (void);
+static void	reject_inode_counter (void);
 
 static void
 make_path (char *path, size_t pathlen, const char *suffix)
@@ -2515,6 +2517,77 @@ free_inode_probe (void)
 	check_absent(path);
 }
 
+static void
+reject_block_counter (void)
+{
+	struct stat st;
+	struct statfs after, before;
+	char path[PATH_MAX];
+	char value;
+	ssize_t n;
+	int fd, saved_errno;
+
+	make_path(path, sizeof(path), "counter-block-probe");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (!S_ISREG(st.st_mode) || st.st_size != 0 || st.st_blocks != 0)
+		errx(1, "counter block probe has wrong shape");
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before rejected block allocation");
+	value = 'x';
+	errno = 0;
+	n = pwrite(fd, &value, sizeof(value), 0);
+	saved_errno = errno;
+	if (n != -1)
+		errx(1, "bad block counter allowed allocation");
+	if (saved_errno != EIO)
+		errx(1, "bad block counter failed with %s",
+		    strerror(saved_errno));
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat rejected block allocation");
+	if (st.st_size != 0 || st.st_blocks != 0)
+		errx(1, "rejected block allocation changed the file");
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after rejected block allocation");
+	if (after.f_bfree != before.f_bfree ||
+	    after.f_ffree != before.f_ffree)
+		errx(1, "rejected block allocation changed counters");
+}
+
+static void
+reject_inode_counter (void)
+{
+	struct statfs after, before;
+	char path[PATH_MAX];
+	int fd, saved_errno;
+
+	make_path(path, sizeof(path), "counter-inode-probe");
+	check_absent(path);
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before rejected inode allocation");
+	errno = 0;
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	saved_errno = errno;
+	if (fd != -1) {
+		(void)close(fd);
+		errx(1, "bad inode counter allowed allocation");
+	}
+	if (saved_errno != EIO)
+		errx(1, "bad inode counter failed with %s",
+		    strerror(saved_errno));
+	check_absent(path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after rejected inode allocation");
+	if (after.f_bfree != before.f_bfree ||
+	    after.f_ffree != before.f_ffree)
+		errx(1, "rejected inode allocation changed counters");
+}
+
 int
 main (int argc, char **argv)
 {
@@ -2618,6 +2691,10 @@ main (int argc, char **argv)
 			verify_inode_probe();
 		else if (strcmp(argv[1], "inode-free") == 0)
 			free_inode_probe();
+		else if (strcmp(argv[1], "counter-reject-block") == 0)
+			reject_block_counter();
+		else if (strcmp(argv[1], "counter-reject-inode") == 0)
+			reject_inode_counter();
 		else if (strcmp(argv[1], "inode-reuse") == 0)
 			allocate_inode_probe();
 		else if (strcmp(argv[1],

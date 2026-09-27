@@ -514,7 +514,7 @@ journal handle. This includes:
 - [x] extent-tree roots, index blocks, and leaf blocks;
 - [x] directory blocks and checksum tails;
 - [x] orphan-list and orphan-file updates;
-- [ ] allocation and free counters;
+- [x] allocation and free counters;
 - [ ] the ext4 superblock.
 
 The first Phase 4 path was validated on 2026-09-25 against the booted
@@ -784,6 +784,33 @@ second `bread()`.  The regression deliberately places the parent and
 first orphan in one inode-table block.  On 2026-09-27, the complete
 orphan target passed against the rebuilt and booted production kernel,
 including this shared-buffer case, so the checklist item is complete.
+
+The allocation and free-counter writer audit is complete.  Shared
+helpers now decode and encode free-block, free-inode, and used-directory
+counters for both 32-byte and 64-byte group descriptors.  After journal
+replay and restartable orphan cleanup, writable mounts reconcile every
+bounded group count with the ext4 superblock totals before starting the
+runtime journal.  Clean read-only mounts perform the same check.
+
+Before a runtime block or inode allocation or free changes metadata, it
+authenticates the selected bitmap and requires its exact free-bit count
+to match the group descriptor.  The bitmap, descriptor, global count,
+and ext4 superblock then enter one journal transaction.  VFS sync no
+longer bypasses that ownership by directly rewriting the superblock on
+a journaled mount.  Guarded journal-less paths and restartable recovery
+use the same descriptor counter helpers.
+
+The focused `run-regress-ext4fsops-counters` target exercises balanced
+block and inode allocation and retirement with 1 KiB, 2 KiB, and 4 KiB
+blocks.  It verifies journal advancement, exact restoration of group
+and superblock counters, and offline `e2fsck -fn` acceptance.  Validly
+checksummed inconsistent global and group counters fail mount without
+changing the image.  Fixtures whose forged group and superblock totals
+agree but disagree with the bitmap mount successfully, then reject the
+block or inode allocation without changing accounting or advancing the
+journal.  On 2026-09-27, the focused target and complete ext4fs suite
+passed against the rebuilt and booted production kernel, so this
+checklist item is complete.
 
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only
 for regular-file data, the journal's own I/O, recovery, checkpointing,

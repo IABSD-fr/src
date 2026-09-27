@@ -734,12 +734,8 @@ ext4fs_recovery_recount (struct mount *mp, int64_t dir_group)
 				valid = fs->m_blocks_per_group;
 		}
 		if (flags & EXT4FS_BGD_FLAG_BLOCK_UNINIT) {
-			free_count =
-			    letoh16(gd->bgd_free_blocks_count_lo);
-			if (fs->m_feature_incompat &
-			    EXT4FS_FEATURE_INCOMPAT_64BIT)
-				free_count |= (u_int32_t)letoh16(
-				    gd->bgd_free_blocks_count_hi) << 16;
+			free_count = ext4fs_bgd_get_count(fs, gd,
+			    EXT4FS_BGD_FREE_BLOCKS);
 		} else {
 			bitmap_block = ext4fs_bgd_get_block(fs, gd,
 			    EXT4FS_BGD_BLOCK_BITMAP);
@@ -765,12 +761,8 @@ ext4fs_recovery_recount (struct mount *mp, int64_t dir_group)
 				    htole16(checksum >> 16);
 			brelse(bp);
 			bp = NULL;
-			gd->bgd_free_blocks_count_lo =
-			    htole16(free_count & 0xffff);
-			if (fs->m_feature_incompat &
-			    EXT4FS_FEATURE_INCOMPAT_64BIT)
-				gd->bgd_free_blocks_count_hi =
-				    htole16(free_count >> 16);
+			ext4fs_bgd_set_count(fs, gd,
+			    EXT4FS_BGD_FREE_BLOCKS, free_count);
 		}
 		free_blocks += free_count;
 
@@ -787,12 +779,8 @@ ext4fs_recovery_recount (struct mount *mp, int64_t dir_group)
 		if (flags & EXT4FS_BGD_FLAG_INODE_UNINIT) {
 			if ((int64_t)group == dir_group)
 				return (EINVAL);
-			free_count =
-			    letoh16(gd->bgd_free_inodes_count_lo);
-			if (fs->m_feature_incompat &
-			    EXT4FS_FEATURE_INCOMPAT_64BIT)
-				free_count |= (u_int32_t)letoh16(
-				    gd->bgd_free_inodes_count_hi) << 16;
+			free_count = ext4fs_bgd_get_count(fs, gd,
+			    EXT4FS_BGD_FREE_INODES);
 		} else {
 			bitmap_block = ext4fs_bgd_get_block(fs, gd,
 			    EXT4FS_BGD_INODE_BITMAP);
@@ -825,21 +813,13 @@ ext4fs_recovery_recount (struct mount *mp, int64_t dir_group)
 					brelse(bp);
 					return (error);
 				}
-				gd->bgd_used_dirs_count_lo =
-				    htole16(dirs & 0xffff);
-				if (fs->m_feature_incompat &
-				    EXT4FS_FEATURE_INCOMPAT_64BIT)
-					gd->bgd_used_dirs_count_hi =
-					    htole16(dirs >> 16);
+				ext4fs_bgd_set_count(fs, gd,
+				    EXT4FS_BGD_USED_DIRS, dirs);
 			}
 			brelse(bp);
 			bp = NULL;
-			gd->bgd_free_inodes_count_lo =
-			    htole16(free_count & 0xffff);
-			if (fs->m_feature_incompat &
-			    EXT4FS_FEATURE_INCOMPAT_64BIT)
-				gd->bgd_free_inodes_count_hi =
-				    htole16(free_count >> 16);
+			ext4fs_bgd_set_count(fs, gd,
+			    EXT4FS_BGD_FREE_INODES, free_count);
 		}
 		free_inodes64 += free_count;
 

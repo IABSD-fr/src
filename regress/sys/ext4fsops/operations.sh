@@ -127,6 +127,40 @@ group_free_blocks()
 	'
 }
 
+group_free_inodes()
+{
+	group_number=$1
+	"$DUMPE2FS" "$image" 2>/dev/null |
+	    awk -v group="$group_number:" '
+	    $1 == "Group" && $2 == group { selected = 1; next }
+	    selected && /free blocks,/ { print $4; exit }
+	'
+}
+
+super_free_blocks()
+{
+	"$DUMPE2FS" -h "$image" 2>/dev/null |
+	    awk '$1 == "Free" && $2 == "blocks:" { print $3; exit }'
+}
+
+super_free_inodes()
+{
+	"$DUMPE2FS" -h "$image" 2>/dev/null |
+	    awk '$1 == "Free" && $2 == "inodes:" { print $3; exit }'
+}
+
+filesystem_counts()
+{
+	"$DUMPE2FS" -h "$image" 2>/dev/null | awk '
+	    $1 == "Free" && $2 == "blocks:" { blocks = $3 }
+	    $1 == "Free" && $2 == "inodes:" { inodes = $3 }
+	    END {
+		if (blocks != "" && inodes != "")
+			print blocks, inodes
+	    }
+	'
+}
+
 attach_image()
 {
 	vnd_output=$($VNCONFIG "$image") || fail "vnconfig failed"
@@ -769,6 +803,274 @@ run_bgd_case()
 	echo " ok"
 }
 
+expect_counter_mount_failure()
+{
+	stage=$1
+	before=$(sha256 -q "$image")
+	attach_image
+	if "$TIMEOUT" -k 2 "$EXT4FS_TIMEOUT" \
+	    "$MOUNT_EXT4FS" "/dev/${vnd}c" "$mountpoint" \
+	    >"$case_dir/mount-$stage.log" 2>&1; then
+		mounted=1
+		fail "kernel accepted invalid counters"
+	fi
+	detach_image
+	after=$(sha256 -q "$image")
+	[ "$before" = "$after" ] ||
+	    fail "failed mount changed the counter fixture"
+}
+
+run_counter_case()
+{
+	block_size=$1
+	case_dir=$work/counters-$block_size
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	test_name="allocation/free counters ($block_size byte blocks)"
+	print_test_name "$test_name"
+
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O 'metadata_csum,^orphan_file' "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs failed"
+	fi
+	filesystem_counts >"$case_dir/super-before"
+	group_descriptor_counts >"$case_dir/groups-before"
+	[ -s "$case_dir/super-before" ] &&
+	    [ -s "$case_dir/groups-before" ] ||
+	    fail "could not read initial counters"
+	sequence_before=$(journal_sequence)
+
+	attach_image
+	mount_image ""
+	run_step bitmap-allocate "$mountpoint/counter-blocks"
+	run_step inode-allocate "$mountpoint/counter-inodes"
+	run_step inode-free "$mountpoint/counter-inodes"
+	run_step bitmap-retire "$mountpoint/counter-blocks"
+	rmdir "$mountpoint/counter-blocks" \
+	    "$mountpoint/counter-inodes" ||
+	    fail "could not retire counter directories"
+	unmount_image counters
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "counter transactions did not advance the journal"
+	check_image counters
+	filesystem_counts >"$case_dir/super-after"
+	group_descriptor_counts >"$case_dir/groups-after"
+	cmp -s "$case_dir/super-before" "$case_dir/super-after" || {
+		diff -u "$case_dir/super-before" \
+		    "$case_dir/super-after" >&2 || :
+		fail "superblock counters were not restored"
+	}
+	cmp -s "$case_dir/groups-before" \
+	    "$case_dir/groups-after" || {
+		diff -u "$case_dir/groups-before" \
+		    "$case_dir/groups-after" >&2 || :
+		fail "group counters were not restored"
+	}
+	echo " ok"
+}
+
+prepare_counter_corrupt_base()
+{
+	counter_base_dir=$work/counter-corrupt-base
+	counter_base=$counter_base_dir/ext4.img
+	mkdir "$counter_base_dir"
+	dd if=/dev/zero of="$counter_base" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b 1024 \
+	    -O 'metadata_csum,^orphan_file' "$counter_base" \
+	    >"$counter_base_dir/mke2fs.log" 2>&1; then
+		cat "$counter_base_dir/mke2fs.log" >&2
+		fail "could not create counter-corruption base"
+	fi
+	: >"$counter_base_dir/empty"
+	if ! "$DEBUGFS" -w -R \
+	    "write $counter_base_dir/empty /counter-block-probe" \
+	    "$counter_base" >"$counter_base_dir/debugfs.log" 2>&1; then
+		cat "$counter_base_dir/debugfs.log" >&2
+		fail "could not create the counter block probe"
+	fi
+	if ! "$TIMEOUT" -k 2 "$EXT4FS_TIMEOUT" "$E2FSCK" -fn \
+	    "$counter_base" >"$counter_base_dir/e2fsck.log" 2>&1; then
+		cat "$counter_base_dir/e2fsck.log" >&2
+		fail "counter-corruption base is invalid"
+	fi
+}
+
+run_counter_mount_reject_case()
+{
+	kind=$1
+	case_dir=$work/counter-reject-$kind
+	image=$case_dir/ext4.img
+	block_size=1024
+	mkdir "$case_dir"
+	cp "$counter_base" "$image"
+
+	case "$kind" in
+	super-blocks)
+		test_name="inconsistent superblock free-block count"
+		value=$(super_free_blocks)
+		field=free_blocks_count
+		;;
+	super-inodes)
+		test_name="inconsistent superblock free-inode count"
+		value=$(super_free_inodes)
+		field=free_inodes_count
+		;;
+	group-blocks)
+		test_name="inconsistent group free-block count"
+		value=$(group_free_blocks 0)
+		field=free_blocks_count
+		;;
+	group-inodes)
+		test_name="inconsistent group free-inode count"
+		value=$(group_free_inodes 0)
+		field=free_inodes_count
+		;;
+	group-dirs)
+		test_name="out-of-range group directory count"
+		value=65534
+		field=used_dirs_count
+		;;
+	*) fail "unknown counter rejection case: $kind" ;;
+	esac
+	print_test_name "$test_name"
+	case "$value" in
+	*[!0-9]*|'') fail "could not read the counter to corrupt" ;;
+	esac
+	value=$((value + 1))
+	case "$kind" in
+	super-*)
+		if ! "$DEBUGFS" -w -R "ssv $field $value" "$image" \
+		    >"$case_dir/debugfs.log" 2>&1; then
+			cat "$case_dir/debugfs.log" >&2
+			fail "could not corrupt the superblock counter"
+		fi
+		;;
+	group-*)
+		if ! "$DEBUGFS" -w -R "set_bg 0 $field $value" \
+		    "$image" >"$case_dir/debugfs.log" 2>&1; then
+			cat "$case_dir/debugfs.log" >&2
+			fail "could not corrupt the group counter"
+		fi
+		if ! "$DEBUGFS" -w -R 'set_bg 0 checksum calc' \
+		    "$image" >>"$case_dir/debugfs.log" 2>&1; then
+			cat "$case_dir/debugfs.log" >&2
+			fail "could not authenticate the group counter"
+		fi
+		;;
+	esac
+	expect_counter_mount_failure "$kind"
+	echo " ok"
+}
+
+run_counter_local_reject_case()
+{
+	kind=$1
+	case_dir=$work/counter-local-$kind
+	image=$case_dir/ext4.img
+	block_size=1024
+	mkdir "$case_dir"
+	cp "$counter_base" "$image"
+
+	case "$kind" in
+	blocks)
+		test_name="local free-block mismatch is non-mutating"
+		probe_inode=$("$DEBUGFS" -R \
+		    'stat /counter-block-probe' "$image" 2>/dev/null |
+		    awk '$1 == "Inode:" { print $2; exit }')
+		inodes_per_group=$("$DUMPE2FS" -h "$image" \
+		    2>/dev/null | awk '
+		    $1 == "Inodes" && $2 == "per" && $3 == "group:" {
+			print $4
+			exit
+		    }')
+		case "$probe_inode:$inodes_per_group" in
+		*[!0-9:]*|:*|*:0) fail "could not locate probe group" ;;
+		esac
+		group=$(((probe_inode - 1) / inodes_per_group))
+		group_value=$(group_free_blocks "$group")
+		super_value=$(super_free_blocks)
+		field=free_blocks_count
+		mode=counter-reject-block
+		;;
+	inodes)
+		test_name="local free-inode mismatch is non-mutating"
+		group=0
+		group_value=$(group_free_inodes "$group")
+		super_value=$(super_free_inodes)
+		field=free_inodes_count
+		mode=counter-reject-inode
+		;;
+	*) fail "unknown local counter case: $kind" ;;
+	esac
+	print_test_name "$test_name"
+	case "$group:$group_value:$super_value" in
+	*[!0-9:]*|:*|*::*|*:)
+		fail "invalid local counter values"
+		;;
+	esac
+	original_group=$group_value
+	original_super=$super_value
+	group_value=$((group_value + 1))
+	super_value=$((super_value + 1))
+	if ! "$DEBUGFS" -w -R \
+	    "set_bg $group $field $group_value" "$image" \
+	    >"$case_dir/debugfs.log" 2>&1; then
+		cat "$case_dir/debugfs.log" >&2
+		fail "could not forge the local group counter"
+	fi
+	if ! "$DEBUGFS" -w -R \
+	    "set_bg $group checksum calc" "$image" \
+	    >>"$case_dir/debugfs.log" 2>&1; then
+		cat "$case_dir/debugfs.log" >&2
+		fail "could not authenticate the local group counter"
+	fi
+	if ! "$DEBUGFS" -w -R "ssv $field $super_value" "$image" \
+	    >>"$case_dir/debugfs.log" 2>&1; then
+		cat "$case_dir/debugfs.log" >&2
+		fail "could not forge the matching superblock counter"
+	fi
+	filesystem_counts >"$case_dir/super-before"
+	group_descriptor_counts >"$case_dir/groups-before"
+	sequence_before=$(journal_sequence)
+
+	attach_image
+	mount_image ""
+	run_step "$mode" "$mountpoint"
+	unmount_image "$kind-counter-reject"
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" = "$sequence_before" ] ||
+	    fail "rejected counter operation advanced the journal"
+	filesystem_counts >"$case_dir/super-after"
+	group_descriptor_counts >"$case_dir/groups-after"
+	cmp -s "$case_dir/super-before" "$case_dir/super-after" ||
+	    fail "rejected operation changed superblock counters"
+	cmp -s "$case_dir/groups-before" \
+	    "$case_dir/groups-after" ||
+	    fail "rejected operation changed group counters"
+
+	"$DEBUGFS" -w -R \
+	    "set_bg $group $field $original_group" "$image" \
+	    >"$case_dir/debugfs-restore.log" 2>&1 ||
+	    fail "could not restore the local group counter"
+	"$DEBUGFS" -w -R \
+	    "set_bg $group checksum calc" "$image" \
+	    >>"$case_dir/debugfs-restore.log" 2>&1 ||
+	    fail "could not restore the group checksum"
+	"$DEBUGFS" -w -R "ssv $field $original_super" "$image" \
+	    >>"$case_dir/debugfs-restore.log" 2>&1 ||
+	    fail "could not restore the superblock counter"
+	check_image "$kind-counter-reject"
+	echo " ok"
+}
+
 extent_leaf_count()
 {
 	stage=$1
@@ -1291,6 +1593,31 @@ bgd)
 			run_bgd_case "$block_size" "$descriptor_size"
 		done
 	done
+	exit 0
+	;;
+counters)
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		case "$block_size" in
+		1024|2048|4096) ;;
+		*)
+			echo "bad block size: $block_size" >&2
+			exit 1
+			;;
+		esac
+		run_counter_case "$block_size"
+	done
+	case " $EXT4FS_BLOCK_SIZES " in
+	*' 1024 '*)
+		prepare_counter_corrupt_base
+		for kind in super-blocks super-inodes group-blocks \
+		    group-inodes group-dirs; do
+			run_counter_mount_reject_case "$kind"
+		done
+		for kind in blocks inodes; do
+			run_counter_local_reject_case "$kind"
+		done
+		;;
+	esac
 	exit 0
 	;;
 extents)

@@ -142,6 +142,153 @@ ext4fs_bgd_get_block (struct m_ext4fs *fs,
 	return (block);
 }
 
+u_int32_t
+ext4fs_group_block_count (struct m_ext4fs *fs, u_int32_t group)
+{
+	u_int64_t blocks, start;
+
+	if (group >= fs->m_block_group_count)
+		return (0);
+	start = fs->m_first_data_block +
+	    (u_int64_t)group * fs->m_blocks_per_group;
+	if (start >= fs->m_blocks_count)
+		return (0);
+	blocks = fs->m_blocks_count - start;
+	if (blocks > fs->m_blocks_per_group)
+		blocks = fs->m_blocks_per_group;
+	return ((u_int32_t)blocks);
+}
+
+u_int32_t
+ext4fs_group_inode_count (struct m_ext4fs *fs, u_int32_t group)
+{
+	u_int64_t inodes, start;
+
+	if (group >= fs->m_block_group_count)
+		return (0);
+	start = (u_int64_t)group * fs->m_inodes_per_group;
+	if (start >= fs->m_inodes_count)
+		return (0);
+	inodes = fs->m_inodes_count - start;
+	if (inodes > fs->m_inodes_per_group)
+		inodes = fs->m_inodes_per_group;
+	return ((u_int32_t)inodes);
+}
+
+u_int32_t
+ext4fs_bgd_get_count (struct m_ext4fs *fs,
+    struct ext4fs_block_group_descriptor *gd, unsigned int which)
+{
+	u_int32_t count;
+	u_int16_t high;
+
+	switch (which) {
+	case EXT4FS_BGD_FREE_BLOCKS:
+		count = letoh16(gd->bgd_free_blocks_count_lo);
+		high = gd->bgd_free_blocks_count_hi;
+		break;
+	case EXT4FS_BGD_FREE_INODES:
+		count = letoh16(gd->bgd_free_inodes_count_lo);
+		high = gd->bgd_free_inodes_count_hi;
+		break;
+	case EXT4FS_BGD_USED_DIRS:
+		count = letoh16(gd->bgd_used_dirs_count_lo);
+		high = gd->bgd_used_dirs_count_hi;
+		break;
+	default:
+		return (0);
+	}
+	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
+		count |= (u_int32_t)letoh16(high) << 16;
+	return (count);
+}
+
+void
+ext4fs_bgd_set_count (struct m_ext4fs *fs,
+    struct ext4fs_block_group_descriptor *gd, unsigned int which,
+    u_int32_t count)
+{
+	switch (which) {
+	case EXT4FS_BGD_FREE_BLOCKS:
+		gd->bgd_free_blocks_count_lo =
+		    htole16(count & 0xffff);
+		if (fs->m_feature_incompat &
+		    EXT4FS_FEATURE_INCOMPAT_64BIT)
+			gd->bgd_free_blocks_count_hi =
+			    htole16(count >> 16);
+		else
+			gd->bgd_free_blocks_count_hi = 0;
+		break;
+	case EXT4FS_BGD_FREE_INODES:
+		gd->bgd_free_inodes_count_lo =
+		    htole16(count & 0xffff);
+		if (fs->m_feature_incompat &
+		    EXT4FS_FEATURE_INCOMPAT_64BIT)
+			gd->bgd_free_inodes_count_hi =
+			    htole16(count >> 16);
+		else
+			gd->bgd_free_inodes_count_hi = 0;
+		break;
+	case EXT4FS_BGD_USED_DIRS:
+		gd->bgd_used_dirs_count_lo =
+		    htole16(count & 0xffff);
+		if (fs->m_feature_incompat &
+		    EXT4FS_FEATURE_INCOMPAT_64BIT)
+			gd->bgd_used_dirs_count_hi =
+			    htole16(count >> 16);
+		else
+			gd->bgd_used_dirs_count_hi = 0;
+		break;
+	default:
+		return;
+	}
+}
+
+static int
+ext4fs_counters_check (struct m_ext4fs *fs)
+{
+	struct ext4fs_block_group_descriptor *gd;
+	u_int64_t free_blocks, free_inodes;
+	u_int32_t blocks, dirs, group, inodes;
+	u_int32_t group_free_blocks, group_free_inodes;
+
+	if (fs->m_block_group_count == 0 ||
+	    fs->m_block_group_count > UINT32_MAX)
+		return (EFBIG);
+	free_blocks = 0;
+	free_inodes = 0;
+	for (group = 0; group < fs->m_block_group_count; group++) {
+		gd = &fs->m_gd[group];
+		blocks = ext4fs_group_block_count(fs, group);
+		inodes = ext4fs_group_inode_count(fs, group);
+		group_free_blocks = ext4fs_bgd_get_count(fs, gd,
+		    EXT4FS_BGD_FREE_BLOCKS);
+		group_free_inodes = ext4fs_bgd_get_count(fs, gd,
+		    EXT4FS_BGD_FREE_INODES);
+		dirs = ext4fs_bgd_get_count(fs, gd,
+		    EXT4FS_BGD_USED_DIRS);
+		if (blocks == 0 || inodes == 0 ||
+		    group_free_blocks > blocks ||
+		    group_free_inodes > inodes ||
+		    dirs > inodes - group_free_inodes) {
+			printf("ext4fs: invalid counters in group %u\n",
+			    group);
+			return (EINVAL);
+		}
+		if (free_blocks > UINT64_MAX - group_free_blocks ||
+		    free_inodes > UINT64_MAX - group_free_inodes)
+			return (EOVERFLOW);
+		free_blocks += group_free_blocks;
+		free_inodes += group_free_inodes;
+	}
+	if (free_blocks != fs->m_free_blocks_count ||
+	    free_inodes != fs->m_free_inodes_count) {
+		printf("ext4fs: group and superblock counters differ\n");
+		return (EINVAL);
+	}
+	return (0);
+}
+
 /*
  * Locate a group descriptor in the primary descriptor table.  The
  * in-memory array always uses the complete structure, while an ext4
@@ -463,6 +610,13 @@ ext4fs_mountfs (struct vnode *devvp, struct mount *mp, struct proc *p)
 
 	if (ronly == 0) {
 		error = ext4fs_orphan_cleanup(mp);
+		if (error)
+			goto out;
+	}
+	if (ronly == 0 || (mfs->m_last_orphan == 0 &&
+	    !(mfs->m_feature_ro_compat &
+	    EXT4FS_FEATURE_RO_COMPAT_ORPHAN_PRESENT))) {
+		error = ext4fs_counters_check(mfs);
 		if (error)
 			goto out;
 	}
@@ -1103,8 +1257,8 @@ ext4fs_inode_alloc (struct inode *pip, mode_t mode, struct ucred *cred,
 		best = 0;
 		best_free = 0;
 		for (i = 0; i < ngroups; i++) {
-			fi = letoh16(
-			    fs->m_gd[i].bgd_free_inodes_count_lo);
+			fi = ext4fs_bgd_get_count(fs, &fs->m_gd[i],
+			    EXT4FS_BGD_FREE_INODES);
 			if (fi > best_free) {
 				best_free = fi;
 				best = i;
@@ -1119,14 +1273,8 @@ ext4fs_inode_alloc (struct inode *pip, mode_t mode, struct ucred *cred,
 	for (i = 0; i < ngroups; i++) {
 		g = (group + i) % ngroups;
 		gd = &fs->m_gd[g];
-		free_inodes =
-		    letoh16(gd->bgd_free_inodes_count_lo);
-		if (fs->m_feature_incompat &
-		    EXT4FS_FEATURE_INCOMPAT_64BIT)
-			free_inodes |=
-			    (u_int32_t)
-			    letoh16(gd->bgd_free_inodes_count_hi)
-			    << 16;
+		free_inodes = ext4fs_bgd_get_count(fs, gd,
+		    EXT4FS_BGD_FREE_INODES);
 		if (free_inodes == 0)
 			continue;
 
@@ -1221,33 +1369,15 @@ ext4fs_inode_alloc (struct inode *pip, mode_t mode, struct ucred *cred,
 
 				/* Update BGD free count */
 				free_inodes--;
-				gd->bgd_free_inodes_count_lo =
-				    htole16(free_inodes & 0xFFFF);
-				if (fs->m_feature_incompat &
-				    EXT4FS_FEATURE_INCOMPAT_64BIT)
-					gd->bgd_free_inodes_count_hi =
-					    htole16(
-					    (free_inodes >> 16) &
-					    0xFFFF);
+				ext4fs_bgd_set_count(fs, gd,
+				    EXT4FS_BGD_FREE_INODES, free_inodes);
 
 				if ((mode & S_IFMT) == S_IFDIR) {
-					dirs = letoh16(
-					    gd->bgd_used_dirs_count_lo);
-					if (fs->m_feature_incompat &
-				    EXT4FS_FEATURE_INCOMPAT_64BIT)
-						dirs |= (u_int32_t)
-						    letoh16(
-				    gd->bgd_used_dirs_count_hi)
-						    << 16;
+					dirs = ext4fs_bgd_get_count(fs, gd,
+					    EXT4FS_BGD_USED_DIRS);
 					dirs++;
-					gd->bgd_used_dirs_count_lo =
-					    htole16(dirs & 0xFFFF);
-					if (fs->m_feature_incompat &
-				    EXT4FS_FEATURE_INCOMPAT_64BIT)
-					gd->bgd_used_dirs_count_hi =
-						    htole16(
-					    (dirs >> 16) &
-					    0xFFFF);
+					ext4fs_bgd_set_count(fs, gd,
+					    EXT4FS_BGD_USED_DIRS, dirs);
 				}
 
 				itu = letoh16(
@@ -1351,12 +1481,8 @@ ext4fs_inode_alloc_handle (struct inode *pip, mode_t mode,
 		best_free = 0;
 		for (i = 0; i < ngroups; i++) {
 			gd = &fs->m_gd[i];
-		free_inodes = letoh16(
-		    gd->bgd_free_inodes_count_lo);
-			if (fs->m_feature_incompat &
-			    EXT4FS_FEATURE_INCOMPAT_64BIT)
-				free_inodes |= (u_int32_t)letoh16(
-				    gd->bgd_free_inodes_count_hi) << 16;
+			free_inodes = ext4fs_bgd_get_count(fs, gd,
+			    EXT4FS_BGD_FREE_INODES);
 			if (free_inodes > best_free) {
 				best_free = free_inodes;
 				best = i;
@@ -1381,12 +1507,8 @@ ext4fs_inode_alloc_handle (struct inode *pip, mode_t mode,
 		valid = fs->m_inodes_count - inode_start;
 		if (valid > fs->m_inodes_per_group)
 			valid = fs->m_inodes_per_group;
-		free_inodes = letoh16(
-		    gd->bgd_free_inodes_count_lo);
-		if (fs->m_feature_incompat &
-		    EXT4FS_FEATURE_INCOMPAT_64BIT)
-			free_inodes |= (u_int32_t)letoh16(
-			    gd->bgd_free_inodes_count_hi) << 16;
+		free_inodes = ext4fs_bgd_get_count(fs, gd,
+		    EXT4FS_BGD_FREE_INODES);
 		if (free_inodes == 0)
 			continue;
 		if (free_inodes > valid ||
@@ -1480,29 +1602,18 @@ ext4fs_inode_alloc_handle (struct inode *pip, mode_t mode,
 			gd->bgd_inode_bitmap_checksum_hi =
 			    htole16(bitmap_csum >> 16);
 		free_inodes--;
-		gd->bgd_free_inodes_count_lo =
-		    htole16(free_inodes & 0xffff);
-		if (fs->m_feature_incompat &
-		    EXT4FS_FEATURE_INCOMPAT_64BIT)
-			gd->bgd_free_inodes_count_hi =
-			    htole16(free_inodes >> 16);
-		dirs = letoh16(gd->bgd_used_dirs_count_lo);
-		if (fs->m_feature_incompat &
-		    EXT4FS_FEATURE_INCOMPAT_64BIT)
-			dirs |= (u_int32_t)letoh16(
-			    gd->bgd_used_dirs_count_hi) << 16;
+		ext4fs_bgd_set_count(fs, gd, EXT4FS_BGD_FREE_INODES,
+		    free_inodes);
+		dirs = ext4fs_bgd_get_count(fs, gd,
+		    EXT4FS_BGD_USED_DIRS);
 		if ((mode & S_IFMT) == S_IFDIR) {
 			if (dirs == UINT32_MAX) {
 				error = EIO;
 				goto restore;
 			}
 			dirs++;
-			gd->bgd_used_dirs_count_lo =
-			    htole16(dirs & 0xffff);
-			if (fs->m_feature_incompat &
-			    EXT4FS_FEATURE_INCOMPAT_64BIT)
-				gd->bgd_used_dirs_count_hi =
-				    htole16(dirs >> 16);
+			ext4fs_bgd_set_count(fs, gd,
+			    EXT4FS_BGD_USED_DIRS, dirs);
 		}
 		itu = letoh16(gd->bgd_inode_table_unused_lo);
 		if (fs->m_feature_incompat &
@@ -1619,8 +1730,8 @@ ext4fs_inode_free_handle (struct inode *pip, ufsino_t ino, mode_t mode,
 	struct buf *bp;
 	u_int8_t *saved_bitmap;
 	u_int64_t bitmap_blk, inode_start;
-	u_int32_t bitmap_csum, dirs, free_inodes, group, ino_in_group;
-	u_int32_t saved_free_inodes, valid;
+	u_int32_t bitmap_csum, dirs, free_bits, free_inodes, group;
+	u_int32_t i, ino_in_group, saved_free_inodes, valid;
 	int error, saved_modified, transaction_changed;
 
 	if (handle == NULL || ino < fs->m_first_non_reserved_inode ||
@@ -1658,20 +1769,19 @@ ext4fs_inode_free_handle (struct inode *pip, ufsino_t ino, mode_t mode,
 	    bp->b_data);
 	if (error)
 		return (error);
+	free_bits = 0;
+	for (i = 0; i < valid; i++)
+		if (isclr((u_int8_t *)bp->b_data, i))
+			free_bits++;
 	if (isclr((u_int8_t *)bp->b_data, ino_in_group))
 		return (EINVAL);
 
-	free_inodes = letoh16(gd->bgd_free_inodes_count_lo);
-	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
-		free_inodes |= (u_int32_t)
-		    letoh16(gd->bgd_free_inodes_count_hi) << 16;
-	if (free_inodes >= valid ||
+	free_inodes = ext4fs_bgd_get_count(fs, gd,
+	    EXT4FS_BGD_FREE_INODES);
+	if (free_bits != free_inodes || free_inodes >= valid ||
 	    fs->m_free_inodes_count >= fs->m_inodes_count)
 		return (EIO);
-	dirs = letoh16(gd->bgd_used_dirs_count_lo);
-	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
-		dirs |= (u_int32_t)
-		    letoh16(gd->bgd_used_dirs_count_hi) << 16;
+	dirs = ext4fs_bgd_get_count(fs, gd, EXT4FS_BGD_USED_DIRS);
 	if ((mode & S_IFMT) == S_IFDIR && dirs == 0)
 		return (EIO);
 
@@ -1692,17 +1802,12 @@ ext4fs_inode_free_handle (struct inode *pip, ufsino_t ino, mode_t mode,
 		gd->bgd_inode_bitmap_checksum_hi =
 		    htole16(bitmap_csum >> 16);
 	free_inodes++;
-	gd->bgd_free_inodes_count_lo = htole16(free_inodes & 0xffff);
-	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
-		gd->bgd_free_inodes_count_hi =
-		    htole16(free_inodes >> 16);
+	ext4fs_bgd_set_count(fs, gd, EXT4FS_BGD_FREE_INODES,
+	    free_inodes);
 	if ((mode & S_IFMT) == S_IFDIR) {
 		dirs--;
-		gd->bgd_used_dirs_count_lo = htole16(dirs & 0xffff);
-		if (fs->m_feature_incompat &
-		    EXT4FS_FEATURE_INCOMPAT_64BIT)
-			gd->bgd_used_dirs_count_hi =
-			    htole16(dirs >> 16);
+		ext4fs_bgd_set_count(fs, gd, EXT4FS_BGD_USED_DIRS,
+		    dirs);
 	}
 	fs->m_free_inodes_count++;
 	fs->m_fs_was_modified = 1;
@@ -1784,30 +1889,19 @@ ext4fs_inode_free (struct inode *pip, ufsino_t ino, mode_t mode)
 		return;
 
 	/* Update BGD */
-	free_inodes = letoh16(gd->bgd_free_inodes_count_lo);
-	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
-		free_inodes |= (u_int32_t)
-		    letoh16(gd->bgd_free_inodes_count_hi) << 16;
+	free_inodes = ext4fs_bgd_get_count(fs, gd,
+	    EXT4FS_BGD_FREE_INODES);
 	free_inodes++;
-	gd->bgd_free_inodes_count_lo = htole16(free_inodes & 0xFFFF);
-	if (fs->m_feature_incompat &
-	    EXT4FS_FEATURE_INCOMPAT_64BIT)
-		gd->bgd_free_inodes_count_hi =
-		    htole16((free_inodes >> 16) & 0xFFFF);
+	ext4fs_bgd_set_count(fs, gd, EXT4FS_BGD_FREE_INODES,
+	    free_inodes);
 
 	if ((mode & S_IFMT) == S_IFDIR) {
 		u_int32_t dirs;
-		dirs = letoh16(gd->bgd_used_dirs_count_lo);
-		if (fs->m_feature_incompat &
-		    EXT4FS_FEATURE_INCOMPAT_64BIT)
-			dirs |= (u_int32_t)
-			    letoh16(gd->bgd_used_dirs_count_hi) << 16;
+		dirs = ext4fs_bgd_get_count(fs, gd,
+		    EXT4FS_BGD_USED_DIRS);
 		dirs--;
-		gd->bgd_used_dirs_count_lo = htole16(dirs & 0xFFFF);
-		if (fs->m_feature_incompat &
-		    EXT4FS_FEATURE_INCOMPAT_64BIT)
-			gd->bgd_used_dirs_count_hi =
-			    htole16((dirs >> 16) & 0xFFFF);
+		ext4fs_bgd_set_count(fs, gd, EXT4FS_BGD_USED_DIRS,
+		    dirs);
 	}
 
 	ext4fs_bgd_write_direct(fs, pip->i_devvp, group);
@@ -1880,8 +1974,8 @@ ext4fs_sync (struct mount *mp, int waitfor, int stall,
 		VOP_UNLOCK(ump->um_devvp);
 	}
 
-	/* Write superblock if modified */
-	if (fs->m_fs_was_modified) {
+	/* Runtime journal transactions own their superblock updates. */
+	if (fs->m_journal == NULL && fs->m_fs_was_modified) {
 		if ((error = ext4fs_sbwrite(mp)))
 			esa.allerror = error;
 	}

@@ -576,23 +576,6 @@ ext4fs_setsize (struct inode *ip, u_int64_t size)
 	din->i_size_hi = htole32((u_int32_t)(size >> 32));
 }
 
-static u_int32_t
-ext4fs_group_block_count (struct m_ext4fs *fs, u_int32_t group)
-{
-	u_int64_t start, blocks;
-
-	if (group >= fs->m_block_group_count)
-		return (0);
-	start = fs->m_first_data_block +
-	    (u_int64_t)group * fs->m_blocks_per_group;
-	if (start >= fs->m_blocks_count)
-		return (0);
-	blocks = fs->m_blocks_count - start;
-	if (blocks > fs->m_blocks_per_group)
-		blocks = fs->m_blocks_per_group;
-	return ((u_int32_t)blocks);
-}
-
 static void
 ext4fs_block_bitmap_mark (struct m_ext4fs *fs, u_int32_t group,
     u_int8_t *bitmap, u_int64_t block)
@@ -777,11 +760,8 @@ ext4fs_blkalloc_direct (struct inode *ip, u_int64_t goal,
 		g = (group + i) % ngroups;
 		gd = &fs->m_gd[g];
 
-		free_blocks = letoh16(gd->bgd_free_blocks_count_lo);
-		if (fs->m_feature_incompat &
-		    EXT4FS_FEATURE_INCOMPAT_64BIT)
-			free_blocks |= (u_int32_t)
-			    letoh16(gd->bgd_free_blocks_count_hi) << 16;
+		free_blocks = ext4fs_bgd_get_count(fs, gd,
+		    EXT4FS_BGD_FREE_BLOCKS);
 		if (free_blocks == 0)
 			continue;
 
@@ -870,14 +850,8 @@ ext4fs_blkalloc_direct (struct inode *ip, u_int64_t goal,
 
 				/* Update BGD */
 				free_blocks -= nalloced;
-				gd->bgd_free_blocks_count_lo =
-				    htole16(free_blocks & 0xFFFF);
-				if (fs->m_feature_incompat &
-				    EXT4FS_FEATURE_INCOMPAT_64BIT)
-					gd->bgd_free_blocks_count_hi =
-					    htole16(
-					    (free_blocks >> 16) &
-					    0xFFFF);
+				ext4fs_bgd_set_count(fs, gd,
+				    EXT4FS_BGD_FREE_BLOCKS, free_blocks);
 
 				ext4fs_bgd_write_direct(fs,
 				    ip->i_devvp, g);
@@ -919,7 +893,7 @@ ext4fs_blkalloc_handle (struct inode *ip,
 	struct buf *bp;
 	u_int8_t *bitmap, *saved_bitmap, *scan;
 	u_int64_t bitmap_block, saved_free_blocks;
-	u_int32_t bitmap_csum, blk, blocks, free_blocks;
+	u_int32_t bitmap_csum, blk, blocks, free_bits, free_blocks;
 	u_int32_t g, goal_group, group, i, k, nalloced, ngroups;
 	u_int32_t start;
 	int error, saved_modified, transaction_dirty, uninit;
@@ -955,11 +929,8 @@ ext4fs_blkalloc_handle (struct inode *ip,
 	for (i = 0; i < ngroups; i++) {
 		g = (group + i) % ngroups;
 		gd = &fs->m_gd[g];
-		free_blocks = letoh16(gd->bgd_free_blocks_count_lo);
-		if (fs->m_feature_incompat &
-		    EXT4FS_FEATURE_INCOMPAT_64BIT)
-			free_blocks |= (u_int32_t)
-			    letoh16(gd->bgd_free_blocks_count_hi) << 16;
+		free_blocks = ext4fs_bgd_get_count(fs, gd,
+		    EXT4FS_BGD_FREE_BLOCKS);
 		if (free_blocks == 0)
 			continue;
 		blocks = ext4fs_group_block_count(fs, g);
@@ -993,6 +964,14 @@ ext4fs_blkalloc_handle (struct inode *ip,
 			if (error)
 				goto out;
 			scan = bp->b_data;
+		}
+		free_bits = 0;
+		for (k = 0; k < blocks; k++)
+			if (isclr(scan, k))
+				free_bits++;
+		if (free_bits != free_blocks) {
+			error = EIO;
+			goto out;
 		}
 
 		start = 0;
@@ -1058,12 +1037,8 @@ ext4fs_blkalloc_handle (struct inode *ip,
 			gd->bgd_block_bitmap_checksum_hi =
 			    htole16(bitmap_csum >> 16);
 		free_blocks -= nalloced;
-		gd->bgd_free_blocks_count_lo =
-		    htole16(free_blocks & 0xffff);
-		if (fs->m_feature_incompat &
-		    EXT4FS_FEATURE_INCOMPAT_64BIT)
-			gd->bgd_free_blocks_count_hi =
-			    htole16(free_blocks >> 16);
+		ext4fs_bgd_set_count(fs, gd, EXT4FS_BGD_FREE_BLOCKS,
+		    free_blocks);
 		fs->m_free_blocks_count -= nalloced;
 		fs->m_fs_was_modified = 1;
 
@@ -1202,16 +1177,11 @@ ext4fs_blkfree_direct (struct inode *ip, u_int64_t bno)
 	bdwrite(bp);
 
 	/* Update BGD */
-	free_blocks = letoh16(gd->bgd_free_blocks_count_lo);
-	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
-		free_blocks |=
-		    (u_int32_t)
-		    letoh16(gd->bgd_free_blocks_count_hi) << 16;
+	free_blocks = ext4fs_bgd_get_count(fs, gd,
+	    EXT4FS_BGD_FREE_BLOCKS);
 	free_blocks++;
-	gd->bgd_free_blocks_count_lo = htole16(free_blocks & 0xFFFF);
-	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
-		gd->bgd_free_blocks_count_hi =
-		    htole16((free_blocks >> 16) & 0xFFFF);
+	ext4fs_bgd_set_count(fs, gd, EXT4FS_BGD_FREE_BLOCKS,
+	    free_blocks);
 
 	ext4fs_bgd_write_direct(fs, ip->i_devvp, group);
 
@@ -1235,7 +1205,8 @@ ext4fs_blkfree_range_handle (struct inode *ip,
 	struct buf *bp;
 	u_int8_t *saved_bitmap;
 	u_int64_t bitmap_block, saved_free_blocks;
-	u_int32_t bitmap_csum, bit, blocks, free_blocks, group, k;
+	u_int32_t bitmap_csum, bit, blocks, free_bits, free_blocks;
+	u_int32_t group, k;
 	int error, saved_modified, transaction_changed;
 
 	if (handle == NULL || count == 0 ||
@@ -1271,15 +1242,19 @@ ext4fs_blkfree_range_handle (struct inode *ip,
 	    bp->b_data);
 	if (error)
 		return (error);
+	free_bits = 0;
+	for (k = 0; k < blocks; k++)
+		if (isclr((u_int8_t *)bp->b_data, k))
+			free_bits++;
+	free_blocks = ext4fs_bgd_get_count(fs, gd,
+	    EXT4FS_BGD_FREE_BLOCKS);
+	if (free_bits != free_blocks)
+		return (EIO);
 	for (k = 0; k < count; k++) {
 		if (isclr((u_int8_t *)bp->b_data, bit + k))
 			return (EINVAL);
 	}
 
-	free_blocks = letoh16(gd->bgd_free_blocks_count_lo);
-	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
-		free_blocks |= (u_int32_t)
-		    letoh16(gd->bgd_free_blocks_count_hi) << 16;
 	if (free_blocks > blocks - count ||
 	    fs->m_free_blocks_count > fs->m_blocks_count - count)
 		return (EIO);
@@ -1302,10 +1277,8 @@ ext4fs_blkfree_range_handle (struct inode *ip,
 		gd->bgd_block_bitmap_checksum_hi =
 		    htole16(bitmap_csum >> 16);
 	free_blocks += count;
-	gd->bgd_free_blocks_count_lo = htole16(free_blocks & 0xffff);
-	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
-		gd->bgd_free_blocks_count_hi =
-		    htole16(free_blocks >> 16);
+	ext4fs_bgd_set_count(fs, gd, EXT4FS_BGD_FREE_BLOCKS,
+	    free_blocks);
 	fs->m_free_blocks_count += count;
 	fs->m_fs_was_modified = 1;
 
@@ -2260,20 +2233,11 @@ ext4fs_free_extents_direct (struct inode *ip,
 			}
 			bdwrite(bbp);
 
-			free_blocks =
-			    letoh16(gd->bgd_free_blocks_count_lo);
-			if (fs->m_feature_incompat &
-			    EXT4FS_FEATURE_INCOMPAT_64BIT)
-				free_blocks |= (u_int32_t)letoh16(
-				    gd->bgd_free_blocks_count_hi) << 16;
+			free_blocks = ext4fs_bgd_get_count(fs, gd,
+			    EXT4FS_BGD_FREE_BLOCKS);
 			free_blocks += n;
-			gd->bgd_free_blocks_count_lo =
-			    htole16(free_blocks & 0xFFFF);
-			if (fs->m_feature_incompat &
-			    EXT4FS_FEATURE_INCOMPAT_64BIT)
-				gd->bgd_free_blocks_count_hi =
-				    htole16((free_blocks >> 16) &
-				    0xFFFF);
+			ext4fs_bgd_set_count(fs, gd,
+			    EXT4FS_BGD_FREE_BLOCKS, free_blocks);
 			ext4fs_bgd_write_direct(fs, ip->i_devvp, group);
 
 			fs->m_free_blocks_count += n;

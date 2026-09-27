@@ -238,6 +238,10 @@ struct ext4fs_runtime_orphan;
 #define EXT4FS_BGD_INODE_BITMAP	1
 #define EXT4FS_BGD_INODE_TABLE	2
 
+#define EXT4FS_BGD_FREE_BLOCKS	0
+#define EXT4FS_BGD_FREE_INODES	1
+#define EXT4FS_BGD_USED_DIRS	2
+
 struct ext4fs {
 	u_int32_t	sb_inodes_count;
 	u_int32_t	sb_blocks_count_lo;
@@ -712,8 +716,14 @@ void	ext4fs_setsize (struct inode *, u_int64_t);
 /* Superblock */
 int	ext4fs_sbcheck (struct ext4fs *, int);
 int	ext4fs_block_group_has_super_block (int);
+u_int32_t	ext4fs_group_block_count (struct m_ext4fs *, u_int32_t);
+u_int32_t	ext4fs_group_inode_count (struct m_ext4fs *, u_int32_t);
 u_int64_t	ext4fs_bgd_get_block (struct m_ext4fs *,
     struct ext4fs_block_group_descriptor *, unsigned int);
+u_int32_t	ext4fs_bgd_get_count (struct m_ext4fs *,
+    struct ext4fs_block_group_descriptor *, unsigned int);
+void	ext4fs_bgd_set_count (struct m_ext4fs *,
+    struct ext4fs_block_group_descriptor *, unsigned int, u_int32_t);
 int	ext4fs_bgd_location (struct m_ext4fs *, u_int32_t,
     u_int64_t *, size_t *);
 int	ext4fs_mountfs (struct vnode *, struct mount *, struct proc *);
