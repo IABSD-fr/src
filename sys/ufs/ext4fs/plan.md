@@ -513,7 +513,7 @@ journal handle. This includes:
 - [x] block-group descriptors;
 - [x] extent-tree roots, index blocks, and leaf blocks;
 - [x] directory blocks and checksum tails;
-- [ ] orphan-list and orphan-file updates;
+- [x] orphan-list and orphan-file updates;
 - [ ] allocation and free counters;
 - [ ] the ext4 superblock.
 
@@ -757,6 +757,33 @@ advancement, remount persistence, read-only non-mutation, and offline
 lookup and creation fail without changing the directory block or
 starting a transaction.  On 2026-09-27, every case passed against the
 rebuilt and booted production kernel.
+
+The orphan-list and orphan-file writer audit is complete.  Runtime
+insertion and removal use journal handles, while direct writes are
+confined to guarded, restartable mount-time recovery.  Before final
+unlink, replacement rename, or `rmdir` starts a transaction, a locked
+preflight authenticates the complete classic chain or orphan file and
+confirms that an orphan-file slot is available.  The transaction then
+reauthenticates the selected orphan block through its journal-owned
+buffer.
+
+The focused `run-regress-ext4fsops-orphan` target covers classic and
+orphan-file operation with 1 KiB, 2 KiB, and 4 KiB blocks.  It exercises
+closed and open unlink, out-of-order final close, replacement rename,
+empty-directory retirement, exact accounting, immediate inode reuse,
+remount persistence, journal-sequence advancement, and offline
+`e2fsck -fn`.  Its corrupt-orphan-file fixture proves that unlink,
+rename, and `rmdir` fail without changing the namespace, accounting,
+or journal sequence.
+
+The first production run exposed a self-deadlock when a transaction
+owned the parent inode's table block and an in-transaction orphan scan
+tried to read a tracked inode from that same busy block.  The preflight
+now passes its authenticated slot into the transaction, avoiding that
+second `bread()`.  The regression deliberately places the parent and
+first orphan in one inode-table block.  On 2026-09-27, the complete
+orphan target passed against the rebuilt and booted production kernel,
+including this shared-buffer case, so the checklist item is complete.
 
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only
 for regular-file data, the journal's own I/O, recovery, checkpointing,
