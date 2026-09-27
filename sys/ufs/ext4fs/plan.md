@@ -672,6 +672,18 @@ offline `e2fsck -fn` acceptance.  On 2026-09-27, the complete ext4fs
 regression matrix passed against the rebuilt and booted production
 kernel with this path active.
 
+The block-bitmap writer audit is complete and awaits its focused
+production-kernel gate.  Runtime allocation and free on a journaled
+mount use handle-owned bitmap buffers, verify initialized bitmap
+checksums and final-group bounds, update descriptor and superblock
+counters in the same transaction, and revoke freed blocks.  Direct
+bitmap writes are confined to explicitly documented journal-less ext4
+paths and restartable mount-time orphan recovery.  A focused regression
+now checks allocation, truncate-free, reuse, and final retirement on all
+three block sizes.  Every mutation must advance the on-disk JBD2
+sequence, preserve exact block and inode accounting across remount, and
+pass offline `e2fsck -fn`.
+
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only
 for regular-file data, the journal's own I/O, recovery, checkpointing,
 or another explicitly documented exception.

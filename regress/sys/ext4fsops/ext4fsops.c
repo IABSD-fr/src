@@ -45,6 +45,7 @@
 #define APPEND_SEED	0x52U
 #define OVERWRITE_SEED	0x93U
 #define EXTENT_SEED	0xb4U
+#define BITMAP_SEED	0xc7U
 
 static char root[PATH_MAX];
 static size_t block_size;
@@ -86,6 +87,11 @@ static void	verify_readonly_tree (void);
 static void	create_allocation_probe (void);
 static void	verify_allocation_probe (void);
 static void	create_extent_file (const char *);
+static void	allocate_bitmap_probe (void);
+static void	verify_bitmap_probe (int);
+static void	free_bitmap_probe (void);
+static void	reuse_bitmap_probe (void);
+static void	retire_bitmap_probe (void);
 
 static void
 make_path (char *path, size_t pathlen, const char *suffix)
@@ -1632,6 +1638,135 @@ verify_allocation_probe (void)
 		err(1, "close %s", path);
 }
 
+static void
+allocate_bitmap_probe (void)
+{
+	struct statfs before, after;
+	char path[PATH_MAX];
+	int fd;
+
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before block allocation");
+	make_path(path, sizeof(path), "bitmap-probe");
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	write_pattern_fd(fd, 0, block_size, BITMAP_SEED);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after block allocation");
+	if (after.f_bfree + 1 != before.f_bfree ||
+	    after.f_ffree + 1 != before.f_ffree)
+		errx(1, "block allocation accounting mismatch");
+	verify_bitmap_probe(1);
+}
+
+static void
+verify_bitmap_probe (int allocated)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	int fd;
+
+	make_path(path, sizeof(path), "bitmap-probe");
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (!S_ISREG(st.st_mode))
+		errx(1, "bitmap probe is not a regular file");
+	if (!allocated) {
+		if (st.st_size != 0 || st.st_blocks != 0)
+			errx(1, "freed bitmap probe retains blocks");
+		return;
+	}
+	if (st.st_size != (off_t)block_size ||
+	    st.st_blocks != (blkcnt_t)(block_size / 512))
+		errx(1, "allocated bitmap probe has wrong shape");
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	check_pattern_fd(fd, 0, block_size, BITMAP_SEED);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+free_bitmap_probe (void)
+{
+	struct statfs before, after;
+	char path[PATH_MAX];
+	int fd;
+
+	verify_bitmap_probe(1);
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before block free");
+	make_path(path, sizeof(path), "bitmap-probe");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (ftruncate(fd, 0) == -1)
+		err(1, "ftruncate %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after block free");
+	if (after.f_bfree != before.f_bfree + 1 ||
+	    after.f_ffree != before.f_ffree)
+		errx(1, "block free accounting mismatch");
+	verify_bitmap_probe(0);
+}
+
+static void
+reuse_bitmap_probe (void)
+{
+	struct statfs before, after;
+	char path[PATH_MAX];
+	int fd;
+
+	verify_bitmap_probe(0);
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before block reuse");
+	make_path(path, sizeof(path), "bitmap-probe");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	write_pattern_fd(fd, 0, block_size, BITMAP_SEED);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after block reuse");
+	if (after.f_bfree + 1 != before.f_bfree ||
+	    after.f_ffree != before.f_ffree)
+		errx(1, "block reuse accounting mismatch");
+	verify_bitmap_probe(1);
+}
+
+static void
+retire_bitmap_probe (void)
+{
+	struct statfs before, after;
+	char path[PATH_MAX];
+
+	verify_bitmap_probe(1);
+	if (statfs(root, &before) == -1)
+		err(1, "statfs before block retirement");
+	make_path(path, sizeof(path), "bitmap-probe");
+	if (unlink(path) == -1)
+		err(1, "unlink %s", path);
+	if (statfs(root, &after) == -1)
+		err(1, "statfs after block retirement");
+	if (after.f_bfree != before.f_bfree + 1 ||
+	    after.f_ffree != before.f_ffree + 1)
+		errx(1, "block retirement accounting mismatch");
+	check_absent(path);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -1653,6 +1788,14 @@ main (int argc, char **argv)
 			err(1, "rmdir %s", root);
 		block_size = (size_t)sfs.f_bsize;
 		create_filesystem_tree();
+	} else if (strcmp(argv[1], "bitmap-allocate") == 0) {
+		block_size = 0;
+		if (mkdir(root, 0755) == -1)
+			err(1, "mkdir %s", root);
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs %s", root);
+		block_size = (size_t)sfs.f_bsize;
+		allocate_bitmap_probe();
 	} else if (strcmp(argv[1], "create-special") == 0) {
 		block_size = 0;
 		if (mkdir(root, 0755) == -1)
@@ -1679,7 +1822,23 @@ main (int argc, char **argv)
 			create_allocation_probe();
 		else if (strcmp(argv[1], "verify-allocation-probe") == 0)
 			verify_allocation_probe();
-		else if (strcmp(argv[1], "verify-special") == 0)
+		else if (strcmp(argv[1], "bitmap-verify") == 0)
+			verify_bitmap_probe(1);
+		else if (strcmp(argv[1], "bitmap-free") == 0)
+			free_bitmap_probe();
+		else if (strcmp(argv[1], "bitmap-verify-free") == 0)
+			verify_bitmap_probe(0);
+		else if (strcmp(argv[1], "bitmap-reuse") == 0)
+			reuse_bitmap_probe();
+		else if (strcmp(argv[1], "bitmap-retire") == 0)
+			retire_bitmap_probe();
+		else if (strcmp(argv[1],
+		    "bitmap-verify-retired") == 0) {
+			char path[PATH_MAX];
+
+			make_path(path, sizeof(path), "bitmap-probe");
+			check_absent(path);
+		} else if (strcmp(argv[1], "verify-special") == 0)
 			verify_special_files();
 		else if (strcmp(argv[1], "remove-special") == 0)
 			remove_special_files();

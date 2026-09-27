@@ -23,7 +23,7 @@ EXT4FSOPS_MODE=${EXT4FSOPS_MODE:-full}
 
 for tool in "$MKE2FS" "$E2FSCK" "$DEBUGFS" "$DUMPE2FS" \
     "$VNCONFIG" "$MOUNT_EXT4FS" \
-    "$UMOUNT" "$TIMEOUT" "$EXT4FSOPS" dd id sha256; do
+    "$UMOUNT" "$TIMEOUT" "$EXT4FSOPS" dd hexdump id sha256; do
 	if ! command -v "$tool" >/dev/null 2>&1; then
 		echo "SKIPPED: ext4fs operations regress requires $tool"
 		exit 0
@@ -185,6 +185,29 @@ check_image()
 		cat "$case_dir/e2fsck-$stage.log" >&2
 		fail "e2fsck rejected the image after $stage"
 	fi
+}
+
+journal_sequence()
+{
+	journal_inode=$("$DUMPE2FS" -h "$image" 2>/dev/null | awk '
+	    $1 == "Journal" && $2 == "inode:" { print $3; exit }
+	')
+	case "$journal_inode" in
+	*[!0-9]*|'') fail "could not locate the journal inode" ;;
+	esac
+	journal_blocks=$("$DEBUGFS" -R "blocks <$journal_inode>" \
+	    "$image" 2>/dev/null) || fail "could not map the journal inode"
+	set -- $journal_blocks
+	[ "$#" -gt 0 ] || fail "journal inode has no blocks"
+	case "$1" in
+	*[!0-9]*|'') fail "invalid journal superblock location" ;;
+	esac
+	journal_offset=$(($1 * block_size + 24))
+	sequence=$(dd if="$image" bs=1 skip="$journal_offset" count=4 \
+	    status=none | hexdump -ve '1/1 "%02x"')
+	[ "${#sequence}" -eq 8 ] ||
+	    fail "could not read the journal sequence"
+	printf '%s\n' "$sequence"
 }
 
 xattr_block()
@@ -427,6 +450,80 @@ run_flex_uninit_case()
 	echo " ok"
 }
 
+run_bitmap_case()
+{
+	block_size=$1
+	case_dir=$work/bitmap-$block_size
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	test_name="block-bitmap transactions ($block_size byte blocks)"
+	print_test_name "$test_name"
+
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O 'metadata_csum,^orphan_file' "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs failed"
+	fi
+	sequence_before=$(journal_sequence)
+
+	attach_image
+	mount_image ""
+	run_step bitmap-allocate "$mountpoint/bitmap"
+	unmount_image bitmap-allocate
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "allocation did not advance the journal sequence"
+	check_image bitmap-allocate
+	sequence_before=$sequence_after
+
+	attach_image
+	mount_image ""
+	run_step bitmap-verify "$mountpoint/bitmap"
+	run_step bitmap-free "$mountpoint/bitmap"
+	unmount_image bitmap-free
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "free did not advance the journal sequence"
+	check_image bitmap-free
+	sequence_before=$sequence_after
+
+	attach_image
+	mount_image ""
+	run_step bitmap-verify-free "$mountpoint/bitmap"
+	run_step bitmap-reuse "$mountpoint/bitmap"
+	unmount_image bitmap-reuse
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "reuse did not advance the journal sequence"
+	check_image bitmap-reuse
+	sequence_before=$sequence_after
+
+	attach_image
+	mount_image ""
+	run_step bitmap-verify "$mountpoint/bitmap"
+	run_step bitmap-retire "$mountpoint/bitmap"
+	unmount_image bitmap-retire
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "retirement did not advance the journal sequence"
+	check_image bitmap-retire
+
+	attach_image
+	mount_image ""
+	run_step bitmap-verify-retired "$mountpoint/bitmap"
+	unmount_image bitmap-final
+	detach_image
+	check_image bitmap-final
+	echo " ok"
+}
+
 run_special_case()
 {
 	case_dir=$work/special-inodes
@@ -464,6 +561,20 @@ run_special_case()
 case "$EXT4FSOPS_MODE" in
 special)
 	run_special_case
+	exit 0
+	;;
+bitmap)
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		case "$block_size" in
+		1024|2048|4096) ;;
+		*)
+			echo "unsupported filesystem block size: " \
+			    "$block_size" >&2
+			exit 1
+			;;
+		esac
+		run_bitmap_case "$block_size"
+	done
 	exit 0
 	;;
 full) ;;

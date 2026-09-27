@@ -686,8 +686,8 @@ ext4fs_block_bitmap_csum_verify (struct m_ext4fs *fs, u_int32_t group,
 }
 
 /*
- * Allocate a filesystem block.
- * Tries the group of the goal block first, then scans all groups.
+ * Allocate a filesystem block on journal-less ext4.  Journal-bearing
+ * mounts are dispatched to ext4fs_blkalloc_handle() below.
  */
 static int
 ext4fs_blkalloc_direct (struct inode *ip, u_int64_t goal,
@@ -705,6 +705,8 @@ ext4fs_blkalloc_direct (struct inode *ip, u_int64_t goal,
 
 	*bnp = 0;
 	*countp = 0;
+	if (fs->m_journal != NULL)
+		return (EIO);
 
 	if (count == 0)
 		count = 1;
@@ -1088,7 +1090,8 @@ ext4fs_blkalloc (struct inode *ip, u_int64_t goal, u_int32_t count,
 }
 
 /*
- * Free a filesystem block.
+ * Free a filesystem block on journal-less ext4.  Journal-bearing mounts
+ * are dispatched to ext4fs_blkfree_handle() below.
  */
 static void
 ext4fs_blkfree_direct (struct inode *ip, u_int64_t bno)
@@ -1101,6 +1104,10 @@ ext4fs_blkfree_direct (struct inode *ip, u_int64_t bno)
 	char *bbp;
 	int error;
 
+	if (fs->m_journal != NULL) {
+		ext4fs_journal_abort(ITOV(ip)->v_mount, EIO);
+		return;
+	}
 	if (bno < fs->m_first_data_block || bno >= fs->m_blocks_count)
 		return;
 
@@ -2014,16 +2021,20 @@ ext4fs_buf_alloc_handle (struct inode *ip,
 }
 
 /*
- * Free all blocks described by an array of extents.
- * Batches frees by block group for efficiency.
+ * Free extents on journal-less ext4, batching blocks by group.
+ * Journal-bearing truncation uses ext4fs_free_extents_handle().
  */
 static void
-ext4fs_free_extents (struct inode *ip, struct ext4fs_extent *ext,
-    u_int16_t entries)
+ext4fs_free_extents_direct (struct inode *ip,
+    struct ext4fs_extent *ext, u_int16_t entries)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	int i;
 
+	if (fs->m_journal != NULL) {
+		ext4fs_journal_abort(ITOV(ip)->v_mount, EIO);
+		return;
+	}
 	for (i = 0; i < entries; i++) {
 		u_int64_t start = letoh32(ext[i].e_start_lo) |
 		    ((u_int64_t)letoh16(ext[i].e_start_hi) << 32);
@@ -2159,7 +2170,7 @@ ext4fs_trim_extents (struct inode *ip, struct ext4fs_extent *ext,
 			/* Entirely past boundary — free all */
 			struct ext4fs_extent tmp = ext[i];
 			tmp.e_len = htole16(elen);
-			ext4fs_free_extents(ip, &tmp, 1);
+			ext4fs_free_extents_direct(ip, &tmp, 1);
 			blocks_freed += elen;
 		} else if (eblk + elen > new_nblocks) {
 			/* Straddles boundary — trim */
@@ -2174,7 +2185,7 @@ ext4fs_trim_extents (struct inode *ip, struct ext4fs_extent *ext,
 			tmp.e_start_hi = htole16(
 			    (u_int16_t)((estart + keep) >> 32));
 			tmp.e_len = htole16(discard);
-			ext4fs_free_extents(ip, &tmp, 1);
+			ext4fs_free_extents_direct(ip, &tmp, 1);
 			blocks_freed += discard;
 
 			/* Keep the trimmed extent */
@@ -3074,7 +3085,8 @@ ext4fs_truncate (struct inode *ip, off_t length, int flags,
 	if (length == 0) {
 		/* Truncate to 0: free everything */
 		if (depth == 0) {
-			ext4fs_free_extents(ip, din->i_extent, entries);
+			ext4fs_free_extents_direct(ip, din->i_extent,
+			    entries);
 		} else {
 			struct ext4fs_extent_idx *idx;
 			int i;
@@ -3116,7 +3128,7 @@ ext4fs_truncate (struct inode *ip, off_t length, int flags,
 				leaf_ext = (struct ext4fs_extent *)
 				    (leaf_eh + 1);
 
-				ext4fs_free_extents(ip, leaf_ext,
+				ext4fs_free_extents_direct(ip, leaf_ext,
 				    leaf_entries);
 				brelse(bp);
 
