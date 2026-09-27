@@ -508,7 +508,7 @@ Audit every metadata write in `sys/ufs/ext4fs` and route it through a
 journal handle. This includes:
 
 - [x] inode-table blocks and inode timestamps;
-- [ ] block bitmaps;
+- [x] block bitmaps;
 - [ ] inode bitmaps;
 - [ ] block-group descriptors;
 - [ ] extent-tree roots, index blocks, and leaf blocks;
@@ -536,9 +536,9 @@ aliased extent metadata before changing the filesystem.  On 2026-09-25,
 the production-kernel `ext4fsops` matrix passed on 1 KiB, 2 KiB, and 4
 KiB filesystems, including depth-1 full release, depth-1 non-zero
 shrink, partial-EOF zeroing and regrowth, remount verification, and
-`e2fsck -fn` after each mutation stage.  The broad bitmap, descriptor,
-counter, superblock, and extent checklist entries remain open until
-every metadata writer using those structures has been converted.
+`e2fsck -fn` after each mutation stage.  The remaining broad metadata
+checklist entries stay open until every writer using those structures
+has been converted.
 
 Hard-link creation is the first journaled compound namespace operation.
 Linear directory blocks are structurally validated and checksum-verified
@@ -672,17 +672,19 @@ offline `e2fsck -fn` acceptance.  On 2026-09-27, the complete ext4fs
 regression matrix passed against the rebuilt and booted production
 kernel with this path active.
 
-The block-bitmap writer audit is complete and awaits its focused
-production-kernel gate.  Runtime allocation and free on a journaled
-mount use handle-owned bitmap buffers, verify initialized bitmap
-checksums and final-group bounds, update descriptor and superblock
-counters in the same transaction, and revoke freed blocks.  Direct
-bitmap writes are confined to explicitly documented journal-less ext4
-paths and restartable mount-time orphan recovery.  A focused regression
-now checks allocation, truncate-free, reuse, and final retirement on all
-three block sizes.  Every mutation must advance the on-disk JBD2
-sequence, preserve exact block and inode accounting across remount, and
-pass offline `e2fsck -fn`.
+The block-bitmap writer audit and focused production-kernel gate are
+complete.  Runtime allocation and free on a journaled mount use
+handle-owned bitmap buffers, verify initialized bitmap checksums and
+final-group bounds, update descriptor and superblock counters in the
+same transaction, and revoke freed blocks.  Direct bitmap writes are
+confined to explicitly documented journal-less ext4 paths and
+restartable mount-time orphan recovery.  The focused regression checks
+allocation, truncate-free, reuse, and final retirement on all three
+block sizes.  Every mutation advances the on-disk JBD2 sequence,
+preserves exact block and inode accounting across remount, and passes
+offline `e2fsck -fn`.  On 2026-09-27, this matrix passed against the
+booted production kernel together with the complete ordinary-operation
+and special-inode suites.
 
 Direct `bwrite()`, `bdwrite()`, or `bawrite()` calls must remain only
 for regular-file data, the journal's own I/O, recovery, checkpointing,

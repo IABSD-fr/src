@@ -5,10 +5,10 @@ NOMAN=
 
 CFLAGS+=	-Wall -Werror -Wextra
 
-REGRESS_TARGETS=	run-regress-ext4fsops
-REGRESS_ROOT_TARGETS=	${REGRESS_TARGETS} \
+REGRESS_TARGETS=	run-regress-ext4fsops \
 			run-regress-ext4fsops-bitmap \
 			run-regress-ext4fsops-special
+REGRESS_ROOT_TARGETS=	${REGRESS_TARGETS}
 
 EXT4FS_TIMEOUT?=	60
 EXT4FS_IMAGE_MB?=	128
