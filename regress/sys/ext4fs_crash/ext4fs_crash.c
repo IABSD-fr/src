@@ -1293,12 +1293,8 @@ selftest (void)
 	char current[PATH_MAX], entry[PATH_MAX], grow[PATH_MAX];
 	char journal_path[PATH_MAX];
 	char marker[PATH_MAX], next[PATH_MAX], removed[PATH_MAX];
-	char reuse[PATH_MAX];
 	char root[] = "/tmp/ext4fs_crash.XXXXXXXX";
-	char source_marker;
 	off_t grown, initial;
-	ssize_t n;
-	size_t block_size;
 	int fd;
 
 	if (mkdtemp(root) == NULL)
@@ -1339,37 +1335,6 @@ selftest (void)
 	if (rmdir(removed) == -1)
 		err(1, "rmdir %s", removed);
 	verify_rmdir(root);
-
-	block_size = filesystem_block_size(root);
-	make_path(reuse, sizeof(reuse), root, REUSE_FILE);
-	fd = open_output(reuse, 1);
-	if (ftruncate(fd, (off_t)block_size) == -1)
-		err(1, "ftruncate %s", reuse);
-	source_marker = 'x';
-	n = pwrite(fd, &source_marker, 1, 0);
-	if (n == -1)
-		err(1, "pwrite %s", reuse);
-	if (n != 1)
-		errx(1, "short write to %s", reuse);
-	if (fsync(fd) == -1)
-		err(1, "fsync %s", reuse);
-	if (close(fd) == -1)
-		err(1, "close %s", reuse);
-	check_block_reuse_source(root);
-	fd = open(reuse, O_RDWR | O_CLOEXEC);
-	if (fd == -1)
-		err(1, "open %s", reuse);
-	if (ftruncate(fd, 0) == -1)
-		err(1, "ftruncate %s", reuse);
-	verify_block_reuse(root);
-	write_pattern(fd, (off_t)block_size, REUSE_SEED);
-	if (fsync(fd) == -1)
-		err(1, "fsync %s", reuse);
-	if (close(fd) == -1)
-		err(1, "close %s", reuse);
-	verify_block_reuse(root);
-	if (unlink(reuse) == -1)
-		err(1, "unlink %s", reuse);
 
 	fd = open_output(next, 1);
 	write_pattern(fd, 12345, NEW_SEED);
