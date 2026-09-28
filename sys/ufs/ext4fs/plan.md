@@ -995,6 +995,33 @@ completing Phase 5.
 
 ## Phase 6: Crash-consistency test matrix
 
+### Phase 6 implementation status (2026-09-28)
+
+The VMM storage path was audited before relying on it for durability
+tests.  vmd did not advertise `VIRTIO_BLK_F_FLUSH`, so guest cache-sync
+requests completed without reaching the host backing file.  Its BSD
+block-backend interface now has a flush operation, implemented with
+`fsync(2)` for raw and qcow2 images.  vioblk handles the virtio flush
+request and advertises the feature.  vmd builds with its production
+warning flags, and the existing raw/qcow2 disk-format regression passes
+through both flush methods.
+
+A separate `regress/sys/ext4fs_crash` directory now builds the
+`PROG=ext4fs_crash` workload and includes a non-root state-model
+self-test.  Its explicit root-only VMM target creates a clean ext4
+fixture, force-stops a production-kernel guest around write, `fsync()`,
+and rename windows, then recovers the image in a fresh guest.  It
+accepts only modeled old-or-new namespace and data states, runs offline
+`e2fsck -fn`, and requires a second read-only mount to leave the
+complete image hash unchanged.  The target is intentionally excluded
+from ordinary regress runs.
+
+This initial harness covers externally scheduled operation windows.  It
+does not yet claim deterministic coverage of every internal commit
+phase.  Durable-state classification at each journal flush boundary,
+the remaining workload matrix, wraparound, and Linux verification remain
+Phase 6 work.
+
 Use filesystem images created by Linux tools and run IABSD in a VM.
 Inject an abrupt power loss after each commit phase and at journal
 wraparound boundaries.

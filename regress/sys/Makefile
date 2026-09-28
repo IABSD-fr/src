@@ -2,7 +2,7 @@
 #	$NetBSD: Makefile,v 1.4 1995/04/20 22:41:08 cgd Exp $
 
 SUBDIR=	altivec_ast btcfi copy crypto dev ddb ext4fs ext4fs_corrupt \
-	ext4fsops ffs \
+	ext4fs_crash ext4fsops ffs \
 	fifofs fileops kern mfs_noperm \
 	net netinet netinet6 nfs ptrace sys uvm
 .if exists(arch/${MACHINE}/Makefile)

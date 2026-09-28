@@ -1273,7 +1273,8 @@ virtio_init(struct vmd_vm *vm, int child_cdrom,
 			}
 			virtio_dev_init(vm, dev, id, VIOBLK_QUEUE_SIZE_DEFAULT,
 			    VIRTIO_BLK_QUEUES,
-			    (VIRTIO_F_VERSION_1 | VIRTIO_BLK_F_SEG_MAX));
+			    (VIRTIO_F_VERSION_1 | VIRTIO_BLK_F_SEG_MAX |
+			    VIRTIO_BLK_F_FLUSH));
 
 			bar_id = pci_add_bar(id, PCI_MAPREG_TYPE_IO, virtio_pci_io,
 			    dev);

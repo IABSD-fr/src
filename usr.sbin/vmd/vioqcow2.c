@@ -103,6 +103,7 @@ static ssize_t qc2_pread(void *, char *, size_t, off_t);
 static ssize_t qc2_preadv(void *, struct iovec *, int, off_t);
 static ssize_t qc2_pwrite(void *, char *, size_t, off_t);
 static ssize_t qc2_pwritev(void *, struct iovec *, int, off_t);
+static int qc2_flush(void *);
 static void qc2_close(void *, int);
 
 /*
@@ -128,6 +129,7 @@ virtio_qcow2_init(struct virtio_backing *file, off_t *szp, int *fd, size_t nfd)
 	file->preadv = qc2_preadv;
 	file->pwrite = qc2_pwrite;
 	file->pwritev = qc2_pwritev;
+	file->flush = qc2_flush;
 	file->close = qc2_close;
 	*szp = diskp->disksz;
 	return 0;
@@ -448,6 +450,14 @@ qc2_pwrite(void *p, char *buf, size_t len, off_t off)
 		rem -= sz;
 	}
 	return len;
+}
+
+static int
+qc2_flush(void *p)
+{
+	struct qcdisk *disk = p;
+
+	return fsync(disk->fd);
 }
 
 static void

@@ -328,6 +328,11 @@ vioblk_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 			else
 				ds = VIRTIO_BLK_S_OK;
 			break;
+		case VIRTIO_BLK_T_FLUSH:
+		case VIRTIO_BLK_T_FLUSH_OUT:
+			ds = vioblk->file.flush(vioblk->file.p) == -1 ?
+			    VIRTIO_BLK_S_IOERR : VIRTIO_BLK_S_OK;
+			break;
 		case VIRTIO_BLK_T_GET_ID:
 			/*
 			 * We don't support this command yet. While it's not

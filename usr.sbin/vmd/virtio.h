@@ -170,6 +170,7 @@ struct virtio_backing {
 	ssize_t (*preadv)(void *, struct iovec *, int, off_t);
 	ssize_t (*pwrite)(void *, char *, size_t, off_t);
 	ssize_t (*pwritev)(void *, struct iovec *, int, off_t);
+	int (*flush)(void *);
 	void (*close)(void *, int);
 };
 
