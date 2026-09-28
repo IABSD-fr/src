@@ -1072,8 +1072,11 @@ block count, sparse holes, source data, appended data, and external-leaf
 count.  Recovery idempotence and offline `e2fsck -fn` remain mandatory.
 The non-root helper self-test, fixture-shape checks, build, and shell
 validation pass.  The explicit
-`run-regress-ext4fs-crash-extent-vmm` target still awaits the
-production-kernel root VMM run.
+`run-regress-ext4fs-crash-extent-vmm` target covers all six durability
+boundaries for both transitions.  On 2026-09-28, all twelve cases
+passed against the installed production kernel, including exact
+extent-tree shape, recovery idempotence, and offline `e2fsck -fn`
+acceptance.
 
 The remaining truncate/revoke, exhaustion, wraparound, error injection,
 and Linux verification matrices remain Phase 6 work.
