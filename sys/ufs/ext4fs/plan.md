@@ -311,7 +311,7 @@ blockers:
 - validate normal extent trees as strictly as journal and orphan extent
   trees, including depth, entry capacity, ordering, physical ranges,
   checksums, and unwritten extents; reject writes and truncates of
-  unsupported depth-2-or- deeper trees rather than treating index blocks
+  unsupported depth-2-or-deeper trees rather than treating index blocks
   as leaves;
 - validate mount geometry and every block-group metadata location with
   overflow-safe arithmetic on both 32-bit and 64-bit systems,
