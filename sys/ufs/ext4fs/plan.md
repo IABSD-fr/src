@@ -857,7 +857,7 @@ Wrap each compound namespace operation in one transaction:
       it.
 - [x] Define remount read-only/read-write behavior.
 - [ ] Implement consistent journal abort and ext4 error-policy handling.
-- [ ] Expose useful journal state and failure diagnostics without
+- [x] Expose useful journal state and failure diagnostics without
       excessive normal-operation logging.
 
 The `fsync()` durability path is complete.  A synchronous flush waits
@@ -949,14 +949,14 @@ writable, and succeed after the final close retires the orphan.  On
 2026-09-28, the focused target and complete ext4fs suite passed against
 the rebuilt and booted production kernel.
 
-Journal abort and error-policy handling is implemented but still awaits
-its production-kernel runtime gate.  The first journal error is sticky,
-marks the ext4 filesystem erroneous, publishes the mount read-only, and
-wakes journal waiters.  Both `errors=continue` and `errors=remount-ro`
-force read-only operation because metadata updates cannot safely
-continue without the journal; `errors=panic` panics.  Invalid on-disk
-policies are rejected during mount.  Aborted teardown preserves
-`RECOVER` and any durable orphan roots for the next recovery.
+Journal abort and error-policy handling is implemented.  The first
+journal error is sticky, marks the ext4 filesystem erroneous, publishes
+the mount read-only, and wakes journal waiters.  Both `errors=continue`
+and `errors=remount-ro` force read-only operation because metadata
+updates cannot safely continue without the journal; `errors=panic`
+panics.  Invalid on-disk policies are rejected during mount.  Aborted
+teardown preserves `RECOVER` and any durable orphan roots for the next
+recovery.
 
 Only the first abort emits a diagnostic.  It names the mount, exact
 caller and synchronized commit stage, error, transaction sequence, and
@@ -964,9 +964,10 @@ journal head, tail, and free-space state.  Normal commits do not log,
 and the unsupported ext4fs VFS sysctl now returns `EOPNOTSUPP` silently.
 The shared non-root journal-core regression verifies sticky errors and
 every exact diagnostic stage name.  The kernel corruption suite covers
-both non-panic policies at every filesystem block size.  A final kernel
-build, boot, and root regression run remain the completion gate after
-the commit-stage locking refinement.
+both non-panic policies at every filesystem block size.  On 2026-09-28,
+the final production kernel built and booted after the commit-stage
+locking refinement, and the complete ext4fs regression suite passed.
+Only the isolated panic-policy test remains for abort-policy completion.
 
 `errors=panic` must be tested only in a disposable vmd guest.  The guest
 will boot the host's installed production `/bsd`, attach a copied IABSD
