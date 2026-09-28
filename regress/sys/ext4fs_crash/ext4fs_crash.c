@@ -54,6 +54,8 @@
 #define EXTENT_NODE_ENTRY_BYTES	12
 #define EXTENT_SPLIT_SEED	0x68U
 #define TRUNCATE_FILE	"truncate-probe"
+#define REUSE_FILE	"reuse-probe"
+#define REUSE_SEED	0xb4U
 
 #define JBD2_MAGIC		UINT32_C(0xc03b3998)
 #define JBD2_SUPERBLOCK_V2	4
@@ -100,6 +102,8 @@ static void	check_sparse_extents (int, unsigned char *, size_t,
 static int	check_extent_growth (const char *, size_t, size_t,
     size_t);
 static int	check_truncate_prune (const char *);
+static void	check_block_reuse_source (const char *);
+static int	check_block_reuse (const char *);
 static void	write_extent_block (int, size_t, off_t);
 static void	write_pattern (int, off_t, unsigned int);
 static void	check_pattern (const char *, off_t, unsigned int);
@@ -114,12 +118,14 @@ static void	run_dir_growth (const char *, const char *, int);
 static void	run_rmdir_open (const char *, const char *, int);
 static void	run_extent_growth (const char *, const char *, int);
 static void	run_truncate_prune (const char *, const char *, int);
+static void	run_block_reuse (const char *, const char *, int);
 static void	run_workload (const char *, const char *, int);
 static void	verify_dir_growth (const char *);
 static void	verify_rmdir (const char *);
 static void	verify_extent_promote (const char *);
 static void	verify_extent_split (const char *);
 static void	verify_truncate_prune (const char *);
+static void	verify_block_reuse (const char *);
 static void	verify_workload (const char *);
 static void	verify_unlink (const char *);
 static void	selftest (void);
@@ -463,6 +469,71 @@ check_truncate_prune (const char *root)
 	if (close(fd) == -1)
 		err(1, "close %s", path);
 	return (state);
+}
+
+static void
+check_block_reuse_source (const char *root)
+{
+	unsigned char buf[IO_BYTES];
+	struct stat st;
+	char path[PATH_MAX];
+	blkcnt_t expected_sectors;
+	ssize_t n;
+	size_t block_size;
+	int fd;
+
+	block_size = filesystem_block_size(root);
+	if (block_size > sizeof(buf))
+		errx(1, "reuse block exceeds input buffer");
+	make_path(path, sizeof(path), root, REUSE_FILE);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	expected_sectors = (blkcnt_t)(block_size / 512);
+	if (! S_ISREG(st.st_mode) || st.st_nlink != 1 ||
+	    st.st_size != (off_t)block_size ||
+	    st.st_blocks != expected_sectors)
+		errx(1, "%s has invalid source shape", path);
+	n = pread(fd, buf, block_size, 0);
+	if (n == -1)
+		err(1, "pread %s", path);
+	if ((size_t)n != block_size)
+		errx(1, "short read from %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (buf[0] != 'x')
+		errx(1, "%s has invalid source marker", path);
+	buf[0] = 0;
+	check_extent_zero(buf, block_size, "reuse source");
+}
+
+static int
+check_block_reuse (const char *root)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	blkcnt_t expected_sectors;
+	size_t block_size;
+
+	block_size = filesystem_block_size(root);
+	make_path(path, sizeof(path), root, REUSE_FILE);
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (! S_ISREG(st.st_mode) || st.st_nlink != 1)
+		errx(1, "%s has invalid inode shape", path);
+	if (st.st_size == 0) {
+		if (st.st_blocks != 0)
+			errx(1, "%s retains blocks after truncate", path);
+		return (0);
+	}
+	expected_sectors = (blkcnt_t)(block_size / 512);
+	if (st.st_size != (off_t)block_size ||
+	    st.st_blocks != expected_sectors)
+		errx(1, "%s has invalid reused shape", path);
+	check_pattern(path, (off_t)block_size, REUSE_SEED);
+	return (1);
 }
 
 static void
@@ -902,6 +973,37 @@ run_truncate_prune (const char *stage, const char *root, int boundary)
 }
 
 static void
+run_block_reuse (const char *stage, const char *root, int boundary)
+{
+	char path[PATH_MAX];
+	size_t block_size;
+	int fd;
+
+	check_block_reuse_source(root);
+	block_size = filesystem_block_size(root);
+	make_path(path, sizeof(path), root, REUSE_FILE);
+	fd = open(path, O_RDWR | O_CLOEXEC);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (ftruncate(fd, 0) == -1)
+		err(1, "ftruncate %s", path);
+	if (check_block_reuse(root) != 0)
+		errx(1, "%s fixture retains its block", stage);
+	if (boundary)
+		arm_boundary(stage);
+	else
+		arm_cut(stage);
+	write_pattern(fd, (off_t)block_size, REUSE_SEED);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (printf("DONE %s\n", stage) < 0 ||
+	    fflush(stdout) == EOF)
+		err(1, "publish completion marker");
+	for (;;)
+		(void)pause();
+}
+
+static void
 run_workload (const char *stage, const char *root, int boundary)
 {
 	char current[PATH_MAX], next[PATH_MAX];
@@ -909,6 +1011,10 @@ run_workload (const char *stage, const char *root, int boundary)
 
 	make_path(current, sizeof(current), root, "current");
 	make_path(next, sizeof(next), root, "next");
+	if (strcmp(stage, "block-reuse") == 0) {
+		run_block_reuse(stage, root, boundary);
+		return;
+	}
 	if (strcmp(stage, "truncate-prune") == 0) {
 		run_truncate_prune(stage, root, boundary);
 		return;
@@ -1095,6 +1201,17 @@ verify_truncate_prune (const char *root)
 }
 
 static void
+verify_block_reuse (const char *root)
+{
+	int state;
+
+	state = check_block_reuse(root);
+	printf("state=reuse-%s\n", state ? "allocated" : "free");
+	if (fflush(stdout) == EOF)
+		err(1, "publish block-reuse state");
+}
+
+static void
 verify_workload (const char *root)
 {
 	struct stat current_st, next_st;
@@ -1176,8 +1293,12 @@ selftest (void)
 	char current[PATH_MAX], entry[PATH_MAX], grow[PATH_MAX];
 	char journal_path[PATH_MAX];
 	char marker[PATH_MAX], next[PATH_MAX], removed[PATH_MAX];
+	char reuse[PATH_MAX];
 	char root[] = "/tmp/ext4fs_crash.XXXXXXXX";
+	char source_marker;
 	off_t grown, initial;
+	ssize_t n;
+	size_t block_size;
 	int fd;
 
 	if (mkdtemp(root) == NULL)
@@ -1218,6 +1339,37 @@ selftest (void)
 	if (rmdir(removed) == -1)
 		err(1, "rmdir %s", removed);
 	verify_rmdir(root);
+
+	block_size = filesystem_block_size(root);
+	make_path(reuse, sizeof(reuse), root, REUSE_FILE);
+	fd = open_output(reuse, 1);
+	if (ftruncate(fd, (off_t)block_size) == -1)
+		err(1, "ftruncate %s", reuse);
+	source_marker = 'x';
+	n = pwrite(fd, &source_marker, 1, 0);
+	if (n == -1)
+		err(1, "pwrite %s", reuse);
+	if (n != 1)
+		errx(1, "short write to %s", reuse);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", reuse);
+	if (close(fd) == -1)
+		err(1, "close %s", reuse);
+	check_block_reuse_source(root);
+	fd = open(reuse, O_RDWR | O_CLOEXEC);
+	if (fd == -1)
+		err(1, "open %s", reuse);
+	if (ftruncate(fd, 0) == -1)
+		err(1, "ftruncate %s", reuse);
+	verify_block_reuse(root);
+	write_pattern(fd, (off_t)block_size, REUSE_SEED);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", reuse);
+	if (close(fd) == -1)
+		err(1, "close %s", reuse);
+	verify_block_reuse(root);
+	if (unlink(reuse) == -1)
+		err(1, "unlink %s", reuse);
 
 	fd = open_output(next, 1);
 	write_pattern(fd, 12345, NEW_SEED);
@@ -1329,6 +1481,9 @@ main (int argc, char **argv)
 	else if (argc == 3 &&
 	    strcmp(argv[1], "verify-truncate-prune") == 0)
 		verify_truncate_prune(argv[2]);
+	else if (argc == 3 &&
+	    strcmp(argv[1], "verify-block-reuse") == 0)
+		verify_block_reuse(argv[2]);
 	else
 		errx(1, "usage: ext4fs_crash pattern-old path | "
 		    "journal-state path | journal-revokes path | "
@@ -1337,6 +1492,7 @@ main (int argc, char **argv)
 		    "verify-dir-growth root | verify-rmdir root | "
 		    "verify-extent-promote root | "
 		    "verify-extent-split root | "
-		    "verify-truncate-prune root");
+		    "verify-truncate-prune root | "
+		    "verify-block-reuse root");
 	return (0);
 }

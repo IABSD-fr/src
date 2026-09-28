@@ -102,7 +102,7 @@ for stage in $EXT4FS_CRASH_STAGES; do
 	esac
 done
 case "$EXT4FS_CRASH_MODE" in
-timed|flush|orphan|directory|extent|truncate) ;;
+timed|flush|orphan|directory|extent|truncate|reuse) ;;
 *)	fail "unsupported crash mode: $EXT4FS_CRASH_MODE" ;;
 esac
 if [ "$EXT4FS_CRASH_MODE" != timed ]; then
@@ -553,6 +553,28 @@ filesystem_free_blocks()
 	echo "$blocks"
 }
 
+filesystem_block_map()
+{
+	image=$1
+	block_path=$2
+	logical=$3
+	output=$4
+	if ! mapped_block=$("$DEBUGFS" \
+	    -R "bmap $block_path $logical" "$image" 2>"$output"); then
+		cat "$output" >&2
+		fail "could not map $block_path logical block $logical"
+	fi
+	mapped_block=$(echo "$mapped_block" |
+	    awk 'NF { value = $NF } END { print value }')
+	case "$mapped_block" in
+	''|*[!0-9]*)
+		cat "$output" >&2
+		fail "invalid physical block for $block_path"
+		;;
+	esac
+	echo "$mapped_block"
+}
+
 run_flush_matrix()
 {
 	base=$1
@@ -564,12 +586,15 @@ run_flush_matrix()
 	after_state=$7
 	before_leaves=${8:-}
 	after_leaves=${9:-}
+	matrix_extent_path=
+	matrix_block_path=
 	case "$stage" in
 	extent-*) matrix_extent_path=/crash/extent-probe ;;
 	truncate-*) matrix_extent_path=/crash/truncate-probe ;;
-	*) matrix_extent_path= ;;
+	block-reuse) matrix_block_path=/crash/reuse-probe ;;
 	esac
 	base_free_blocks=
+	base_reuse_block=
 	truncate_freed_blocks=
 	if [ "$stage" = truncate-prune ]; then
 		base_super=$work/base-super-$block_size.log
@@ -589,6 +614,16 @@ run_flush_matrix()
 		grep -q ' incompat=1$' \
 		    "$work/base-revokes-$block_size.log" ||
 		    fail "truncate baseline lacks REVOKE feature"
+	elif [ "$stage" = block-reuse ]; then
+		base_super=$work/base-reuse-super-$block_size.log
+		"$DUMPE2FS" -h "$base" >"$base_super" 2>&1 ||
+		    fail "could not inspect block-reuse baseline"
+		base_free_blocks=$(filesystem_free_blocks "$base_super")
+		base_reuse_block=$(filesystem_block_map "$base" \
+		    "$matrix_block_path" 0 \
+		    "$work/base-reuse-map-$block_size.log")
+		[ "$base_reuse_block" -gt 0 ] ||
+		    fail "block-reuse source has no physical block"
 	fi
 
 	for flush_count in $EXT4FS_CRASH_FLUSH_COUNTS; do
@@ -669,9 +704,50 @@ $durable_journal_state != $expected_journal"
 			fi
 			[ "$recovered_free" -eq "$expected_free" ] ||
 			    fail "truncate free-block count mismatch"
+		elif [ "$stage" = block-reuse ]; then
+			recovered_free=$(filesystem_free_blocks \
+			    "$case_dir/dumpe2fs.log")
+			recovered_block=$(filesystem_block_map "$image" \
+			    "$matrix_block_path" 0 \
+			    "$case_dir/recovered-block-map.log")
+			if [ "$expected_state" = state=reuse-free ]; then
+				expected_free=$((base_free_blocks + 1))
+				expected_block=0
+			else
+				expected_free=$base_free_blocks
+				expected_block=$base_reuse_block
+			fi
+			[ "$recovered_free" -eq "$expected_free" ] ||
+			    fail "block-reuse free-block count mismatch"
+			[ "$recovered_block" -eq "$expected_block" ] ||
+			    fail "block-reuse physical block mismatch"
 		fi
 		echo ' ok'
 	done
+}
+
+prepare_block_reuse_base()
+{
+	image=$1
+	block_size=$2
+	source_root=$work/source-reuse-$block_size
+	source_file=$source_root/crash/reuse-probe
+
+	mkdir -p "$source_root/crash"
+	dd if=/dev/zero of="$source_file" bs=1 count=0 \
+	    seek="$block_size" status=none
+	printf x | dd of="$source_file" bs=1 conv=notrunc status=none
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_CRASH_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O 'metadata_csum,^orphan_file' -d "$source_root" \
+	    "$image" >"$work/mke2fs-reuse-$block_size.log" 2>&1; then
+		cat "$work/mke2fs-reuse-$block_size.log" >&2
+		fail "could not create block-reuse fixture"
+	fi
+	"$E2FSCK" -fn "$image" \
+	    >"$work/e2fsck-reuse-$block_size.log" 2>&1 ||
+	    fail "e2fsck rejected block-reuse fixture"
 }
 
 prepare_sparse_extent_base()
@@ -748,6 +824,15 @@ old_data=$work/old.data
 "$EXT4FS_CRASH" pattern-old "$old_data"
 
 for block_size in $EXT4FS_CRASH_BLOCK_SIZES; do
+	if [ "$EXT4FS_CRASH_MODE" = reuse ]; then
+		reuse_base=$work/base-reuse-$block_size.img
+		prepare_block_reuse_base "$reuse_base" "$block_size"
+		run_flush_matrix "$reuse_base" "$block_size" \
+		    block-reuse 'block reuse' verify-block-reuse \
+		    'state=reuse-free' 'state=reuse-allocated'
+		continue
+	fi
+
 	if [ "$EXT4FS_CRASH_MODE" = truncate ]; then
 		extent_capacity=$(((block_size - 12) / 12))
 		truncate_base=$work/base-truncate-$block_size.img

@@ -995,7 +995,7 @@ completing Phase 5.
 
 ## Phase 6: Crash-consistency test matrix
 
-### Phase 6 implementation status (2026-09-28)
+### Phase 6 implementation status (2026-09-29)
 
 The VMM storage path was audited before relying on it for durability
 tests.  vmd did not advertise `VIRTIO_BLK_F_FLUSH`, so guest cache-sync
@@ -1100,8 +1100,21 @@ the installed production kernel, including exact revoke counts,
 allocator accounting, recovery idempotence, and offline `e2fsck -fn`
 acceptance.
 
-The remaining block-reuse, exhaustion, wraparound, error injection, and
-Linux verification matrices remain Phase 6 work.
+The deterministic block-reuse matrix is now integrated.  Each fixture
+starts with one allocated data block.  Before arming the selected
+boundary, the workload durably truncates the file to zero and verifies
+that the inode no longer accounts for a block.  It then reallocates
+logical block zero in a separate transaction.  Every cut requires
+either the exact empty file and one additional free block, or the exact
+new data and the original physical block allocated again.  Recovery
+idempotence and offline `e2fsck -fn` remain mandatory.  The non-root
+helper self-test, shell validation, and fixture audits pass for 1 KiB,
+2 KiB, and 4 KiB blocks.  The explicit
+`run-regress-ext4fs-crash-reuse-vmm` target covers all six durability
+boundaries and awaits its production-kernel run.
+
+The remaining exhaustion, wraparound, error injection, and Linux
+verification matrices remain Phase 6 work.
 
 Use filesystem images created by Linux tools and run IABSD in a VM.
 Inject an abrupt power loss after each commit phase and at journal

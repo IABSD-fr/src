@@ -108,4 +108,19 @@ run-regress-ext4fs-crash-truncate-vmm: ${PROG}
 	    EXT4FS_CRASH_MODE='truncate' \
 	    sh ${.CURDIR}/crash-vmm.sh
 
+# Explicit only: crash block reallocation durability boundaries.
+run-regress-ext4fs-crash-reuse-vmm: ${PROG}
+	env EXT4FS_CRASH='${.OBJDIR}/${PROG}' \
+	    EXT4FS_CRASH_VMM_BASE='${EXT4FS_CRASH_VMM_BASE}' \
+	    EXT4FS_CRASH_VMM_KERNEL='${EXT4FS_CRASH_VMM_KERNEL}' \
+	    EXT4FS_CRASH_VMM_DIR='${EXT4FS_CRASH_VMM_DIR}' \
+	    EXT4FS_CRASH_BOOT_TIMEOUT='${EXT4FS_CRASH_BOOT_TIMEOUT}' \
+	    EXT4FS_CRASH_STEP_TIMEOUT='${EXT4FS_CRASH_STEP_TIMEOUT}' \
+	    EXT4FS_CRASH_IMAGE_MB='${EXT4FS_CRASH_IMAGE_MB}' \
+	    EXT4FS_CRASH_BLOCK_SIZES='${EXT4FS_CRASH_BLOCK_SIZES}' \
+	    EXT4FS_CRASH_FLUSH_COUNTS='${EXT4FS_CRASH_FLUSH_COUNTS}' \
+	    EXT4FS_CRASH_SSH_KEY='${EXT4FS_CRASH_SSH_KEY}' \
+	    EXT4FS_CRASH_MODE='reuse' \
+	    sh ${.CURDIR}/crash-vmm.sh
+
 .include <bsd.regress.mk>
