@@ -55,6 +55,9 @@
 #define BITMAP_SEED	0xc7U
 #define FSYNC_INITIAL_SEED	0x2dU
 #define FSYNC_UPDATE_SEED	0xe1U
+#define SYNC_INITIAL_SEED	0x46U
+#define OSYNC_UPDATE_SEED	0x8bU
+#define MOUNT_SYNC_SEED		0xf2U
 
 static char root[PATH_MAX];
 static size_t block_size;
@@ -129,6 +132,10 @@ static void	create_fsync_fixture (void);
 static void	update_fsync_fixture (void);
 static void	clean_fsync_fixture (void);
 static void	verify_fsync_fixture (void);
+static void	create_sync_fixture (void);
+static void	update_sync_fixture (int, unsigned int);
+static void	clean_osync_fixture (void);
+static void	verify_sync_fixture (unsigned int);
 
 static void
 make_path (char *path, size_t pathlen, const char *suffix)
@@ -2676,6 +2683,95 @@ verify_fsync_fixture (void)
 		err(1, "close %s", path);
 }
 
+static void
+create_sync_fixture (void)
+{
+	char path[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "sync-file");
+	length = 2 * block_size + 73;
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	write_pattern_fd(fd, 0, length, SYNC_INITIAL_SEED);
+	if (fsync(fd) == -1)
+		err(1, "initial fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+update_sync_fixture (int flags, unsigned int seed)
+{
+	struct stat after, before;
+	char path[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "sync-file");
+	length = 2 * block_size + 73;
+	fd = open(path, O_RDWR | flags);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &before) == -1)
+		err(1, "fstat %s", path);
+	if (!S_ISREG(before.st_mode) ||
+	    before.st_size != (off_t)length)
+		errx(1, "synchronous-write fixture has wrong shape");
+	write_pattern_fd(fd, 0, length, seed);
+	if (fstat(fd, &after) == -1)
+		err(1, "fstat updated %s", path);
+	if (after.st_size != before.st_size ||
+	    after.st_blocks != before.st_blocks)
+		errx(1, "synchronous in-place write changed allocation");
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+clean_osync_fixture (void)
+{
+	char path[PATH_MAX];
+	ssize_t n;
+	int fd;
+
+	make_path(path, sizeof(path), "sync-file");
+	fd = open(path, O_RDWR | O_SYNC);
+	if (fd == -1)
+		err(1, "open %s", path);
+	n = write(fd, "", 0);
+	if (n == -1)
+		err(1, "zero-length O_SYNC write %s", path);
+	if (n != 0)
+		errx(1, "non-zero result from empty O_SYNC write");
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+verify_sync_fixture (unsigned int seed)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "sync-file");
+	length = 2 * block_size + 73;
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (!S_ISREG(st.st_mode) || st.st_size != (off_t)length)
+		errx(1, "remounted synchronous-write fixture is invalid");
+	check_pattern_fd(fd, 0, length, seed);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -2831,6 +2927,19 @@ main (int argc, char **argv)
 			clean_fsync_fixture();
 		else if (strcmp(argv[1], "fsync-verify") == 0)
 			verify_fsync_fixture();
+		else if (strcmp(argv[1], "sync-create") == 0)
+			create_sync_fixture();
+		else if (strcmp(argv[1], "osync-update") == 0)
+			update_sync_fixture(O_SYNC,
+			    OSYNC_UPDATE_SEED);
+		else if (strcmp(argv[1], "mount-sync-update") == 0)
+			update_sync_fixture(0, MOUNT_SYNC_SEED);
+		else if (strcmp(argv[1], "osync-clean") == 0)
+			clean_osync_fixture();
+		else if (strcmp(argv[1], "osync-verify") == 0)
+			verify_sync_fixture(OSYNC_UPDATE_SEED);
+		else if (strcmp(argv[1], "sync-verify") == 0)
+			verify_sync_fixture(MOUNT_SYNC_SEED);
 		else
 			errx(1, "unknown mode: %s", argv[1]);
 	}

@@ -12,6 +12,7 @@ REGRESS_TARGETS=	run-regress-ext4fsops \
 			run-regress-ext4fsops-counters \
 			run-regress-ext4fsops-superblock \
 			run-regress-ext4fsops-fsync \
+			run-regress-ext4fsops-sync \
 			run-regress-ext4fsops-extents \
 			run-regress-ext4fsops-directory \
 			run-regress-ext4fsops-orphan \
@@ -68,6 +69,14 @@ run-regress-ext4fsops-fsync: ${PROG}
 	    EXT4FS_IMAGE_MB='${EXT4FS_IMAGE_MB}' \
 	    EXT4FS_BLOCK_SIZES='${EXT4FS_BLOCK_SIZES}' \
 	    EXT4FSOPS_MODE='fsync' \
+	    sh ${.CURDIR}/operations.sh
+
+run-regress-ext4fsops-sync: ${PROG}
+	env EXT4FSOPS='${.OBJDIR}/${PROG}' \
+	    EXT4FS_TIMEOUT='${EXT4FS_TIMEOUT}' \
+	    EXT4FS_IMAGE_MB='${EXT4FS_IMAGE_MB}' \
+	    EXT4FS_BLOCK_SIZES='${EXT4FS_BLOCK_SIZES}' \
+	    EXT4FSOPS_MODE='sync' \
 	    sh ${.CURDIR}/operations.sh
 
 run-regress-ext4fsops-extents: ${PROG}

@@ -4808,9 +4808,12 @@ do_io:
 			break;
 		}
 
-		if (ioflag & IO_SYNC)
-			(void)bwrite(bp);
-		else if (xfersize + blkoffset == fs->m_block_size)
+		if (ioflag & IO_SYNC) {
+			error = bwrite(bp);
+			bp = NULL;
+			if (error)
+				break;
+		} else if (xfersize + blkoffset == fs->m_block_size)
 			bawrite(bp);
 		else
 			bdwrite(bp);

@@ -1301,6 +1301,99 @@ run_fsync_case()
 	echo " ok"
 }
 
+run_sync_case()
+{
+	block_size=$1
+	case_dir=$work/sync-$block_size
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	test_name="O_SYNC and sync mount ($block_size byte blocks)"
+	print_test_name "$test_name"
+
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O 'metadata_csum,^orphan_file' "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs failed"
+	fi
+
+	attach_image
+	mount_image ""
+	run_step sync-create "$mountpoint"
+	unmount_image sync-create
+	detach_image
+	check_superblock_clean sync-create
+	check_image sync-create
+	sequence_before=$(journal_sequence)
+
+	attach_image
+	mount_image ""
+	run_step osync-update "$mountpoint"
+	sequence_live=$(journal_sequence)
+	[ "$sequence_live" != "$sequence_before" ] ||
+	    fail "O_SYNC returned before committing the inode"
+	unmount_image osync-update
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" = "$sequence_live" ] ||
+	    fail "O_SYNC left a transaction for unmount"
+	check_superblock_clean osync-update
+	check_image osync-update
+
+	before=$(sha256 -q "$image")
+	attach_image
+	mount_image ro
+	run_step osync-verify "$mountpoint"
+	unmount_image osync-verify
+	detach_image
+	after=$(sha256 -q "$image")
+	[ "$before" = "$after" ] ||
+	    fail "O_SYNC verification changed the image"
+	sequence_before=$sequence_after
+
+	attach_image
+	mount_image sync
+	run_step mount-sync-update "$mountpoint"
+	sequence_live=$(journal_sequence)
+	[ "$sequence_live" != "$sequence_before" ] ||
+	    fail "synchronous mount returned before commit"
+	unmount_image mount-sync-update
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" = "$sequence_live" ] ||
+	    fail "synchronous mount left a transaction for unmount"
+	check_superblock_clean mount-sync-update
+	check_image mount-sync-update
+	sequence_before=$sequence_after
+
+	attach_image
+	mount_image ""
+	run_step osync-clean "$mountpoint"
+	sequence_live=$(journal_sequence)
+	[ "$sequence_live" = "$sequence_before" ] ||
+	    fail "empty O_SYNC write created a transaction"
+	unmount_image osync-clean
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" = "$sequence_before" ] ||
+	    fail "clean synchronous cycle advanced the journal"
+	check_superblock_clean osync-clean
+	check_image osync-clean
+
+	before=$(sha256 -q "$image")
+	attach_image
+	mount_image ro
+	run_step sync-verify "$mountpoint"
+	unmount_image sync-verify
+	detach_image
+	after=$(sha256 -q "$image")
+	[ "$before" = "$after" ] ||
+	    fail "synchronous-mount verification changed the image"
+	echo " ok"
+}
+
 extent_leaf_count()
 {
 	stage=$1
@@ -1880,6 +1973,19 @@ fsync)
 			;;
 		esac
 		run_fsync_case "$block_size"
+	done
+	exit 0
+	;;
+sync)
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		case "$block_size" in
+		1024|2048|4096) ;;
+		*)
+			echo "bad block size: $block_size" >&2
+			exit 1
+			;;
+		esac
+		run_sync_case "$block_size"
 	done
 	exit 0
 	;;
