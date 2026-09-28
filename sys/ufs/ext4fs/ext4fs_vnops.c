@@ -4848,13 +4848,28 @@ ext4fs_fsync (void *v)
 {
 	struct vop_fsync_args *ap = v;
 	struct vnode *vp = ap->a_vp;
-
+	int error, s;
 
 	if (vp->v_mount->mnt_flag & MNT_RDONLY)
 		return (0);
 
 	vflushbuf(vp, ap->a_waitfor == MNT_WAIT);
-	return (ext4fs_update(VTOI(vp), ap->a_waitfor == MNT_WAIT));
+	if (ap->a_waitfor == MNT_WAIT) {
+		s = splbio();
+		error = ISSET(vp->v_bioflag, VBIOERROR) ? EIO : 0;
+		splx(s);
+		if (error)
+			return (error);
+	}
+
+	/*
+	 * On a journaled mount, ext4fs_update() attaches the inode-table
+	 * block to the running transaction.  Its synchronous commit
+	 * flushes prior data first, makes the commit record durable, and
+	 * checkpoints the inode.
+	 */
+	return (ext4fs_update(VTOI(vp),
+	    ap->a_waitfor == MNT_WAIT));
 }
 
 int

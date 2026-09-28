@@ -847,7 +847,7 @@ Wrap each compound namespace operation in one transaction:
 
 ## Phase 5: VFS semantics
 
-- [ ] Make `fsync()` commit the transaction containing the inode and
+- [x] Make `fsync()` commit the transaction containing the inode and
       wait for ordered data and the commit record to become durable.
 - [ ] Make synchronous mounts and `O_SYNC` writes force the required
       commit.
@@ -859,6 +859,21 @@ Wrap each compound namespace operation in one transaction:
 - [ ] Implement consistent journal abort and ext4 error-policy handling.
 - [ ] Expose useful journal state and failure diagnostics without
       excessive normal-operation logging.
+
+The `fsync()` durability path is complete.  A synchronous flush waits
+for vnode data writes and checks their sticky error state before inode
+metadata can enter the journal.  The inode-table block then joins the
+running transaction.  Commit processing flushes earlier data, writes
+and flushes the commit record, checkpoints the inode, and empties the
+journal before returning.
+
+The focused `run-regress-ext4fsops-fsync` target exercises initial and
+in-place writes with 1 KiB, 2 KiB, and 4 KiB filesystem blocks.  It
+requires dirty `fsync()` calls to advance the journal sequence, proves
+that a clean `fsync()` creates no transaction, verifies remounted data,
+and finishes with offline `e2fsck -fn`.  On 2026-09-28, the focused
+target and complete ext4fs suite passed against the rebuilt and booted
+production kernel.
 
 ## Phase 6: Crash-consistency test matrix
 

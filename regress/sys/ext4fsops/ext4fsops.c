@@ -53,6 +53,8 @@
 #define EXTENT_SPLIT_SEED	0x68U
 #define EXTENT_APPEND_SEED	0x79U
 #define BITMAP_SEED	0xc7U
+#define FSYNC_INITIAL_SEED	0x2dU
+#define FSYNC_UPDATE_SEED	0xe1U
 
 static char root[PATH_MAX];
 static size_t block_size;
@@ -123,6 +125,10 @@ static void	verify_inode_probe (void);
 static void	free_inode_probe (void);
 static void	reject_block_counter (void);
 static void	reject_inode_counter (void);
+static void	create_fsync_fixture (void);
+static void	update_fsync_fixture (void);
+static void	clean_fsync_fixture (void);
+static void	verify_fsync_fixture (void);
 
 static void
 make_path (char *path, size_t pathlen, const char *suffix)
@@ -2588,6 +2594,88 @@ reject_inode_counter (void)
 		errx(1, "rejected inode allocation changed counters");
 }
 
+static void
+create_fsync_fixture (void)
+{
+	char path[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "fsync-file");
+	length = 3 * block_size + 37;
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	write_pattern_fd(fd, 0, length, FSYNC_INITIAL_SEED);
+	if (fsync(fd) == -1)
+		err(1, "initial fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+update_fsync_fixture (void)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "fsync-file");
+	length = 3 * block_size + 37;
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (!S_ISREG(st.st_mode) || st.st_size != (off_t)length)
+		errx(1, "fsync fixture has wrong shape");
+	write_pattern_fd(fd, 0, length, FSYNC_UPDATE_SEED);
+	if (fsync(fd) == -1)
+		err(1, "update fsync %s", path);
+	check_pattern_fd(fd, 0, length, FSYNC_UPDATE_SEED);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+clean_fsync_fixture (void)
+{
+	char path[PATH_MAX];
+	int fd;
+
+	make_path(path, sizeof(path), "fsync-file");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fsync(fd) == -1)
+		err(1, "clean fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+verify_fsync_fixture (void)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "fsync-file");
+	length = 3 * block_size + 37;
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (!S_ISREG(st.st_mode) || st.st_size != (off_t)length)
+		errx(1, "remounted fsync fixture has wrong shape");
+	check_pattern_fd(fd, 0, length, FSYNC_UPDATE_SEED);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -2735,6 +2823,14 @@ main (int argc, char **argv)
 			verify_orphan_fixture();
 		else if (strcmp(argv[1], "orphan-reject") == 0)
 			reject_corrupt_orphan_file();
+		else if (strcmp(argv[1], "fsync-create") == 0)
+			create_fsync_fixture();
+		else if (strcmp(argv[1], "fsync-update") == 0)
+			update_fsync_fixture();
+		else if (strcmp(argv[1], "fsync-clean") == 0)
+			clean_fsync_fixture();
+		else if (strcmp(argv[1], "fsync-verify") == 0)
+			verify_fsync_fixture();
 		else
 			errx(1, "unknown mode: %s", argv[1]);
 	}

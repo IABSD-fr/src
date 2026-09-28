@@ -1235,6 +1235,72 @@ run_superblock_reject_case()
 	echo " ok"
 }
 
+run_fsync_case()
+{
+	block_size=$1
+	case_dir=$work/fsync-$block_size
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	test_name="fsync ordering ($block_size byte blocks)"
+	print_test_name "$test_name"
+
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O 'metadata_csum,^orphan_file' "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs failed"
+	fi
+	sequence_before=$(journal_sequence)
+
+	attach_image
+	mount_image ""
+	run_step fsync-create "$mountpoint"
+	unmount_image fsync-create
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "initial fsync did not commit its inode"
+	check_superblock_clean fsync-create
+	check_image fsync-create
+	sequence_before=$sequence_after
+
+	attach_image
+	mount_image ""
+	run_step fsync-update "$mountpoint"
+	unmount_image fsync-update
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "in-place fsync did not commit its inode"
+	check_superblock_clean fsync-update
+	check_image fsync-update
+	sequence_before=$sequence_after
+
+	attach_image
+	mount_image ""
+	run_step fsync-clean "$mountpoint"
+	unmount_image fsync-clean
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" = "$sequence_before" ] ||
+	    fail "clean fsync created a journal transaction"
+	check_superblock_clean fsync-clean
+	check_image fsync-clean
+
+	before=$(sha256 -q "$image")
+	attach_image
+	mount_image ro
+	run_step fsync-verify "$mountpoint"
+	unmount_image fsync-verify
+	detach_image
+	after=$(sha256 -q "$image")
+	[ "$before" = "$after" ] ||
+	    fail "read-only verification changed the image"
+	echo " ok"
+}
+
 extent_leaf_count()
 {
 	stage=$1
@@ -1802,6 +1868,19 @@ superblock)
 		done
 		;;
 	esac
+	exit 0
+	;;
+fsync)
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		case "$block_size" in
+		1024|2048|4096) ;;
+		*)
+			echo "bad block size: $block_size" >&2
+			exit 1
+			;;
+		esac
+		run_fsync_case "$block_size"
+	done
 	exit 0
 	;;
 extents)
