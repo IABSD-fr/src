@@ -1091,11 +1091,17 @@ The journal inspector then requires no revoke before journal records
 are written and exactly one revoke for the retired extent leaf at every
 later durable boundary.  The non-root helper self-test, fixture audit,
 build, and shell validation pass.  The explicit
-`run-regress-ext4fs-crash-truncate-vmm` target still awaits the
-production-kernel root VMM run.
+`run-regress-ext4fs-crash-truncate-vmm` target covers all six durability
+boundaries.  The first production run exposed that the original
+`mke2fs` journal lacked the optional `REVOKE` feature, correctly taking
+the checkpoint-only fallback.  After making the feature an explicit,
+validated fixture property, all six cases passed on 2026-09-29 against
+the installed production kernel, including exact revoke counts,
+allocator accounting, recovery idempotence, and offline `e2fsck -fn`
+acceptance.
 
-The remaining truncate/revoke, exhaustion, wraparound, error injection,
-and Linux verification matrices remain Phase 6 work.
+The remaining block-reuse, exhaustion, wraparound, error injection, and
+Linux verification matrices remain Phase 6 work.
 
 Use filesystem images created by Linux tools and run IABSD in a VM.
 Inject an abrupt power loss after each commit phase and at journal
