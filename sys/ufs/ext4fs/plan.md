@@ -1045,8 +1045,10 @@ the linked file and its exact data; cuts after the commit must recover
 an absent name and complete classic-orphan cleanup.  Every case also
 requires idempotent second recovery and offline `e2fsck -fn`
 acceptance.  The non-root helper self-test passes, and the explicit
-`run-regress-ext4fs-crash-orphan-vmm` production-kernel target awaits
-its root VMM run.
+`run-regress-ext4fs-crash-orphan-vmm` production-kernel target covers
+all six durability boundaries.  On 2026-09-28, every boundary passed
+against the installed production kernel, including recovery
+idempotence and offline `e2fsck -fn` acceptance.
 
 The remaining workload matrix, wraparound, and Linux verification remain
 Phase 6 work.
