@@ -463,6 +463,7 @@ struct m_ext4fs {
 	u_int32_t	m_resize_dind_block;
 	struct ext4fs_block_group_descriptor *m_gd;
 	struct ext4fs_journal *m_journal;
+	struct rwlock	m_remount_lock;
 	struct rwlock	m_runtime_orphan_lock;
 	struct ext4fs_runtime_orphan *m_runtime_orphans;
 };

@@ -59,6 +59,10 @@
 #define OSYNC_UPDATE_SEED	0x8bU
 #define MOUNT_SYNC_SEED		0xf2U
 #define VFS_SYNC_UPDATE_SEED	0x6dU
+#define REMOUNT_INITIAL_SEED	0x37U
+#define REMOUNT_DIRTY_SEED	0x9aU
+#define REMOUNT_FINAL_SEED	0xd4U
+#define REMOUNT_ORPHAN_SEED	0x63U
 
 static char root[PATH_MAX];
 static size_t block_size;
@@ -138,6 +142,10 @@ static void	update_sync_fixture (int, unsigned int, int);
 static void	clean_vfs_sync_fixture (void);
 static void	clean_osync_fixture (void);
 static void	verify_sync_fixture (unsigned int);
+static void	create_remount_fixture (void);
+static void	update_remount_fixture (unsigned int, int);
+static void	verify_remount_fixture (unsigned int, int);
+static void	hold_remount_orphan (void);
 
 static void
 make_path (char *path, size_t pathlen, const char *suffix)
@@ -2782,6 +2790,132 @@ verify_sync_fixture (unsigned int seed)
 		err(1, "close %s", path);
 }
 
+static void
+create_remount_fixture (void)
+{
+	char path[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "remount-file");
+	length = 2 * block_size + 119;
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	write_pattern_fd(fd, 0, length, REMOUNT_INITIAL_SEED);
+	if (fsync(fd) == -1)
+		err(1, "initial fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+update_remount_fixture (unsigned int seed, int do_fsync)
+{
+	struct stat after, before;
+	char path[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "remount-file");
+	length = 2 * block_size + 119;
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &before) == -1)
+		err(1, "fstat %s", path);
+	if (!S_ISREG(before.st_mode) ||
+	    before.st_size != (off_t)length)
+		errx(1, "remount fixture has wrong shape");
+	write_pattern_fd(fd, 0, length, seed);
+	if (do_fsync && fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (fstat(fd, &after) == -1)
+		err(1, "fstat updated %s", path);
+	if (after.st_size != before.st_size ||
+	    after.st_blocks != before.st_blocks)
+		errx(1, "remount update changed allocation");
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+verify_remount_fixture (unsigned int seed, int readonly)
+{
+	struct stat st;
+	char path[PATH_MAX], create_path[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "remount-file");
+	length = 2 * block_size + 119;
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (!S_ISREG(st.st_mode) || st.st_size != (off_t)length)
+		errx(1, "remounted fixture has wrong shape");
+	check_pattern_fd(fd, 0, length, seed);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (!readonly)
+		return;
+
+	errno = 0;
+	fd = open(path, O_WRONLY);
+	expect_ro_failure("remounted open for write", fd);
+	make_path(create_path, sizeof(create_path),
+	    "remount-create");
+	errno = 0;
+	fd = open(create_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	expect_ro_failure("remounted create", fd);
+	check_absent(create_path);
+}
+
+static void
+hold_remount_orphan (void)
+{
+	struct stat st;
+	char path[PATH_MAX], ready[PATH_MAX], release[PATH_MAX];
+	size_t length;
+	int fd;
+
+	make_path(path, sizeof(path), "remount-held-orphan");
+	length = block_size + 73;
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	write_pattern_fd(fd, 0, length, REMOUNT_ORPHAN_SEED);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (unlink(path) == -1)
+		err(1, "unlink %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync unlinked %s", path);
+	check_pattern_fd(fd, 0, length, REMOUNT_ORPHAN_SEED);
+
+	make_path(ready, sizeof(ready), "remount-orphan-ready");
+	make_path(release, sizeof(release),
+	    "remount-orphan-release");
+	write_text_file(ready, "ready");
+	for (;;) {
+		if (lstat(release, &st) == 0)
+			break;
+		if (errno != ENOENT)
+			err(1, "lstat %s", release);
+		(void)usleep(10000);
+	}
+
+	check_pattern_fd(fd, 0, length, REMOUNT_ORPHAN_SEED);
+	if (close(fd) == -1)
+		err(1, "close held orphan");
+	if (unlink(ready) == -1)
+		err(1, "unlink %s", ready);
+	if (unlink(release) == -1)
+		err(1, "unlink %s", release);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -2956,6 +3090,18 @@ main (int argc, char **argv)
 			verify_sync_fixture(MOUNT_SYNC_SEED);
 		else if (strcmp(argv[1], "vfs-sync-verify") == 0)
 			verify_sync_fixture(VFS_SYNC_UPDATE_SEED);
+		else if (strcmp(argv[1], "remount-create") == 0)
+			create_remount_fixture();
+		else if (strcmp(argv[1], "remount-dirty") == 0)
+			update_remount_fixture(REMOUNT_DIRTY_SEED, 0);
+		else if (strcmp(argv[1], "remount-sync") == 0)
+			update_remount_fixture(REMOUNT_FINAL_SEED, 1);
+		else if (strcmp(argv[1], "remount-ro-dirty") == 0)
+			verify_remount_fixture(REMOUNT_DIRTY_SEED, 1);
+		else if (strcmp(argv[1], "remount-ro-final") == 0)
+			verify_remount_fixture(REMOUNT_FINAL_SEED, 1);
+		else if (strcmp(argv[1], "remount-hold-orphan") == 0)
+			hold_remount_orphan();
 		else
 			errx(1, "unknown mode: %s", argv[1]);
 	}

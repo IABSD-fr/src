@@ -855,7 +855,7 @@ Wrap each compound namespace operation in one transaction:
 - [x] Ensure read-only mounts may replay recovery only when the device
       can be safely opened for writing; otherwise fail without modifying
       it.
-- [ ] Define remount read-only/read-write behavior.
+- [x] Define remount read-only/read-write behavior.
 - [ ] Implement consistent journal abort and ext4 error-policy handling.
 - [ ] Expose useful journal state and failure diagnostics without
       excessive normal-operation logging.
@@ -925,6 +925,28 @@ The existing writable-device control proves that a requested read-only
 mount still performs valid recovery when write access is available.
 On 2026-09-28, the complete kernel journal suite passed against the
 booted production kernel.
+
+Read-only/read-write remount behavior is complete.  Transitions use an
+ext4fs-private, non-blocking lifecycle lock, so overlapping updates fail
+with `EBUSY` instead of concurrently destroying or rebuilding journal
+state.  As in FFS and ext2fs, the existing block-device open is retained
+across a transition.  A writable-to-read-only remount synchronizes dirty
+vnodes, commits and checkpoints the journal, refuses active writable or
+unlinked inodes, clears `RECOVER`, and marks the filesystem valid.  A
+read-only-to-writable remount revalidates writable feature and clean-state
+requirements, performs restartable orphan cleanup, checks counters,
+rebuilds the runtime journal, sets `RECOVER`, and durably marks the
+filesystem dirty.  Failed upgrades restore a usable read-only runtime.
+
+The focused `run-regress-ext4fsops-remount` target covers classic orphan
+metadata with 1 KiB, 2 KiB, and 4 KiB blocks and orphan-file metadata
+with 1 KiB blocks.  It verifies both transition directions, durable
+journal and superblock state, read-only mutation rejection, and a failed
+read-only transition while an unlinked inode remains open.  The failed
+transition must retain `RECOVER`, leave the filesystem dirty and
+writable, and succeed after the final close retires the orphan.  On
+2026-09-28, the focused target and complete ext4fs suite passed against
+the rebuilt and booted production kernel.
 
 ## Phase 6: Crash-consistency test matrix
 

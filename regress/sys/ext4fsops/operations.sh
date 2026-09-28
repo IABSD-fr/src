@@ -70,6 +70,7 @@ esac
 
 vnd=
 mounted=0
+holder_pid=
 mountpoint=$work/mnt
 mkdir "$mountpoint"
 
@@ -77,6 +78,11 @@ cleanup()
 {
 	rc=$?
 	trap - EXIT HUP INT TERM
+	if [ -n "$holder_pid" ]; then
+		kill "$holder_pid" >/dev/null 2>&1 || :
+		wait "$holder_pid" >/dev/null 2>&1 || :
+		holder_pid=
+	fi
 	if [ "$mounted" -eq 1 ]; then
 		"$UMOUNT" "$mountpoint" >/dev/null 2>&1 || :
 		mounted=0
@@ -191,6 +197,93 @@ mount_image()
 		    fail "mount_ext4fs failed"
 	fi
 	mounted=1
+}
+
+remount_image()
+{
+	options=$1
+	stage=$2
+	if ! "$TIMEOUT" -k 2 "$EXT4FS_TIMEOUT" \
+	    "$MOUNT_EXT4FS" -o "update,$options" \
+	    "/dev/${vnd}c" "$mountpoint" \
+	    >"$case_dir/remount-$stage.log" 2>&1; then
+		cat "$case_dir/remount-$stage.log" >&2
+		fail "$stage remount failed"
+	fi
+}
+
+reject_readonly_remount()
+{
+	stage=$1
+	if "$TIMEOUT" -k 2 "$EXT4FS_TIMEOUT" \
+	    "$MOUNT_EXT4FS" -o update,ro \
+	    "/dev/${vnd}c" "$mountpoint" \
+	    >"$case_dir/remount-$stage.log" 2>&1; then
+		fail "$stage remount unexpectedly succeeded"
+	else
+		status=$?
+	fi
+	case "$status" in
+	1)
+		;;
+	124|137)
+		cat "$case_dir/remount-$stage.log" >&2
+		fail "$stage remount timed out"
+		;;
+	*)
+		cat "$case_dir/remount-$stage.log" >&2
+		fail "$stage remount exited with status $status"
+		;;
+	esac
+}
+
+start_held_remount_orphan()
+{
+	ready=$mountpoint/remount-orphan-ready
+	holder_log=$case_dir/remount-hold-orphan.log
+	"$EXT4FSOPS" remount-hold-orphan "$mountpoint" \
+	    >"$holder_log" 2>&1 &
+	holder_pid=$!
+	wait_ticks=0
+	max_ticks=$((EXT4FS_TIMEOUT * 10))
+	while [ ! -f "$ready" ]; do
+		if ! kill -0 "$holder_pid" 2>/dev/null; then
+			if wait "$holder_pid"; then
+				status=0
+			else
+				status=$?
+			fi
+			holder_pid=
+			cat "$holder_log" >&2
+			fail "orphan holder exited with status $status"
+		fi
+		[ "$wait_ticks" -lt "$max_ticks" ] ||
+		    fail "timed out waiting for orphan holder"
+		wait_ticks=$((wait_ticks + 1))
+		sleep .1
+	done
+}
+
+release_held_remount_orphan()
+{
+	ready=$mountpoint/remount-orphan-ready
+	release=$mountpoint/remount-orphan-release
+	holder_log=$case_dir/remount-hold-orphan.log
+	if ! : >"$release"; then
+		fail "mount was not writable after rejected remount"
+	fi
+	if wait "$holder_pid"; then
+		status=0
+	else
+		status=$?
+	fi
+	holder_pid=
+	if [ "$status" -ne 0 ]; then
+		cat "$holder_log" >&2
+		fail "orphan holder exited with status $status"
+	fi
+	[ ! -e "$ready" ] || fail "orphan ready marker survived"
+	[ ! -e "$release" ] || fail "orphan release marker survived"
 }
 
 unmount_image()
@@ -1480,6 +1573,109 @@ run_vfs_sync_case()
 	echo " ok"
 }
 
+superblock_recover_set()
+{
+	feature=$(dd if="$image" bs=1 skip=$((1024 + 96)) count=1 \
+	    status=none | hexdump -ve '1/1 "%u"')
+	case "$feature" in
+	*[!0-9]*|'') fail "could not read incompat features" ;;
+	esac
+	[ $((feature & 4)) -ne 0 ]
+}
+
+superblock_valid_set()
+{
+	state=$(dd if="$image" bs=1 skip=$((1024 + 58)) count=1 \
+	    status=none | hexdump -ve '1/1 "%u"')
+	case "$state" in
+	*[!0-9]*|'') fail "could not read filesystem state" ;;
+	esac
+	[ $((state & 1)) -ne 0 ]
+}
+
+run_remount_case()
+{
+	block_size=$1
+	orphan_format=$2
+	case "$orphan_format" in
+	classic)
+		features='metadata_csum,^orphan_file'
+		;;
+	orphan-file)
+		features='metadata_csum,orphan_file'
+		;;
+	*)
+		fail "unknown orphan format: $orphan_format"
+		;;
+	esac
+	case_dir=$work/remount-$orphan_format-$block_size
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	test_name="remount $orphan_format ($block_size byte blocks)"
+	print_test_name "$test_name"
+
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O "$features" "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs failed"
+	fi
+
+	attach_image
+	mount_image ""
+	run_step remount-create "$mountpoint"
+	start_held_remount_orphan
+	reject_readonly_remount active-unlinked-inode
+	superblock_recover_set ||
+	    fail "rejected remount cleared RECOVER"
+	if superblock_valid_set; then
+		fail "rejected remount marked the filesystem valid"
+	fi
+	release_held_remount_orphan
+	sequence_before=$(journal_sequence)
+	run_step remount-dirty "$mountpoint"
+	remount_image ro dirty-to-read-only
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "read-only remount did not commit the dirty inode"
+	[ "$(journal_start)" = 00000000 ] ||
+	    fail "read-only remount did not empty the journal"
+	if superblock_recover_set; then
+		fail "read-only remount retained RECOVER"
+	fi
+	superblock_valid_set ||
+	    fail "read-only remount did not mark the filesystem valid"
+	run_step remount-ro-dirty "$mountpoint"
+
+	remount_image rw read-write
+	superblock_recover_set ||
+	    fail "read-write remount did not set RECOVER"
+	if superblock_valid_set; then
+		fail "read-write remount left the filesystem valid"
+	fi
+	run_step remount-sync "$mountpoint"
+	sequence_before=$(journal_sequence)
+	remount_image ro final-read-only
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" = "$sequence_before" ] ||
+	    fail "clean read-only remount created a transaction"
+	[ "$(journal_start)" = 00000000 ] ||
+	    fail "final read-only remount left a live journal"
+	if superblock_recover_set; then
+		fail "final read-only remount retained RECOVER"
+	fi
+	superblock_valid_set ||
+	    fail "final read-only remount did not mark a valid filesystem"
+	run_step remount-ro-final "$mountpoint"
+	unmount_image remount-transitions
+	detach_image
+	check_superblock_clean remount-transitions
+	check_image remount-transitions
+	echo " ok"
+}
+
 extent_leaf_count()
 {
 	stage=$1
@@ -2086,6 +2282,20 @@ vfs-sync)
 		esac
 		run_vfs_sync_case "$block_size"
 	done
+	exit 0
+	;;
+remount)
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		case "$block_size" in
+		1024|2048|4096) ;;
+		*)
+			echo "bad block size: $block_size" >&2
+			exit 1
+			;;
+		esac
+		run_remount_case "$block_size" classic
+	done
+	run_remount_case 1024 orphan-file
 	exit 0
 	;;
 extents)

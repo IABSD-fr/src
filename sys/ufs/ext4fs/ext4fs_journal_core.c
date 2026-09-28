@@ -930,7 +930,7 @@ ext4fs_journal_init (struct mount *mp)
 	jbd2_journal_close(&ctx);
 
 	fs->m_journal = journal;
-	if (!fs->m_read_only && !(mp->mnt_flag & MNT_RDONLY)) {
+	if (!fs->m_read_only) {
 		error = ext4fs_journal_set_recover(journal);
 		if (error) {
 			ext4fs_journal_destroy(mp);
@@ -1013,7 +1013,7 @@ ext4fs_journal_begin (struct mount *mp, unsigned int credits,
 		return (EINVAL);
 	*handlep = NULL;
 	fs = VFSTOUFS(mp)->um_e4fs;
-	if (fs->m_read_only || (mp->mnt_flag & MNT_RDONLY))
+	if (fs->m_read_only)
 		return (EROFS);
 	journal = fs->m_journal;
 	if (journal == NULL)
@@ -1532,8 +1532,7 @@ ext4fs_journal_mark_clean (struct mount *mp)
 	ump = VFSTOUFS(mp);
 	fs = ump->um_e4fs;
 	journal = fs->m_journal;
-	if (journal == NULL || fs->m_read_only ||
-	    (mp->mnt_flag & MNT_RDONLY))
+	if (journal == NULL || fs->m_read_only)
 		return (0);
 	error = ext4fs_journal_force_commit(mp);
 	if (error)
@@ -1565,6 +1564,8 @@ ext4fs_journal_mark_clean (struct mount *mp)
 		fs->m_sble.sb_feature_incompat = htole32(old_incompat);
 		fs->m_state = old_state;
 		fs->m_sble.sb_state = htole16(old_state);
+		fs->m_sble.sb_checksum = htole32(
+		    ext4fs_sb_csum(&fs->m_sble));
 		ext4fs_journal_abort(mp, error);
 	}
 	return (error);

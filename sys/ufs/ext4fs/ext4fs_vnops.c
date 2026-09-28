@@ -498,7 +498,7 @@ ext4fs_update (struct inode *ip, int waitfor)
 	daddr_t disk_block;
 	int end_error, error;
 
-	if (ITOV(ip)->v_mount->mnt_flag & MNT_RDONLY)
+	if (fs->m_read_only)
 		return (0);
 	if (fs->m_journal != NULL) {
 		handle = NULL;
@@ -4851,9 +4851,10 @@ ext4fs_fsync (void *v)
 {
 	struct vop_fsync_args *ap = v;
 	struct vnode *vp = ap->a_vp;
+	struct m_ext4fs *fs = VTOI(vp)->i_e4fs;
 	int error, s;
 
-	if (vp->v_mount->mnt_flag & MNT_RDONLY)
+	if (fs->m_read_only)
 		return (0);
 
 	vflushbuf(vp, ap->a_waitfor == MNT_WAIT);
@@ -7747,7 +7748,7 @@ ext4fs_inactive (void *v)
 	 * Handle file deletion: if nlink == 0, truncate data,
 	 * free inode, and mark as deleted.
 	 */
-	if (nlink == 0 && (vp->v_mount->mnt_flag & MNT_RDONLY) == 0) {
+	if (nlink == 0 && !ip->i_e4fs->m_read_only) {
 		struct timespec ts;
 
 		if (ip->i_e4fs->m_journal != NULL &&

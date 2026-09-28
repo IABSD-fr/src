@@ -67,6 +67,11 @@
 struct pool ext4fs_inode_pool;
 struct pool ext4fs_dinode_pool;
 
+static int	ext4fs_mark_writable (struct mount *, int);
+static int	ext4fs_remount_readonly (struct mount *, struct proc *);
+static int	ext4fs_remount_writable (struct mount *, struct proc *);
+static int	ext4fs_mount_update (struct mount *, struct proc *);
+
 #define PRINTF_FEATURES(mask, features)				\
 	for (i = 0; i < nitems(features); i++)			\
 		if ((mask) & (features)[i].f_mask)		\
@@ -365,29 +370,176 @@ ext4fs_init (struct vfsconf *vfsp)
 	return (0);
 }
 
+static int
+ext4fs_mark_writable (struct mount *mp, int recovered)
+{
+	struct ufsmount *ump = VFSTOUFS(mp);
+	struct m_ext4fs *fs = ump->um_e4fs;
+	int error;
+
+	if (recovered)
+		fs->m_state &= ~EXT4FS_STATE_VALID;
+	else if (fs->m_state == EXT4FS_STATE_VALID)
+		fs->m_state = 0;
+	else
+		fs->m_state = EXT4FS_STATE_ERROR;
+	fs->m_fs_was_modified = 1;
+	if (fs->m_journal != NULL)
+		error = ext4fs_sbwrite_lifecycle(mp);
+	else
+		error = ext4fs_sbwrite_direct(mp);
+	if (error == 0)
+		error = jbd2_flush_device(ump->um_devvp, curproc);
+	return (error);
+}
+
+static int
+ext4fs_remount_readonly (struct mount *mp, struct proc *p)
+{
+	struct ufsmount *ump = VFSTOUFS(mp);
+	struct m_ext4fs *fs = ump->um_e4fs;
+	u_int16_t saved_state;
+	int error, flags;
+
+	if (fs->m_read_only)
+		return (0);
+	error = ext4fs_sync(mp, MNT_WAIT, 0, p->p_ucred, p);
+	if (error)
+		return (error);
+	flags = WRITECLOSE;
+	if (mp->mnt_flag & MNT_FORCE)
+		flags |= FORCECLOSE;
+	error = ext4fs_flushfiles(mp, flags, p);
+	if (error)
+		return (error);
+	if (ext4fs_orphan_pending(mp))
+		return (EBUSY);
+
+	if (fs->m_journal != NULL) {
+		error = ext4fs_journal_mark_clean(mp);
+	} else {
+		saved_state = fs->m_state;
+		fs->m_state = EXT4FS_STATE_VALID;
+		fs->m_fs_was_modified = 1;
+		error = ext4fs_sbwrite_direct(mp);
+		if (error == 0)
+			error = jbd2_flush_device(ump->um_devvp, p);
+		if (error) {
+			fs->m_state = saved_state;
+			fs->m_sble.sb_state = htole16(saved_state);
+			fs->m_sble.sb_checksum = htole32(
+			    ext4fs_sb_csum(&fs->m_sble));
+		}
+	}
+	if (error)
+		return (error);
+
+	fs->m_read_only = 1;
+	return (0);
+}
+
+static int
+ext4fs_remount_writable (struct mount *mp, struct proc *p)
+{
+	struct ufsmount *ump = VFSTOUFS(mp);
+	struct m_ext4fs *fs = ump->um_e4fs;
+	int cleanup_error, error;
+
+	if (!fs->m_read_only)
+		return (0);
+	error = ext4fs_sbcheck(&fs->m_sble, 0);
+	if (error)
+		return (error);
+	ext4fs_journal_destroy(mp);
+	fs->m_read_only = 0;
+
+	error = ext4fs_orphan_cleanup(mp);
+	if (error == 0)
+		error = ext4fs_counters_check(fs);
+	if (error == 0)
+		error = ext4fs_journal_init(mp);
+	if (error == 0)
+		error = ext4fs_mark_writable(mp, 0);
+	if (error == 0)
+		return (0);
+
+	/* Recovery progress is restartable; restore a usable r/o mount. */
+	if (fs->m_journal != NULL &&
+	    (fs->m_feature_incompat &
+	    EXT4FS_FEATURE_INCOMPAT_RECOVER))
+		(void)ext4fs_journal_mark_clean(mp);
+	fs->m_read_only = 1;
+	if (fs->m_journal == NULL) {
+		cleanup_error = ext4fs_journal_init(mp);
+		if (cleanup_error)
+			printf("ext4fs: remount rollback could not "
+			    "reopen journal: %d\n", cleanup_error);
+	}
+	return (error);
+}
+
+static int
+ext4fs_mount_update (struct mount *mp, struct proc *p)
+{
+	struct m_ext4fs *fs = VFSTOUFS(mp)->um_e4fs;
+	int error;
+
+	if (rw_enter(&fs->m_remount_lock,
+	    RW_WRITE | RW_NOSLEEP) != 0)
+		return (EBUSY);
+	if (mp->mnt_flag & MNT_RELOAD)
+		error = EOPNOTSUPP;
+	else if (!fs->m_read_only &&
+	    (mp->mnt_flag & MNT_RDONLY))
+		error = ext4fs_remount_readonly(mp, p);
+	else if (fs->m_read_only &&
+	    (mp->mnt_flag & MNT_WANTRDWR))
+		error = ext4fs_remount_writable(mp, p);
+	else
+		error = 0;
+	rw_exit_write(&fs->m_remount_lock);
+	return (error);
+}
+
 int
 ext4fs_mount (struct mount *mp, const char *path, void *data,
-	struct nameidata *ndp, struct proc *p)
+    struct nameidata *ndp, struct proc *p)
 {
-	struct ufs_args *args;
+	struct ufs_args *args = data;
+	struct ufsmount *ump;
 	struct vnode *devvp;
-	int error;
-	struct m_ext4fs *mfs;
 	char fname[MNAMELEN];
 	char fspec[MNAMELEN];
-	struct ufsmount *ump = NULL;
+	int error, update;
 
-	args = data;
+	update = (mp->mnt_flag & MNT_UPDATE) != 0;
+	ump = update ? VFSTOUFS(mp) : NULL;
+	if (args == NULL) {
+		if (!update)
+			return (EINVAL);
+		return (ext4fs_mount_update(mp, p));
+	}
+	if (args->fspec == NULL) {
+		if (!update)
+			return (EINVAL);
+		if (mp->mnt_flag & MNT_RELOAD)
+			return (EOPNOTSUPP);
+		error = vfs_export(mp, &ump->um_export,
+		    &args->export_info);
+		if (error)
+			return (error);
+		return (ext4fs_mount_update(mp, p));
+	}
 	error = copyinstr(args->fspec, fspec, sizeof(fspec), NULL);
 	if (error)
-		goto error;
+		return (error);
 
 	if (disk_map(fspec, fname, MNAMELEN, DM_OPENBLCK) == -1)
 		memcpy(fname, fspec, sizeof(fname));
 
 	NDINIT(ndp, LOOKUP, FOLLOW, UIO_SYSSPACE, fname, p);
 	if ((error = namei(ndp)) != 0)
-		goto error;
+		return (error);
 	devvp = ndp->ni_vp;
 
 	if (devvp->v_type != VBLK) {
@@ -398,34 +550,30 @@ ext4fs_mount (struct mount *mp, const char *path, void *data,
 		error = ENXIO;
 		goto error_devvp;
 	}
-	if ((mp->mnt_flag & MNT_UPDATE) == 0) {
+	if (!update) {
 		error = ext4fs_mountfs(devvp, mp, p);
 	} else {
-		ump = VFSTOUFS(mp);
-		if (devvp != ump->um_devvp) {
-			/* XXX needs translation */
+		if (devvp != ump->um_devvp &&
+		    devvp->v_rdev != ump->um_devvp->v_rdev)
 			error = EINVAL;
-		}
-		else
-			vrele(devvp);
+		vrele(devvp);
+		devvp = NULL;
+		if (error == 0)
+			error = ext4fs_mount_update(mp, p);
 	}
 	if (error)
 		goto error_devvp;
-	ump = VFSTOUFS(mp);
-	mfs = ump->um_e4fs;
 
 	strlcpy(mp->mnt_stat.f_mntfromname, fname,
-		sizeof(mp->mnt_stat.f_mntfromname));
+	    sizeof(mp->mnt_stat.f_mntfromname));
 	strlcpy(mp->mnt_stat.f_mntonname, path,
-		sizeof(mp->mnt_stat.f_mntonname));
+	    sizeof(mp->mnt_stat.f_mntonname));
 
-	goto success;
+	return (0);
 
 error_devvp:
-	vrele(devvp);
-
-error:
-success:
+	if (devvp != NULL)
+		vrele(devvp);
 	return (error);
 }
 
@@ -488,6 +636,7 @@ ext4fs_mountfs (struct vnode *devvp, struct mount *mp, struct proc *p)
 	ump = malloc(sizeof *ump, M_UFSMNT, M_WAITOK | M_ZERO);
 	mfs = ump->um_e4fs = malloc(sizeof(struct m_ext4fs), M_UFSMNT,
 	    M_WAITOK | M_ZERO);
+	rw_init(&mfs->m_remount_lock, "e4remount");
 	rw_init(&mfs->m_runtime_orphan_lock, "e4orphan");
 
 	/*
@@ -633,17 +782,7 @@ ext4fs_mountfs (struct vnode *devvp, struct mount *mp, struct proc *p)
 		 * Mark the filesystem dirty only after those roots are
 		 * gone.
 		 */
-		if (recovered)
-			mfs->m_state &= ~EXT4FS_STATE_VALID;
-		else if (mfs->m_state == EXT4FS_STATE_VALID)
-			mfs->m_state = 0;
-		else
-			mfs->m_state = EXT4FS_STATE_ERROR;
-		mfs->m_fs_was_modified = 1;
-		if (mfs->m_journal != NULL)
-			error = ext4fs_sbwrite_lifecycle(mp);
-		else
-			error = ext4fs_sbwrite_direct(mp);
+		error = ext4fs_mark_writable(mp, recovered);
 		if (error)
 			goto out;
 	}
@@ -1216,7 +1355,7 @@ ext4fs_sbwrite_lifecycle (struct mount *mp)
 	fs = VFSTOUFS(mp)->um_e4fs;
 	if (fs->m_journal == NULL)
 		return (EINVAL);
-	if (fs->m_read_only || (mp->mnt_flag & MNT_RDONLY))
+	if (fs->m_read_only)
 		return (EROFS);
 	return (ext4fs_sbwrite_raw(mp));
 }
