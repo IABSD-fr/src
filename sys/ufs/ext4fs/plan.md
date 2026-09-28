@@ -1018,9 +1018,13 @@ from ordinary regress runs.
 
 This initial harness covers externally scheduled operation windows.  It
 does not yet claim deterministic coverage of every internal commit
-phase.  Durable-state classification at each journal flush boundary,
-the remaining workload matrix, wraparound, and Linux verification remain
-Phase 6 work.
+phase.  Each cut now preserves an untouched durable image before replay,
+requires that image to retain `RECOVER`, extracts the internal journal
+read-only, and records validated `s_start`, sequence, head, and
+geometry.
+It also proves that durable-state inspection does not modify the image.
+Stopping at every individual flush boundary, the remaining workload
+matrix, wraparound, and Linux verification remain Phase 6 work.
 
 Use filesystem images created by Linux tools and run IABSD in a VM.
 Inject an abrupt power loss after each commit phase and at journal

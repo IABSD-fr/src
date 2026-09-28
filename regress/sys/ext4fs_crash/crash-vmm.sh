@@ -40,7 +40,7 @@ fail()
 
 tools="$MKE2FS $DEBUGFS $E2FSCK $DUMPE2FS $VMCTL $SSH $SCP \
 $SYSCTL $TIMEOUT $SHA256 $SYNC $EXT4FS_CRASH awk cmp cp dd grep \
-cat id kill mkdir mktemp rm sleep"
+cat id kill mkdir mktemp mv rm sleep"
 for tool in $tools; do
 	command -v "$tool" >/dev/null 2>&1 ||
 	    fail "required tool not found: $tool"
@@ -354,6 +354,30 @@ for block_size in $EXT4FS_CRASH_BLOCK_SIZES; do
 		start_guest "$image"
 		run_crash "$image" "$stage" \
 		    "$case_dir/workload.log"
+		durable=$case_dir/durable.img
+		mv "$image" "$durable"
+		durable_hash=$($SHA256 -q "$durable")
+		"$DUMPE2FS" -h "$durable" \
+		    >"$case_dir/durable-super.log" 2>&1 ||
+		    fail "dumpe2fs rejected durable image"
+		grep -q '^Filesystem features:.*needs_recovery' \
+		    "$case_dir/durable-super.log" ||
+		    fail "durable image does not require recovery"
+		journal=$case_dir/journal.bin
+		"$DEBUGFS" -R "dump <8> $journal" "$durable" \
+		    >"$case_dir/durable-journal-dump.log" 2>&1 ||
+		    fail "could not extract durable journal"
+		"$EXT4FS_CRASH" journal-state "$journal" \
+		    >"$case_dir/durable-journal.log" 2>&1 || {
+			cat "$case_dir/durable-journal.log" >&2
+			fail "could not classify durable journal"
+		}
+		grep -q '^journal=' \
+		    "$case_dir/durable-journal.log" ||
+		    fail "durable journal state was not reported"
+		[ "$durable_hash" = "$($SHA256 -q "$durable")" ] ||
+		    fail "durable-state inspection modified image"
+		cp "$durable" "$image"
 		validate_guest "$image" '' \
 		    "$case_dir/recovery.log"
 		hash_before=$("$SHA256" -q "$image")

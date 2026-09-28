@@ -16,8 +16,9 @@
  * PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/endian.h>
+#include <sys/stat.h>
 
 #include <err.h>
 #include <errno.h>
@@ -36,6 +37,19 @@
 #define NEW_SEED	0xc9U
 #define ARM_USEC	2000000
 
+#define JBD2_MAGIC		UINT32_C(0xc03b3998)
+#define JBD2_SUPERBLOCK_V2	4
+#define JBD2_SUPER_BYTES	256
+
+#define JBD2_OFF_MAGIC		0x00
+#define JBD2_OFF_BLOCKTYPE	0x04
+#define JBD2_OFF_BLOCKSIZE	0x0c
+#define JBD2_OFF_MAXLEN		0x10
+#define JBD2_OFF_FIRST		0x14
+#define JBD2_OFF_SEQUENCE	0x18
+#define JBD2_OFF_START		0x1c
+#define JBD2_OFF_HEAD		0x58
+
 static void	make_path (char *, size_t, const char *, const char *);
 static unsigned char pattern_byte (off_t, unsigned int);
 static void	fill_pattern (unsigned char *, size_t, off_t,
@@ -45,6 +59,9 @@ static void	write_pattern (int, off_t, unsigned int);
 static void	check_pattern (const char *, off_t, unsigned int);
 static void	arm_cut (const char *);
 static void	make_old_pattern (const char *);
+static uint32_t	load_be32 (const unsigned char *, size_t);
+static void	store_be32 (unsigned char *, size_t, uint32_t);
+static void	classify_journal (const char *);
 static void	run_workload (const char *, const char *);
 static void	verify_workload (const char *);
 static void	selftest (void);
@@ -185,6 +202,76 @@ make_old_pattern (const char *path)
 		err(1, "close %s", path);
 }
 
+static uint32_t
+load_be32 (const unsigned char *buf, size_t offset)
+{
+	uint32_t value;
+
+	memcpy(&value, buf + offset, sizeof(value));
+	return (be32toh(value));
+}
+
+static void
+store_be32 (unsigned char *buf, size_t offset, uint32_t value)
+{
+	value = htobe32(value);
+	memcpy(buf + offset, &value, sizeof(value));
+}
+
+static void
+classify_journal (const char *path)
+{
+	unsigned char buf[JBD2_SUPER_BYTES];
+	struct stat st;
+	uint64_t blocks;
+	uint32_t blocksize, first, head, maxlen, sequence, start;
+	ssize_t n;
+	int fd;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (! S_ISREG(st.st_mode) || st.st_size < JBD2_SUPER_BYTES)
+		errx(1, "%s has invalid journal size", path);
+	n = pread(fd, buf, sizeof(buf), 0);
+	if (n == -1)
+		err(1, "pread %s", path);
+	if ((size_t)n != sizeof(buf))
+		errx(1, "short read from %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+
+	if (load_be32(buf, JBD2_OFF_MAGIC) != JBD2_MAGIC)
+		errx(1, "%s has invalid journal magic", path);
+	if (load_be32(buf, JBD2_OFF_BLOCKTYPE) !=
+	    JBD2_SUPERBLOCK_V2)
+		errx(1, "%s has unsupported journal version", path);
+	blocksize = load_be32(buf, JBD2_OFF_BLOCKSIZE);
+	if (blocksize != 1024 && blocksize != 2048 &&
+	    blocksize != 4096)
+		errx(1, "%s has invalid journal block size", path);
+	if ((uint64_t)st.st_size % blocksize != 0)
+		errx(1, "%s is not journal-block aligned", path);
+	blocks = (uint64_t)st.st_size / blocksize;
+	maxlen = load_be32(buf, JBD2_OFF_MAXLEN);
+	first = load_be32(buf, JBD2_OFF_FIRST);
+	sequence = load_be32(buf, JBD2_OFF_SEQUENCE);
+	start = load_be32(buf, JBD2_OFF_START);
+	head = load_be32(buf, JBD2_OFF_HEAD);
+	if (first == 0 || first >= maxlen || maxlen > blocks ||
+	    (start != 0 && (start < first || start >= maxlen)) ||
+	    (head != 0 && (head < first || head >= maxlen)))
+		errx(1, "%s has invalid journal geometry", path);
+
+	printf("journal=%s sequence=%u start=%u head=%u "
+	    "first=%u maxlen=%u\n", start == 0 ? "clean" : "recover",
+	    sequence, start, head, first, maxlen);
+	if (fflush(stdout) == EOF)
+		err(1, "publish journal state");
+}
+
 static void
 run_workload (const char *stage, const char *root)
 {
@@ -270,7 +357,9 @@ verify_workload (const char *root)
 static void
 selftest (void)
 {
+	unsigned char journal[JBD2_SUPER_BYTES];
 	char current[PATH_MAX], next[PATH_MAX];
+	char journal_path[PATH_MAX];
 	char root[] = "/tmp/ext4fs_crash.XXXXXXXX";
 	int fd;
 
@@ -300,6 +389,38 @@ selftest (void)
 	if (rename(next, current) == -1)
 		err(1, "rename %s", next);
 	verify_workload(root);
+
+	make_path(journal_path, sizeof(journal_path), root, "journal");
+	memset(journal, 0, sizeof(journal));
+	store_be32(journal, JBD2_OFF_MAGIC, JBD2_MAGIC);
+	store_be32(journal, JBD2_OFF_BLOCKTYPE,
+	    JBD2_SUPERBLOCK_V2);
+	store_be32(journal, JBD2_OFF_BLOCKSIZE, 1024);
+	store_be32(journal, JBD2_OFF_MAXLEN, 4);
+	store_be32(journal, JBD2_OFF_FIRST, 1);
+	store_be32(journal, JBD2_OFF_SEQUENCE, 7);
+	store_be32(journal, JBD2_OFF_HEAD, 3);
+	fd = open_output(journal_path, 1);
+	if (ftruncate(fd, 4096) == -1)
+		err(1, "ftruncate %s", journal_path);
+	if (pwrite(fd, journal, sizeof(journal), 0) !=
+	    (ssize_t)sizeof(journal))
+		err(1, "pwrite %s", journal_path);
+	if (close(fd) == -1)
+		err(1, "close %s", journal_path);
+	classify_journal(journal_path);
+	store_be32(journal, JBD2_OFF_START, 2);
+	fd = open(journal_path, O_WRONLY | O_CLOEXEC);
+	if (fd == -1)
+		err(1, "open %s", journal_path);
+	if (pwrite(fd, journal, sizeof(journal), 0) !=
+	    (ssize_t)sizeof(journal))
+		err(1, "pwrite %s", journal_path);
+	if (close(fd) == -1)
+		err(1, "close %s", journal_path);
+	classify_journal(journal_path);
+	if (unlink(journal_path) == -1)
+		err(1, "unlink %s", journal_path);
 	if (unlink(current) == -1)
 		err(1, "unlink %s", current);
 	if (rmdir(root) == -1)
@@ -313,12 +434,15 @@ main (int argc, char **argv)
 		selftest();
 	else if (argc == 3 && strcmp(argv[1], "pattern-old") == 0)
 		make_old_pattern(argv[2]);
+	else if (argc == 3 && strcmp(argv[1], "journal-state") == 0)
+		classify_journal(argv[2]);
 	else if (argc == 4 && strcmp(argv[1], "workload") == 0)
 		run_workload(argv[2], argv[3]);
 	else if (argc == 3 && strcmp(argv[1], "verify") == 0)
 		verify_workload(argv[2]);
 	else
 		errx(1, "usage: ext4fs_crash pattern-old path | "
-		    "workload stage root | verify root");
+		    "journal-state path | workload stage root | "
+		    "verify root");
 	return (0);
 }
