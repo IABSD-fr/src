@@ -53,10 +53,17 @@
 #define EXTENT_NODE_HEADER_BYTES	12
 #define EXTENT_NODE_ENTRY_BYTES	12
 #define EXTENT_SPLIT_SEED	0x68U
+#define TRUNCATE_FILE	"truncate-probe"
 
 #define JBD2_MAGIC		UINT32_C(0xc03b3998)
 #define JBD2_SUPERBLOCK_V2	4
+#define JBD2_REVOKE_BLOCK	5
 #define JBD2_SUPER_BYTES	256
+#define JBD2_HEADER_BYTES	12
+#define JBD2_REVOKE_HEADER_BYTES	16
+
+#define JBD2_FEATURE_INCOMPAT_REVOKE	0x1
+#define JBD2_FEATURE_INCOMPAT_64BIT	0x2
 
 #define JBD2_OFF_MAGIC		0x00
 #define JBD2_OFF_BLOCKTYPE	0x04
@@ -65,6 +72,7 @@
 #define JBD2_OFF_FIRST		0x14
 #define JBD2_OFF_SEQUENCE	0x18
 #define JBD2_OFF_START		0x1c
+#define JBD2_OFF_FEATURE_INCOMPAT	0x28
 #define JBD2_OFF_HEAD		0x58
 
 static void	make_path (char *, size_t, const char *, const char *);
@@ -87,8 +95,11 @@ static off_t	extent_lbn_offset (size_t, size_t);
 static void	read_extent_block (int, unsigned char *, size_t, off_t);
 static void	check_extent_zero (const unsigned char *, size_t,
     const char *);
+static void	check_sparse_extents (int, unsigned char *, size_t,
+    size_t, int);
 static int	check_extent_growth (const char *, size_t, size_t,
     size_t);
+static int	check_truncate_prune (const char *);
 static void	write_extent_block (int, size_t, off_t);
 static void	write_pattern (int, off_t, unsigned int);
 static void	check_pattern (const char *, off_t, unsigned int);
@@ -98,14 +109,17 @@ static void	make_old_pattern (const char *);
 static uint32_t	load_be32 (const unsigned char *, size_t);
 static void	store_be32 (unsigned char *, size_t, uint32_t);
 static void	classify_journal (const char *);
+static void	journal_revoke_count (const char *);
 static void	run_dir_growth (const char *, const char *, int);
 static void	run_rmdir_open (const char *, const char *, int);
 static void	run_extent_growth (const char *, const char *, int);
+static void	run_truncate_prune (const char *, const char *, int);
 static void	run_workload (const char *, const char *, int);
 static void	verify_dir_growth (const char *);
 static void	verify_rmdir (const char *);
 static void	verify_extent_promote (const char *);
 static void	verify_extent_split (const char *);
+static void	verify_truncate_prune (const char *);
 static void	verify_workload (const char *);
 static void	verify_unlink (const char *);
 static void	selftest (void);
@@ -322,6 +336,28 @@ check_extent_zero (const unsigned char *buf, size_t block_size,
 	}
 }
 
+static void
+check_sparse_extents (int fd, unsigned char *buf, size_t block_size,
+    size_t entries, int trailing_hole)
+{
+	off_t offset;
+	size_t i;
+
+	for (i = 0; i < entries; i++) {
+		offset = extent_lbn_offset(block_size, 2 * i);
+		read_extent_block(fd, buf, block_size, offset);
+		if (buf[0] != 'x')
+			errx(1, "source extent %zu is corrupt", i);
+		buf[0] = 0;
+		check_extent_zero(buf, block_size, "source extent");
+		if (i + 1 < entries || trailing_hole) {
+			offset += (off_t)block_size;
+			read_extent_block(fd, buf, block_size, offset);
+			check_extent_zero(buf, block_size, "sparse hole");
+		}
+	}
+}
+
 static int
 check_extent_growth (const char *root, size_t entries,
     size_t old_metadata, size_t new_metadata)
@@ -362,20 +398,7 @@ check_extent_growth (const char *root, size_t entries,
 	if (st.st_blocks != expected_sectors)
 		errx(1, "%s has unexpected block count %lld", path,
 		    (long long)st.st_blocks);
-	for (i = 0; i < entries; i++) {
-		offset = extent_lbn_offset(block_size, 2 * i);
-		read_extent_block(fd, buf, block_size, offset);
-		if (buf[0] != 'x')
-			errx(1, "%s source extent %zu is corrupt", path,
-			    i);
-		buf[0] = 0;
-		check_extent_zero(buf, block_size, "source extent");
-		if (i + 1 < entries) {
-			offset += (off_t)block_size;
-			read_extent_block(fd, buf, block_size, offset);
-			check_extent_zero(buf, block_size, "sparse hole");
-		}
-	}
+	check_sparse_extents(fd, buf, block_size, entries, 0);
 	if (state != 0) {
 		offset = extent_lbn_offset(block_size, target_lbn - 1);
 		read_extent_block(fd, buf, block_size, offset);
@@ -388,6 +411,55 @@ check_extent_growth (const char *root, size_t entries,
 				errx(1, "%s growth data is corrupt", path);
 		}
 	}
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	return (state);
+}
+
+static int
+check_truncate_prune (const char *root)
+{
+	unsigned char buf[IO_BYTES];
+	struct stat st;
+	char path[PATH_MAX];
+	blkcnt_t expected_sectors;
+	off_t new_size, old_size;
+	size_t block_size, capacity, entries, expected_blocks;
+	size_t retained;
+	int fd, state;
+
+	block_size = filesystem_block_size(root);
+	if (block_size > sizeof(buf))
+		errx(1, "truncate block exceeds input buffer");
+	capacity = extent_leaf_capacity(block_size);
+	entries = capacity + 1;
+	retained = capacity - capacity / 2;
+	old_size = extent_lbn_offset(block_size, 2 * entries - 1);
+	new_size = extent_lbn_offset(block_size, 2 * retained);
+	make_path(path, sizeof(path), root, TRUNCATE_FILE);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (! S_ISREG(st.st_mode) || st.st_nlink != 1)
+		errx(1, "%s has invalid inode shape", path);
+	if (st.st_size == old_size) {
+		state = 0;
+		expected_blocks = entries + 2;
+	} else if (st.st_size == new_size) {
+		state = 1;
+		expected_blocks = retained + 1;
+	} else
+		errx(1, "%s has unexpected size %lld", path,
+		    (long long)st.st_size);
+	expected_sectors = (blkcnt_t)expected_blocks *
+	    (blkcnt_t)(block_size / 512);
+	if (st.st_blocks != expected_sectors)
+		errx(1, "%s has unexpected block count %lld", path,
+		    (long long)st.st_blocks);
+	check_sparse_extents(fd, buf, block_size,
+	    state ? retained : entries, state);
 	if (close(fd) == -1)
 		err(1, "close %s", path);
 	return (state);
@@ -587,6 +659,78 @@ classify_journal (const char *path)
 }
 
 static void
+journal_revoke_count (const char *path)
+{
+	unsigned char super[JBD2_SUPER_BYTES];
+	unsigned char *block;
+	struct stat st;
+	off_t offset;
+	uint64_t records, revoke_blocks;
+	uint32_t blocksize, incompat, type, used;
+	size_t record_size;
+	ssize_t n;
+	int fd;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	n = pread(fd, super, sizeof(super), 0);
+	if (n == -1)
+		err(1, "pread %s", path);
+	if ((size_t)n != sizeof(super))
+		errx(1, "short read from %s", path);
+	if (load_be32(super, JBD2_OFF_MAGIC) != JBD2_MAGIC ||
+	    load_be32(super, JBD2_OFF_BLOCKTYPE) !=
+	    JBD2_SUPERBLOCK_V2)
+		errx(1, "%s has invalid journal superblock", path);
+	blocksize = load_be32(super, JBD2_OFF_BLOCKSIZE);
+	if (blocksize != 1024 && blocksize != 2048 &&
+	    blocksize != 4096)
+		errx(1, "%s has invalid journal block size", path);
+	if (st.st_size < 0 || (uint64_t)st.st_size % blocksize != 0)
+		errx(1, "%s has invalid journal length", path);
+	incompat = load_be32(super, JBD2_OFF_FEATURE_INCOMPAT);
+	record_size = incompat & JBD2_FEATURE_INCOMPAT_64BIT ? 8 : 4;
+	block = malloc(blocksize);
+	if (block == NULL)
+		err(1, "malloc journal block");
+	records = 0;
+	revoke_blocks = 0;
+	for (offset = blocksize; offset < st.st_size;
+	    offset += blocksize) {
+		n = pread(fd, block, blocksize, offset);
+		if (n == -1)
+			err(1, "pread %s", path);
+		if ((uint32_t)n != blocksize)
+			errx(1, "short journal block read");
+		if (load_be32(block, JBD2_OFF_MAGIC) != JBD2_MAGIC)
+			continue;
+		type = load_be32(block, JBD2_OFF_BLOCKTYPE);
+		if (type != JBD2_REVOKE_BLOCK)
+			continue;
+		used = load_be32(block, JBD2_HEADER_BYTES);
+		if (used < JBD2_REVOKE_HEADER_BYTES ||
+		    used > blocksize ||
+		    (used - JBD2_REVOKE_HEADER_BYTES) %
+		    record_size != 0)
+			errx(1, "%s has invalid revoke block", path);
+		records += (used - JBD2_REVOKE_HEADER_BYTES) /
+		    record_size;
+		revoke_blocks++;
+	}
+	free(block);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	printf("revokes=%llu blocks=%llu incompat=%u\n",
+	    (unsigned long long)records,
+	    (unsigned long long)revoke_blocks, incompat);
+	if (fflush(stdout) == EOF)
+		err(1, "publish journal revoke count");
+}
+
+static void
 run_dir_growth (const char *stage, const char *root, int boundary)
 {
 	struct stat st;
@@ -725,6 +869,39 @@ run_extent_growth (const char *stage, const char *root, int boundary)
 }
 
 static void
+run_truncate_prune (const char *stage, const char *root, int boundary)
+{
+	char path[PATH_MAX];
+	off_t length;
+	size_t block_size, capacity, retained;
+	int fd;
+
+	if (check_truncate_prune(root) != 0)
+		errx(1, "%s fixture has already been truncated", stage);
+	block_size = filesystem_block_size(root);
+	capacity = extent_leaf_capacity(block_size);
+	retained = capacity - capacity / 2;
+	length = extent_lbn_offset(block_size, 2 * retained);
+	make_path(path, sizeof(path), root, TRUNCATE_FILE);
+	fd = open(path, O_RDWR | O_CLOEXEC);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (boundary)
+		arm_boundary(stage);
+	else
+		arm_cut(stage);
+	if (ftruncate(fd, length) == -1)
+		err(1, "ftruncate %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (printf("DONE %s\n", stage) < 0 ||
+	    fflush(stdout) == EOF)
+		err(1, "publish completion marker");
+	for (;;)
+		(void)pause();
+}
+
+static void
 run_workload (const char *stage, const char *root, int boundary)
 {
 	char current[PATH_MAX], next[PATH_MAX];
@@ -732,6 +909,10 @@ run_workload (const char *stage, const char *root, int boundary)
 
 	make_path(current, sizeof(current), root, "current");
 	make_path(next, sizeof(next), root, "next");
+	if (strcmp(stage, "truncate-prune") == 0) {
+		run_truncate_prune(stage, root, boundary);
+		return;
+	}
 	if (strcmp(stage, "extent-promote") == 0 ||
 	    strcmp(stage, "extent-split") == 0) {
 		run_extent_growth(stage, root, boundary);
@@ -903,6 +1084,17 @@ verify_extent_split (const char *root)
 }
 
 static void
+verify_truncate_prune (const char *root)
+{
+	int state;
+
+	state = check_truncate_prune(root);
+	printf("state=truncate-%s\n", state ? "pruned" : "full");
+	if (fflush(stdout) == EOF)
+		err(1, "publish truncate state");
+}
+
+static void
 verify_workload (const char *root)
 {
 	struct stat current_st, next_st;
@@ -1058,6 +1250,8 @@ selftest (void)
 	store_be32(journal, JBD2_OFF_FIRST, 1);
 	store_be32(journal, JBD2_OFF_SEQUENCE, 7);
 	store_be32(journal, JBD2_OFF_HEAD, 3);
+	store_be32(journal, JBD2_OFF_FEATURE_INCOMPAT,
+	    JBD2_FEATURE_INCOMPAT_REVOKE);
 	fd = open_output(journal_path, 1);
 	if (ftruncate(fd, 4096) == -1)
 		err(1, "ftruncate %s", journal_path);
@@ -1077,6 +1271,23 @@ selftest (void)
 	if (close(fd) == -1)
 		err(1, "close %s", journal_path);
 	classify_journal(journal_path);
+	journal_revoke_count(journal_path);
+	memset(journal, 0, sizeof(journal));
+	store_be32(journal, JBD2_OFF_MAGIC, JBD2_MAGIC);
+	store_be32(journal, JBD2_OFF_BLOCKTYPE, JBD2_REVOKE_BLOCK);
+	store_be32(journal, JBD2_OFF_SEQUENCE, 7);
+	store_be32(journal, JBD2_HEADER_BYTES,
+	    JBD2_REVOKE_HEADER_BYTES + 4);
+	store_be32(journal, JBD2_REVOKE_HEADER_BYTES, 123);
+	fd = open(journal_path, O_WRONLY | O_CLOEXEC);
+	if (fd == -1)
+		err(1, "open %s", journal_path);
+	if (pwrite(fd, journal, sizeof(journal), 1024) !=
+	    (ssize_t)sizeof(journal))
+		err(1, "pwrite revoke %s", journal_path);
+	if (close(fd) == -1)
+		err(1, "close %s", journal_path);
+	journal_revoke_count(journal_path);
 	if (unlink(journal_path) == -1)
 		err(1, "unlink %s", journal_path);
 	if (unlink(current) == -1)
@@ -1095,6 +1306,8 @@ main (int argc, char **argv)
 		make_old_pattern(argv[2]);
 	else if (argc == 3 && strcmp(argv[1], "journal-state") == 0)
 		classify_journal(argv[2]);
+	else if (argc == 3 && strcmp(argv[1], "journal-revokes") == 0)
+		journal_revoke_count(argv[2]);
 	else if (argc == 4 && strcmp(argv[1], "workload") == 0)
 		run_workload(argv[2], argv[3], 0);
 	else if (argc == 4 && strcmp(argv[1], "boundary") == 0)
@@ -1113,12 +1326,17 @@ main (int argc, char **argv)
 	else if (argc == 3 &&
 	    strcmp(argv[1], "verify-extent-split") == 0)
 		verify_extent_split(argv[2]);
+	else if (argc == 3 &&
+	    strcmp(argv[1], "verify-truncate-prune") == 0)
+		verify_truncate_prune(argv[2]);
 	else
 		errx(1, "usage: ext4fs_crash pattern-old path | "
-		    "journal-state path | workload stage root | boundary "
-		    "stage root | verify root | verify-unlink root | "
+		    "journal-state path | journal-revokes path | "
+		    "workload stage root | boundary stage root | "
+		    "verify root | verify-unlink root | "
 		    "verify-dir-growth root | verify-rmdir root | "
 		    "verify-extent-promote root | "
-		    "verify-extent-split root");
+		    "verify-extent-split root | "
+		    "verify-truncate-prune root");
 	return (0);
 }

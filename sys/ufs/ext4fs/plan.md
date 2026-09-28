@@ -1078,6 +1078,22 @@ passed against the installed production kernel, including exact
 extent-tree shape, recovery idempotence, and offline `e2fsck -fn`
 acceptance.
 
+The deterministic truncate matrix is now integrated.  Its sparse
+depth-1 fixture begins with two external extent leaves.  A truncate at
+a block boundary releases the second half of the data extents and
+retires one complete leaf.  Every cut requires either the exact full
+file and two-leaf tree or the exact shortened file and one-leaf tree,
+including data, holes, inode block accounting, filesystem free-block
+accounting, idempotent recovery, and offline `e2fsck -fn` acceptance.
+The fixture explicitly enables the published JBD2 `REVOKE` feature on
+its checksum-free journal and is accepted by `e2fsck -fn` before use.
+The journal inspector then requires no revoke before journal records
+are written and exactly one revoke for the retired extent leaf at every
+later durable boundary.  The non-root helper self-test, fixture audit,
+build, and shell validation pass.  The explicit
+`run-regress-ext4fs-crash-truncate-vmm` target still awaits the
+production-kernel root VMM run.
+
 The remaining truncate/revoke, exhaustion, wraparound, error injection,
 and Linux verification matrices remain Phase 6 work.
 

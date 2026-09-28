@@ -42,7 +42,7 @@ fail()
 
 tools="$MKE2FS $DEBUGFS $E2FSCK $DUMPE2FS $VMCTL $SSH $SCP \
 $SYSCTL $TIMEOUT $SHA256 $SYNC $EXT4FS_CRASH awk cmp cp dd grep \
-cat id kill mkdir mktemp mv rm sleep"
+cat id kill mkdir mktemp mv od rm sleep"
 for tool in $tools; do
 	command -v "$tool" >/dev/null 2>&1 ||
 	    fail "required tool not found: $tool"
@@ -102,7 +102,7 @@ for stage in $EXT4FS_CRASH_STAGES; do
 	esac
 done
 case "$EXT4FS_CRASH_MODE" in
-timed|flush|orphan|directory|extent) ;;
+timed|flush|orphan|directory|extent|truncate) ;;
 *)	fail "unsupported crash mode: $EXT4FS_CRASH_MODE" ;;
 esac
 if [ "$EXT4FS_CRASH_MODE" != timed ]; then
@@ -485,8 +485,9 @@ recover_case()
 extent_leaf_count()
 {
 	image=$1
-	output=$2
-	if ! "$DEBUGFS" -R 'stat /crash/extent-probe' "$image" \
+	extent_path=$2
+	output=$3
+	if ! "$DEBUGFS" -R "stat $extent_path" "$image" \
 	    >"$output" 2>&1; then
 		cat "$output" >&2
 		fail "could not inspect recovered extent tree"
@@ -506,9 +507,10 @@ extent_leaf_count()
 check_extent_leaf_count()
 {
 	image=$1
-	expected=$2
-	output=$3
-	actual=$(extent_leaf_count "$image" "$output")
+	extent_path=$2
+	expected=$3
+	output=$4
+	actual=$(extent_leaf_count "$image" "$extent_path" "$output")
 	case "$actual" in
 	''|*[!0-9]*)
 		fail "could not count recovered extent leaves"
@@ -516,6 +518,39 @@ check_extent_leaf_count()
 	esac
 	[ "$actual" -eq "$expected" ] ||
 	    fail "expected $expected extent leaves, got $actual"
+}
+
+journal_revoke_records()
+{
+	journal=$1
+	output=$2
+	if ! "$EXT4FS_CRASH" journal-revokes "$journal" \
+	    >"$output" 2>&1; then
+		cat "$output" >&2
+		fail "could not inspect journal revokes"
+	fi
+	records=$(awk -F'[ =]' \
+	    '/^revokes=/ { print $2; exit }' "$output")
+	case "$records" in
+	''|*[!0-9]*) fail "journal revoke count was not reported" ;;
+	esac
+	echo "$records"
+}
+
+filesystem_free_blocks()
+{
+	output=$1
+	blocks=$(awk -F: '
+	    $1 == "Free blocks" {
+		gsub(/[[:space:]]/, "", $2)
+		print $2
+		exit
+	    }
+	' "$output")
+	case "$blocks" in
+	''|*[!0-9]*) fail "filesystem free-block count was not reported" ;;
+	esac
+	echo "$blocks"
 }
 
 run_flush_matrix()
@@ -529,6 +564,32 @@ run_flush_matrix()
 	after_state=$7
 	before_leaves=${8:-}
 	after_leaves=${9:-}
+	case "$stage" in
+	extent-*) matrix_extent_path=/crash/extent-probe ;;
+	truncate-*) matrix_extent_path=/crash/truncate-probe ;;
+	*) matrix_extent_path= ;;
+	esac
+	base_free_blocks=
+	truncate_freed_blocks=
+	if [ "$stage" = truncate-prune ]; then
+		base_super=$work/base-super-$block_size.log
+		"$DUMPE2FS" -h "$base" >"$base_super" 2>&1 ||
+		    fail "could not inspect truncate baseline"
+		base_free_blocks=$(filesystem_free_blocks "$base_super")
+		truncate_capacity=$(((block_size - 12) / 12))
+		truncate_freed_blocks=$((truncate_capacity / 2 + 2))
+		base_journal=$work/base-journal-$block_size.bin
+		"$DEBUGFS" -R "dump <8> $base_journal" "$base" \
+		    >"$work/base-journal-$block_size.log" 2>&1 ||
+		    fail "could not extract truncate baseline journal"
+		base_revokes=$(journal_revoke_records "$base_journal" \
+		    "$work/base-revokes-$block_size.log")
+		[ "$base_revokes" -eq 0 ] ||
+		    fail "truncate baseline contains stale revokes"
+		grep -q ' incompat=1$' \
+		    "$work/base-revokes-$block_size.log" ||
+		    fail "truncate baseline lacks REVOKE feature"
+	fi
 
 	for flush_count in $EXT4FS_CRASH_FLUSH_COUNTS; do
 		test_name="$label flush $flush_count, "
@@ -544,6 +605,24 @@ run_flush_matrix()
 		    "$case_dir/workload.log" \
 		    "$case_dir/flush-stop.log"
 		preserve_durable "$image" "$case_dir"
+		if [ "$stage" = truncate-prune ]; then
+			durable_revokes=$(journal_revoke_records \
+			    "$case_dir/journal.bin" \
+			    "$case_dir/durable-revokes.log")
+			grep -q ' incompat=1$' \
+			    "$case_dir/durable-revokes.log" ||
+			    fail "durable journal lost REVOKE feature"
+			if [ "$flush_count" -eq 1 ]; then
+				expected_revokes=0
+			else
+				expected_revokes=1
+			fi
+			if [ "$durable_revokes" -ne "$expected_revokes" ]; then
+				reason="truncate flush $flush_count has "
+				reason="$reason$durable_revokes revokes, "
+				fail "${reason}expected $expected_revokes"
+			fi
+		fi
 		case "$flush_count" in
 		1|2)
 			expected_journal=clean
@@ -576,22 +655,35 @@ $durable_journal_state != $expected_journal"
 		}
 		if [ -n "$expected_leaves" ]; then
 			check_extent_leaf_count "$image" \
+			    "$matrix_extent_path" \
 			    "$expected_leaves" \
 			    "$case_dir/recovered-extents.log"
+		fi
+		if [ "$stage" = truncate-prune ]; then
+			recovered_free=$(filesystem_free_blocks \
+			    "$case_dir/dumpe2fs.log")
+			expected_free=$base_free_blocks
+			if [ "$expected_state" = state=truncate-pruned ]; then
+				expected_free=$((base_free_blocks + \
+				    truncate_freed_blocks))
+			fi
+			[ "$recovered_free" -eq "$expected_free" ] ||
+			    fail "truncate free-block count mismatch"
 		fi
 		echo ' ok'
 	done
 }
 
-prepare_extent_base()
+prepare_sparse_extent_base()
 {
 	image=$1
 	block_size=$2
 	fixture_entries=$3
 	expected_leaves=$4
 	fixture_name=$5
+	fixture_file=$6
 	source_root=$work/source-$fixture_name-$block_size
-	source_file=$source_root/crash/extent-probe
+	source_file=$source_root/crash/$fixture_file
 	fixture_size=$(((2 * fixture_entries - 1) * block_size))
 
 	mkdir -p "$source_root/crash"
@@ -616,8 +708,39 @@ prepare_extent_base()
 	"$E2FSCK" -fn "$image" \
 	    >"$work/e2fsck-$fixture_name-$block_size.log" 2>&1 ||
 	    fail "e2fsck rejected $fixture_name extent fixture"
-	check_extent_leaf_count "$image" "$expected_leaves" \
+	check_extent_leaf_count "$image" "/crash/$fixture_file" \
+	    "$expected_leaves" \
 	    "$work/extents-$fixture_name-$block_size.log"
+}
+
+enable_journal_revoke()
+{
+	image=$1
+	block_size=$2
+	output=$3
+	journal_block=$("$DEBUGFS" -R 'bmap <8> 0' "$image" \
+	    2>"$output" | awk 'NF { value = $NF } END { print value }')
+	case "$journal_block" in
+	''|*[!0-9]*)
+		cat "$output" >&2
+		fail "could not map journal superblock"
+		;;
+	esac
+	feature_offset=$((journal_block * block_size + 40))
+	set -- $(dd if="$image" bs=1 skip="$feature_offset" count=4 \
+	    status=none | od -An -tu1)
+	[ "$#" -eq 4 ] || fail "could not read journal features"
+	[ "$1" -eq 0 ] && [ "$2" -eq 0 ] &&
+	    [ "$3" -eq 0 ] && [ "$4" -eq 0 ] ||
+	    fail "truncate journal has unexpected incompat features"
+	# This clean journal has no checksum feature, so enabling the
+	# published REVOKE bit does not require a checksum update.
+	printf '\000\000\000\001' | dd of="$image" bs=1 \
+	    seek="$feature_offset" count=4 conv=notrunc status=none
+	"$E2FSCK" -fn "$image" >"$output" 2>&1 || {
+		cat "$output" >&2
+		fail "e2fsck rejected revoke-enabled journal"
+	}
 }
 
 "$SYSCTL" -n kern.version >"$work/host-version.log"
@@ -625,19 +748,35 @@ old_data=$work/old.data
 "$EXT4FS_CRASH" pattern-old "$old_data"
 
 for block_size in $EXT4FS_CRASH_BLOCK_SIZES; do
+	if [ "$EXT4FS_CRASH_MODE" = truncate ]; then
+		extent_capacity=$(((block_size - 12) / 12))
+		truncate_base=$work/base-truncate-$block_size.img
+		prepare_sparse_extent_base "$truncate_base" \
+		    "$block_size" "$((extent_capacity + 1))" 2 \
+		    truncate truncate-probe
+		enable_journal_revoke "$truncate_base" "$block_size" \
+		    "$work/revoke-feature-$block_size.log"
+		run_flush_matrix "$truncate_base" "$block_size" \
+		    truncate-prune 'extent truncate' \
+		    verify-truncate-prune 'state=truncate-full' \
+		    'state=truncate-pruned' 2 1
+		continue
+	fi
+
 	if [ "$EXT4FS_CRASH_MODE" = extent ]; then
 		extent_capacity=$(((block_size - 12) / 12))
 		promote_base=$work/base-extent-promote-$block_size.img
-		prepare_extent_base "$promote_base" "$block_size" 4 0 \
-		    promote
+		prepare_sparse_extent_base "$promote_base" \
+		    "$block_size" 4 0 promote extent-probe
 		run_flush_matrix "$promote_base" "$block_size" \
 		    extent-promote 'extent root promotion' \
 		    verify-extent-promote 'state=extent-inline' \
 		    'state=extent-promoted' 0 1
 
 		split_base=$work/base-extent-split-$block_size.img
-		prepare_extent_base "$split_base" "$block_size" \
-		    "$extent_capacity" 1 split
+		prepare_sparse_extent_base "$split_base" \
+		    "$block_size" "$extent_capacity" 1 split \
+		    extent-probe
 		run_flush_matrix "$split_base" "$block_size" \
 		    extent-split 'extent leaf split' \
 		    verify-extent-split 'state=extent-one-leaf' \
