@@ -1058,8 +1058,10 @@ holding an open descriptor so orphan retirement remains crash-relevant.
 For both workloads, each cut requires the modeled old-or-new namespace
 and directory-size state, idempotent recovery, and offline
 `e2fsck -fn` acceptance.  The non-root helper self-test passes.  The
-explicit `run-regress-ext4fs-crash-directory-vmm` target still awaits
-the production-kernel root VMM run.
+explicit `run-regress-ext4fs-crash-directory-vmm` target covers all six
+durability boundaries for both workloads.  On 2026-09-28, all twelve
+cases passed against the installed production kernel, including
+recovery idempotence and offline `e2fsck -fn` acceptance.
 
 The remaining extent, truncate/revoke, exhaustion, wraparound, error
 injection, and Linux verification matrices remain Phase 6 work.
