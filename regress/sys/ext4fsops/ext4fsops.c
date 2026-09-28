@@ -58,6 +58,7 @@
 #define SYNC_INITIAL_SEED	0x46U
 #define OSYNC_UPDATE_SEED	0x8bU
 #define MOUNT_SYNC_SEED		0xf2U
+#define VFS_SYNC_UPDATE_SEED	0x6dU
 
 static char root[PATH_MAX];
 static size_t block_size;
@@ -133,7 +134,8 @@ static void	update_fsync_fixture (void);
 static void	clean_fsync_fixture (void);
 static void	verify_fsync_fixture (void);
 static void	create_sync_fixture (void);
-static void	update_sync_fixture (int, unsigned int);
+static void	update_sync_fixture (int, unsigned int, int);
+static void	clean_vfs_sync_fixture (void);
 static void	clean_osync_fixture (void);
 static void	verify_sync_fixture (unsigned int);
 
@@ -2703,7 +2705,7 @@ create_sync_fixture (void)
 }
 
 static void
-update_sync_fixture (int flags, unsigned int seed)
+update_sync_fixture (int flags, unsigned int seed, int do_vfs_sync)
 {
 	struct stat after, before;
 	char path[PATH_MAX];
@@ -2721,6 +2723,8 @@ update_sync_fixture (int flags, unsigned int seed)
 	    before.st_size != (off_t)length)
 		errx(1, "synchronous-write fixture has wrong shape");
 	write_pattern_fd(fd, 0, length, seed);
+	if (do_vfs_sync)
+		sync();
 	if (fstat(fd, &after) == -1)
 		err(1, "fstat updated %s", path);
 	if (after.st_size != before.st_size ||
@@ -2728,6 +2732,12 @@ update_sync_fixture (int flags, unsigned int seed)
 		errx(1, "synchronous in-place write changed allocation");
 	if (close(fd) == -1)
 		err(1, "close %s", path);
+}
+
+static void
+clean_vfs_sync_fixture (void)
+{
+	sync();
 }
 
 static void
@@ -2931,15 +2941,21 @@ main (int argc, char **argv)
 			create_sync_fixture();
 		else if (strcmp(argv[1], "osync-update") == 0)
 			update_sync_fixture(O_SYNC,
-			    OSYNC_UPDATE_SEED);
+			    OSYNC_UPDATE_SEED, 0);
 		else if (strcmp(argv[1], "mount-sync-update") == 0)
-			update_sync_fixture(0, MOUNT_SYNC_SEED);
+			update_sync_fixture(0, MOUNT_SYNC_SEED, 0);
+		else if (strcmp(argv[1], "vfs-sync-update") == 0)
+			update_sync_fixture(0, VFS_SYNC_UPDATE_SEED, 1);
 		else if (strcmp(argv[1], "osync-clean") == 0)
 			clean_osync_fixture();
+		else if (strcmp(argv[1], "vfs-sync-clean") == 0)
+			clean_vfs_sync_fixture();
 		else if (strcmp(argv[1], "osync-verify") == 0)
 			verify_sync_fixture(OSYNC_UPDATE_SEED);
 		else if (strcmp(argv[1], "sync-verify") == 0)
 			verify_sync_fixture(MOUNT_SYNC_SEED);
+		else if (strcmp(argv[1], "vfs-sync-verify") == 0)
+			verify_sync_fixture(VFS_SYNC_UPDATE_SEED);
 		else
 			errx(1, "unknown mode: %s", argv[1]);
 	}

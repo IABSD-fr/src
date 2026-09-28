@@ -851,7 +851,7 @@ Wrap each compound namespace operation in one transaction:
       wait for ordered data and the commit record to become durable.
 - [x] Make synchronous mounts and `O_SYNC` writes force the required
       commit.
-- [ ] Make VFS sync commit and checkpoint outstanding journal work.
+- [x] Make VFS sync commit and checkpoint outstanding journal work.
 - [ ] Ensure read-only mounts may replay recovery only when the device
       can be safely opened for writing; otherwise fail without modifying
       it.
@@ -892,6 +892,22 @@ It also verifies that an empty `O_SYNC` write creates no transaction,
 checks remounted data, and runs offline `e2fsck -fn`.  On 2026-09-28,
 the focused target and complete ext4fs suite passed against the rebuilt
 and booted production kernel.
+
+VFS sync semantics are complete.  Non-lazy sync first flushes dirty
+vnodes, then commits and checkpoints any remaining journal work before
+flushing the device.  `MNT_LAZY` skips the vnode walk but still drains
+filesystem-owned journal state.  On a journal-less mount, the ext4
+superblock is written before the final device flush.
+
+The focused `run-regress-ext4fsops-vfs-sync` target performs a normal
+buffered update followed by `sync()` with 1 KiB, 2 KiB, and 4 KiB
+filesystem blocks.  While the filesystem remains mounted, it requires
+the journal sequence to advance and `s_start` to be zero.  It proves
+that unmount has no delayed transaction to finish and that a clean
+`sync()` creates no transaction.  It also verifies remounted data,
+read-only non-mutation, and offline `e2fsck -fn` acceptance.  On
+2026-09-28, the focused target and complete ext4fs suite passed against
+the rebuilt and booted production kernel.
 
 ## Phase 6: Crash-consistency test matrix
 

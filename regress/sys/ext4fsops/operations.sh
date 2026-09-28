@@ -225,8 +225,9 @@ check_image()
 	fi
 }
 
-journal_sequence()
+journal_word()
 {
+	field_offset=$1
 	journal_inode=$("$DUMPE2FS" -h "$image" 2>/dev/null | awk '
 	    $1 == "Journal" && $2 == "inode:" { print $3; exit }
 	')
@@ -241,12 +242,21 @@ journal_sequence()
 	case "$1" in
 	*[!0-9]*|'') fail "invalid journal superblock location" ;;
 	esac
-	journal_offset=$(($1 * block_size + 24))
-	sequence=$(dd if="$image" bs=1 skip="$journal_offset" count=4 \
+	journal_offset=$(($1 * block_size + field_offset))
+	word=$(dd if="$image" bs=1 skip="$journal_offset" count=4 \
 	    status=none | hexdump -ve '1/1 "%02x"')
-	[ "${#sequence}" -eq 8 ] ||
-	    fail "could not read the journal sequence"
-	printf '%s\n' "$sequence"
+	[ "${#word}" -eq 8 ] || fail "could not read a journal word"
+	printf '%s\n' "$word"
+}
+
+journal_sequence()
+{
+	journal_word 24
+}
+
+journal_start()
+{
+	journal_word 28
 }
 
 check_last_orphan_clear()
@@ -1394,6 +1404,82 @@ run_sync_case()
 	echo " ok"
 }
 
+run_vfs_sync_case()
+{
+	block_size=$1
+	case_dir=$work/vfs-sync-$block_size
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	test_name="VFS sync ($block_size byte blocks)"
+	print_test_name "$test_name"
+
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O 'metadata_csum,^orphan_file' "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs failed"
+	fi
+
+	attach_image
+	mount_image ""
+	run_step sync-create "$mountpoint"
+	unmount_image vfs-sync-create
+	detach_image
+	check_superblock_clean vfs-sync-create
+	check_image vfs-sync-create
+	sequence_before=$(journal_sequence)
+	[ "$(journal_start)" = 00000000 ] ||
+	    fail "initial journal was not empty"
+
+	attach_image
+	mount_image ""
+	run_step vfs-sync-update "$mountpoint"
+	sequence_live=$(journal_sequence)
+	[ "$sequence_live" != "$sequence_before" ] ||
+	    fail "sync returned before committing the transaction"
+	[ "$(journal_start)" = 00000000 ] ||
+	    fail "sync returned before checkpointing the transaction"
+	unmount_image vfs-sync-update
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" = "$sequence_live" ] ||
+	    fail "sync left a transaction for unmount"
+	[ "$(journal_start)" = 00000000 ] ||
+	    fail "journal was not empty after unmount"
+	check_superblock_clean vfs-sync-update
+	check_image vfs-sync-update
+	sequence_before=$sequence_after
+
+	attach_image
+	mount_image ""
+	run_step vfs-sync-clean "$mountpoint"
+	sequence_live=$(journal_sequence)
+	[ "$sequence_live" = "$sequence_before" ] ||
+	    fail "clean sync created a journal transaction"
+	[ "$(journal_start)" = 00000000 ] ||
+	    fail "clean sync left a live transaction"
+	unmount_image vfs-sync-clean
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" = "$sequence_before" ] ||
+	    fail "clean sync left a transaction for unmount"
+	check_superblock_clean vfs-sync-clean
+	check_image vfs-sync-clean
+
+	before=$(sha256 -q "$image")
+	attach_image
+	mount_image ro
+	run_step vfs-sync-verify "$mountpoint"
+	unmount_image vfs-sync-verify
+	detach_image
+	after=$(sha256 -q "$image")
+	[ "$before" = "$after" ] ||
+	    fail "read-only verification changed the image"
+	echo " ok"
+}
+
 extent_leaf_count()
 {
 	stage=$1
@@ -1986,6 +2072,19 @@ sync)
 			;;
 		esac
 		run_sync_case "$block_size"
+	done
+	exit 0
+	;;
+vfs-sync)
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		case "$block_size" in
+		1024|2048|4096) ;;
+		*)
+			echo "bad block size: $block_size" >&2
+			exit 1
+			;;
+		esac
+		run_vfs_sync_case "$block_size"
 	done
 	exit 0
 	;;

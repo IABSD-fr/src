@@ -2003,20 +2003,24 @@ ext4fs_sync (struct mount *mp, int waitfor, int stall,
 	esa.allerror = 0;
 	esa.waitfor = waitfor;
 
-	vfs_mount_foreach_vnode(mp, ext4fs_sync_vnode, &esa);
+	if (waitfor != MNT_LAZY)
+		vfs_mount_foreach_vnode(mp, ext4fs_sync_vnode, &esa);
+
+	if (fs->m_journal != NULL) {
+		if ((error = ext4fs_journal_force_commit(mp)) != 0)
+			esa.allerror = error;
+	} else if (fs->m_fs_was_modified) {
+		if ((error = ext4fs_sbwrite_direct(mp)))
+			esa.allerror = error;
+	}
 
 	if (waitfor != MNT_LAZY) {
+		/* Flush checkpointed and journal-less metadata. */
 		vn_lock(ump->um_devvp, LK_EXCLUSIVE | LK_RETRY);
 		if ((error = VOP_FSYNC(ump->um_devvp, cred,
 		    waitfor, p)))
 			esa.allerror = error;
 		VOP_UNLOCK(ump->um_devvp);
-	}
-
-	/* Runtime journal transactions own their superblock updates. */
-	if (fs->m_journal == NULL && fs->m_fs_was_modified) {
-		if ((error = ext4fs_sbwrite_direct(mp)))
-			esa.allerror = error;
 	}
 
 	return (esa.allerror);
