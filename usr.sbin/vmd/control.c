@@ -97,6 +97,8 @@ control_dispatch_vmd(int fd, struct privsep_proc *p, struct imsg *imsg)
 	case IMSG_VMDOP_START_VM_RESPONSE:
 	case IMSG_VMDOP_PAUSE_VM_RESPONSE:
 	case IMSG_VMDOP_UNPAUSE_VM_RESPONSE:
+	case IMSG_VMDOP_FLUSH_STOP_ARMED:
+	case IMSG_VMDOP_FLUSH_STOPPED:
 	case IMSG_VMDOP_GET_INFO_VM_DATA:
 	case IMSG_VMDOP_GET_INFO_VM_END_DATA:
 	case IMSG_CTL_FAIL:
@@ -378,6 +380,7 @@ control_dispatch_imsg(int fd, short event, void *arg)
 	struct ctl_conn			*c;
 	struct imsg			 imsg;
 	struct vmop_create_params	 vmc;
+	struct vmop_flush_stop		 vfs;
 	struct vmop_id			 vid;
 	struct ctl_notify		*notify;
 	int				 kernfd, n, v, wait = 0, ret = 0;
@@ -422,6 +425,10 @@ control_dispatch_imsg(int fd, short event, void *arg)
 		case IMSG_VMDOP_PAUSE_VM:
 		case IMSG_VMDOP_UNPAUSE_VM:
 			if (imsg_get_len(&imsg) != sizeof(vid))
+				goto fail_imsg;
+			break;
+		case IMSG_VMDOP_FLUSH_STOP:
+			if (imsg_get_len(&imsg) != sizeof(vfs))
 				goto fail_imsg;
 			break;
 		case IMSG_VMDOP_START_VM_REQUEST:
@@ -510,6 +517,14 @@ control_dispatch_imsg(int fd, short event, void *arg)
 
 			if (proc_compose_imsg(ps, PROC_PARENT, type,
 			    peer_id, imsg_get_fd(&imsg), &vid, sizeof(vid)))
+				goto fail;
+			break;
+		case IMSG_VMDOP_FLUSH_STOP:
+			vmop_flush_stop_read(&imsg, &vfs);
+			vfs.vfs_uid = c->peercred.uid;
+			vfs.vfs_peer_id = peer_id;
+			if (proc_compose_imsg(ps, PROC_PARENT, type,
+			    peer_id, -1, &vfs, sizeof(vfs)))
 				goto fail;
 			break;
 		default:

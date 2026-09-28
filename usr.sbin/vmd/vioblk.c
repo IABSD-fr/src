@@ -44,6 +44,7 @@ static uint32_t vioblk_dev_read(struct virtio_dev *, struct viodev_msg *);
 static int vioblk_notifyq(struct virtio_dev *, uint16_t);
 static ssize_t vioblk_io(struct vioblk_dev *, struct virtio_vq_info *, int,
     off_t, struct vring_desc *, struct vring_desc **);
+static void vioblk_flush_boundary(struct virtio_dev *);
 
 static void dev_dispatch_vm(int, short, void *);
 static void handle_sync_io(int, short, void *);
@@ -256,7 +257,7 @@ vioblk_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 	uint8_t ds;
 	off_t offset;
 	ssize_t sz;
-	int is_write, notify = 0;
+	int is_write, notify = 0, stop_after = 0;
 	char *vr;
 	size_t i;
 	struct vring_desc *table, *desc;
@@ -330,8 +331,18 @@ vioblk_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 			break;
 		case VIRTIO_BLK_T_FLUSH:
 		case VIRTIO_BLK_T_FLUSH_OUT:
-			ds = vioblk->file.flush(vioblk->file.p) == -1 ?
-			    VIRTIO_BLK_S_IOERR : VIRTIO_BLK_S_OK;
+			if (vioblk->file.flush(vioblk->file.p) == -1)
+				ds = VIRTIO_BLK_S_IOERR;
+			else {
+				ds = VIRTIO_BLK_S_OK;
+				if (vioblk->flush_stop_target != 0 &&
+				    ++vioblk->flush_stop_seen ==
+				    vioblk->flush_stop_target) {
+					vioblk->flush_stop_target = 0;
+					vioblk_flush_boundary(dev);
+					stop_after = 1;
+				}
+			}
 			break;
 		case VIRTIO_BLK_T_GET_ID:
 			/*
@@ -383,6 +394,8 @@ vioblk_notifyq(struct virtio_dev *dev, uint16_t vq_idx)
 		__sync_synchronize();
 		used->idx++;
 		idx++;
+		if (stop_after)
+			break;
 	}
 
 	vq_info->last_avail = idx;
@@ -396,6 +409,44 @@ reset:
 	dev->status |= DEVICE_NEEDS_RESET;
 	dev->isr |= VIRTIO_CONFIG_ISR_CONFIG_CHANGE;
 	return (1);
+}
+
+static void
+vioblk_flush_boundary(struct virtio_dev *dev)
+{
+	struct imsgbuf *ibuf;
+	struct imsg imsg;
+	uint32_t type;
+	int n, verbose;
+
+	ibuf = &dev->async_iev.ibuf;
+	if (imsg_compose(ibuf, IMSG_DEVOP_FLUSH_STOPPED,
+	    0, 0, -1, NULL, 0) == -1)
+		fatal("%s: compose", __func__);
+	if (imsgbuf_flush(ibuf) == -1)
+		fatal("%s: flush", __func__);
+	for (;;) {
+		n = imsgbuf_read_one(ibuf, &imsg);
+		if (n <= 0)
+			fatal("%s: read", __func__);
+		type = imsg_get_type(&imsg);
+		if (type == IMSG_DEVOP_FLUSH_CONTINUE) {
+			imsg_free(&imsg);
+			break;
+		}
+		switch (type) {
+		case IMSG_VMDOP_PAUSE_VM:
+			log_debug("%s: paused at flush boundary", __func__);
+			break;
+		case IMSG_CTL_VERBOSE:
+			verbose = imsg_int_read(&imsg);
+			log_setverbose(verbose);
+			break;
+		default:
+			fatalx("%s: unexpected response %u", __func__, type);
+		}
+		imsg_free(&imsg);
+	}
 }
 
 static void
@@ -441,6 +492,17 @@ dev_dispatch_vm(int fd, short event, void *arg)
 
 		type = imsg_get_type(&imsg);
 		switch (type) {
+		case IMSG_DEVOP_FLUSH_STOP:
+			dev->vioblk.flush_stop_target =
+			    imsg_uint_read(&imsg);
+			dev->vioblk.flush_stop_seen = 0;
+			if (dev->vioblk.flush_stop_target == 0)
+				fatalx("%s: zero flush count", __func__);
+			if (imsg_compose_event(iev,
+			    IMSG_DEVOP_FLUSH_STOP_ARMED, 0, 0, -1,
+			    NULL, 0) == -1)
+				fatal("%s: arm response", __func__);
+			break;
 		case IMSG_VMDOP_PAUSE_VM:
 			log_debug("%s: pausing", __func__);
 			break;

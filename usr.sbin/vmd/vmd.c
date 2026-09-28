@@ -95,6 +95,8 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 	int				 cmd = IMSG_NONE, verbose;
 	unsigned int			 v = 0, flags;
 	struct vmop_create_params	 vmc;
+	struct vmop_flush_stop		 vfs;
+	struct vmop_flush_stop_result	 vfr;
 	struct vmop_id			 vid;
 	struct vmop_result		 vmr;
 	struct vmd_vm			*vm = NULL;
@@ -275,6 +277,34 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 		proc_compose_imsg(ps, PROC_VMM, type, vm->vm_peerid, -1,
 		    &vid, sizeof(vid));
 		break;
+	case IMSG_VMDOP_FLUSH_STOP:
+		vmop_flush_stop_read(imsg, &vfs);
+		cmd = IMSG_VMDOP_FLUSH_STOP_ARMED;
+		if (vfs.vfs_id == 0) {
+			if ((vm = vm_getbyname(vfs.vfs_name)) == NULL) {
+				res = ENOENT;
+				break;
+			}
+			vfs.vfs_id = vm->vm_vmid;
+		} else if ((vm = vm_getbyid(vfs.vfs_id)) == NULL) {
+			res = ENOENT;
+			break;
+		}
+		if (vm_checkperm(vm, &vm->vm_params.vmc_owner,
+		    vfs.vfs_uid) != 0)
+			res = EPERM;
+		else if (! (vm->vm_state & VM_STATE_RUNNING))
+			res = EINVAL;
+		else if (vfs.vfs_disk >= vm->vm_params.vmc_ndisks ||
+		    vfs.vfs_count == 0)
+			res = EINVAL;
+		if (res != 0)
+			break;
+		cmd = IMSG_NONE;
+		if (proc_compose_imsg(ps, PROC_VMM, type, peer_id,
+		    -1, &vfs, sizeof(vfs)) == -1)
+			return (-1);
+		break;
 	case IMSG_VMDOP_DONE:
 		control_reset(&ps->ps_csock);
 		break;
@@ -294,6 +324,17 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 		    &vmr, sizeof(vmr)) == -1)
 			return (-1);
 		break;
+	case IMSG_VMDOP_FLUSH_STOP_ARMED:
+		memset(&vfr, 0, sizeof(vfr));
+		vfr.vfr_result = res;
+		vfr.vfr_id = vfs.vfs_id;
+		vfr.vfr_peer_id = vfs.vfs_peer_id;
+		vfr.vfr_disk = vfs.vfs_disk;
+		vfr.vfr_count = vfs.vfs_count;
+		if (proc_compose_imsg(ps, PROC_CONTROL, cmd, peer_id,
+		    -1, &vfr, sizeof(vfr)) == -1)
+			return (-1);
+		break;
 	default:
 		if (proc_compose_imsg(ps, PROC_CONTROL, cmd, peer_id, -1,
 		    &res, sizeof(res)) == -1)
@@ -307,6 +348,7 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 int
 vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 {
+	struct vmop_flush_stop_result vfr;
 	struct vmop_result	 vmr;
 	struct privsep		*ps = p->p_ps;
 	struct vmd_vm		*vm = NULL;
@@ -317,6 +359,20 @@ vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 	type = imsg_get_type(imsg);
 
 	switch (type) {
+	case IMSG_VMDOP_FLUSH_STOP_ARMED:
+	case IMSG_VMDOP_FLUSH_STOPPED:
+		vmop_flush_stop_result_read(imsg, &vfr);
+		if ((vm = vm_getbyvmid(vfr.vfr_id)) == NULL)
+			break;
+		proc_compose_imsg(ps, PROC_CONTROL, type,
+		    vfr.vfr_peer_id, -1, &vfr, sizeof(vfr));
+		if (type == IMSG_VMDOP_FLUSH_STOPPED) {
+			log_info("%s: paused at disk %u flush %u",
+			    vm->vm_params.vmc_name, vfr.vfr_disk,
+			    vfr.vfr_count);
+			vm->vm_state |= VM_STATE_PAUSED;
+		}
+		break;
 	case IMSG_VMDOP_PAUSE_VM_RESPONSE:
 		vmop_result_read(imsg, &vmr);
 		if ((vm = vm_getbyvmid(vmr.vmr_id)) == NULL)
@@ -1889,6 +1945,22 @@ vmop_create_params_read(struct imsg *imsg, struct vmop_create_params *vmc)
 		vmc->vmc_ifgroup[i][sizeof(vmc->vmc_ifgroup[i]) - 1] = '\0';
 
 	vmc->vmc_instance[sizeof(vmc->vmc_instance) - 1] = '\0';
+}
+
+void
+vmop_flush_stop_read(struct imsg *imsg, struct vmop_flush_stop *vfs)
+{
+	if (imsg_get_data(imsg, vfs, sizeof(*vfs)))
+		fatal("%s", __func__);
+	vfs->vfs_name[sizeof(vfs->vfs_name) - 1] = '\0';
+}
+
+void
+vmop_flush_stop_result_read(struct imsg *imsg,
+    struct vmop_flush_stop_result *vfr)
+{
+	if (imsg_get_data(imsg, vfr, sizeof(*vfr)))
+		fatal("%s", __func__);
 }
 
 void

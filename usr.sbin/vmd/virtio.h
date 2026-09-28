@@ -270,6 +270,10 @@ struct vioblk_dev {
 	uint32_t seg_max;	/* maximum number of segments */
 
 	unsigned int idx;
+	struct vmop_flush_stop flush_stop;
+	uint32_t flush_stop_target;
+	uint32_t flush_stop_seen;
+	int flush_stop_pending;
 };
 
 /* vioscsi will use at least 3 queues - 5.6.2 Virtqueues
@@ -398,6 +402,7 @@ void virtio_vq_init(struct virtio_dev *, size_t);
 void virtio_broadcast_imsg(struct vmd_vm *, uint16_t, void *, uint16_t);
 void virtio_stop(struct vmd_vm *);
 void virtio_start(struct vmd_vm *);
+int vioblk_flush_stop(struct vmd_vm *, struct vmop_flush_stop *);
 void virtio_shutdown(struct vmd_vm *);
 const char *virtio_reg_name(uint8_t);
 uint32_t vring_size(uint32_t);

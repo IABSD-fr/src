@@ -110,6 +110,18 @@ and
 .Fl i
 options and will be obtained from the base or input image respectively.
 .El
+.It Cm flush-stop Ar id disk count
+Arm the zero-based virtual
+.Ar disk
+of VM
+.Ar id
+to pause after
+.Ar count
+successful cache flushes.
+The command reports when the device is armed, then waits until the
+selected backing-file flush is durable and every vCPU is paused.
+The flush is not reported complete to the guest until after the pause.
+This command is intended for storage crash-consistency testing.
 .It Cm load Ar filename
 Load additional configuration from the specified file.
 .It Cm log brief | verbose

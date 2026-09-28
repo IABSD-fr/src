@@ -65,11 +65,14 @@ int		 ctl_stop(struct parse_result *, int, char *[]);
 int		 ctl_waitfor(struct parse_result *, int, char *[]);
 int		 ctl_pause(struct parse_result *, int, char *[]);
 int		 ctl_unpause(struct parse_result *, int, char *[]);
+int		 ctl_flush_stop(struct parse_result *, int, char *[]);
 
 struct ctl_command ctl_commands[] = {
 	{ "console",	CMD_CONSOLE,	ctl_console,	"id" },
 	{ "create",	CMD_CREATE,	ctl_create,
 		"[-b base | -i disk] [-s size] disk", 1 },
+	{ "flush-stop",	CMD_FLUSH_STOP,	ctl_flush_stop,
+	    "id disk count" },
 	{ "load",	CMD_LOAD,	ctl_load,	"filename" },
 	{ "log",	CMD_LOG,	ctl_log,	"[brief | verbose]" },
 	{ "pause",	CMD_PAUSE,	ctl_pause,	"id" },
@@ -255,6 +258,10 @@ vmmaction(struct parse_result *res)
 	case CMD_UNPAUSE:
 		unpause_vm(res->id, res->name);
 		break;
+	case CMD_FLUSH_STOP:
+		flush_stop_vm(res->id, res->name, res->disk_index,
+		    res->flush_count);
+		break;
 	case CMD_CREATE:
 	case NONE:
 		/* The action is not expected here */
@@ -317,6 +324,9 @@ vmmaction(struct parse_result *res)
 				break;
 			case CMD_UNPAUSE:
 				done = unpause_vm_complete(&imsg, &ret);
+				break;
+			case CMD_FLUSH_STOP:
+				done = flush_stop_vm_complete(&imsg, &ret);
 				break;
 			default:
 				done = 1;
@@ -1007,6 +1017,26 @@ ctl_unpause(struct parse_result *res, int argc, char *argv[])
 	} else if (argc != 2)
 		ctl_usage(res->ctl);
 
+	return (vmmaction(res));
+}
+
+int
+ctl_flush_stop(struct parse_result *res, int argc, char *argv[])
+{
+	const char *errstr;
+
+	if (argc != 4)
+		ctl_usage(res->ctl);
+	if (parse_vmid(res, argv[1], 0) == -1)
+		errx(1, "invalid id: %s", argv[1]);
+	res->disk_index = strtonum(argv[2], 0,
+	    VM_MAX_DISKS_PER_VM - 1, &errstr);
+	if (errstr != NULL)
+		errx(1, "disk index is %s: %s", errstr, argv[2]);
+	res->flush_count = strtonum(argv[3], 1, UINT32_MAX,
+	    &errstr);
+	if (errstr != NULL)
+		errx(1, "flush count is %s: %s", errstr, argv[3]);
 	return (vmmaction(res));
 }
 

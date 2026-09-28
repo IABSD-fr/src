@@ -366,6 +366,54 @@ unpause_vm_complete(struct imsg *imsg, int *ret)
 	return (1);
 }
 
+void
+flush_stop_vm(uint32_t id, const char *name, uint32_t disk,
+    uint32_t count)
+{
+	struct vmop_flush_stop vfs;
+
+	memset(&vfs, 0, sizeof(vfs));
+	vfs.vfs_id = id;
+	if (name != NULL)
+		(void)strlcpy(vfs.vfs_name, name, sizeof(vfs.vfs_name));
+	vfs.vfs_disk = disk;
+	vfs.vfs_count = count;
+	imsg_compose(ibuf, IMSG_VMDOP_FLUSH_STOP, 0, 0, -1,
+	    &vfs, sizeof(vfs));
+}
+
+int
+flush_stop_vm_complete(struct imsg *imsg, int *ret)
+{
+	struct vmop_flush_stop_result vfr;
+	uint32_t type;
+
+	type = imsg_get_type(imsg);
+	if (type != IMSG_VMDOP_FLUSH_STOP_ARMED &&
+	    type != IMSG_VMDOP_FLUSH_STOPPED) {
+		warnx("unexpected response received from vmd");
+		*ret = EINVAL;
+		return (1);
+	}
+	if (imsg_get_data(imsg, &vfr, sizeof(vfr)))
+		fatal("%s", __func__);
+	if (vfr.vfr_result != 0) {
+		errno = vfr.vfr_result;
+		warn("flush-stop command failed");
+		*ret = EIO;
+		return (1);
+	}
+	*ret = 0;
+	if (type == IMSG_VMDOP_FLUSH_STOP_ARMED) {
+		warnx("armed vm %u disk %u at flush %u", vfr.vfr_id,
+		    vfr.vfr_disk, vfr.vfr_count);
+		return (0);
+	}
+	warnx("paused vm %u at disk %u flush %u", vfr.vfr_id,
+	    vfr.vfr_disk, vfr.vfr_count);
+	return (1);
+}
+
 /*
  * terminate_vm
  *
