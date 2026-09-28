@@ -102,7 +102,7 @@ for stage in $EXT4FS_CRASH_STAGES; do
 	esac
 done
 case "$EXT4FS_CRASH_MODE" in
-timed|flush|orphan) ;;
+timed|flush|orphan|directory) ;;
 *)	fail "unsupported crash mode: $EXT4FS_CRASH_MODE" ;;
 esac
 if [ "$EXT4FS_CRASH_MODE" != timed ]; then
@@ -575,13 +575,25 @@ for block_size in $EXT4FS_CRASH_BLOCK_SIZES; do
 		continue
 	fi
 
-	if [ "$EXT4FS_CRASH_MODE" = flush ]; then
+	case "$EXT4FS_CRASH_MODE" in
+	flush)
 		run_flush_matrix "$base" "$block_size" rename rename \
 		    verify 'state=old next=full' \
 		    'state=new next=absent'
-	else
+		;;
+	orphan)
 		run_flush_matrix "$base" "$block_size" unlink-open \
 		    'open unlink' verify-unlink 'state=linked' \
 		    'state=absent'
-	fi
+		;;
+	directory)
+		run_flush_matrix "$base" "$block_size" dir-grow \
+		    'directory growth' verify-dir-growth \
+		    'state=directory-old' 'state=directory-grown'
+		run_flush_matrix "$base" "$block_size" rmdir-open \
+		    'directory removal' verify-rmdir \
+		    'state=directory-linked' \
+		    'state=directory-absent'
+		;;
+	esac
 done

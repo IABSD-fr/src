@@ -1050,8 +1050,19 @@ all six durability boundaries.  On 2026-09-28, every boundary passed
 against the installed production kernel, including recovery
 idempotence and offline `e2fsck -fn` acceptance.
 
-The remaining workload matrix, wraparound, and Linux verification remain
-Phase 6 work.
+The deterministic directory matrix is now integrated.  One workload
+probes the actual filesystem directory layout, prepares a directory at
+the last entry before growth, and creates the exact entry which adds a
+directory block.  A second workload removes an empty directory while
+holding an open descriptor so orphan retirement remains crash-relevant.
+For both workloads, each cut requires the modeled old-or-new namespace
+and directory-size state, idempotent recovery, and offline
+`e2fsck -fn` acceptance.  The non-root helper self-test passes.  The
+explicit `run-regress-ext4fs-crash-directory-vmm` target still awaits
+the production-kernel root VMM run.
+
+The remaining extent, truncate/revoke, exhaustion, wraparound, error
+injection, and Linux verification matrices remain Phase 6 work.
 
 Use filesystem images created by Linux tools and run IABSD in a VM.
 Inject an abrupt power loss after each commit phase and at journal

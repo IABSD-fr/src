@@ -20,6 +20,7 @@
 #include <sys/endian.h>
 #include <sys/stat.h>
 
+#include <dirent.h>
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -39,6 +40,13 @@
 #define GATE_USEC	10000
 #define GATE_PATH	"/tmp/ext4fs_crash.go"
 
+#define DIR_ENTRY_LIMIT	128
+#define DIR_ENTRY_NAME_LEN	200
+#define GROW_DIR	"grow"
+#define GROW_MARKER	"grow.marker"
+#define PROBE_DIR	"grow.probe"
+#define REMOVE_DIR	"removed"
+
 #define JBD2_MAGIC		UINT32_C(0xc03b3998)
 #define JBD2_SUPERBLOCK_V2	4
 #define JBD2_SUPER_BYTES	256
@@ -53,10 +61,19 @@
 #define JBD2_OFF_HEAD		0x58
 
 static void	make_path (char *, size_t, const char *, const char *);
+static void	make_entry_name (char *, size_t, unsigned int);
+static void	make_entry_path (char *, size_t, const char *,
+    const char *, unsigned int);
 static unsigned char pattern_byte (off_t, unsigned int);
 static void	fill_pattern (unsigned char *, size_t, off_t,
     unsigned int);
 static int	open_output (const char *, int);
+static void	create_empty (const char *);
+static unsigned int directory_entries (const char *);
+static void	write_growth_marker (const char *, unsigned int, off_t,
+    off_t);
+static void	read_growth_marker (const char *, unsigned int *, off_t *,
+    off_t *);
 static void	write_pattern (int, off_t, unsigned int);
 static void	check_pattern (const char *, off_t, unsigned int);
 static void	arm_cut (const char *);
@@ -65,7 +82,11 @@ static void	make_old_pattern (const char *);
 static uint32_t	load_be32 (const unsigned char *, size_t);
 static void	store_be32 (unsigned char *, size_t, uint32_t);
 static void	classify_journal (const char *);
+static void	run_dir_growth (const char *, const char *, int);
+static void	run_rmdir_open (const char *, const char *, int);
 static void	run_workload (const char *, const char *, int);
+static void	verify_dir_growth (const char *);
+static void	verify_rmdir (const char *);
 static void	verify_workload (const char *);
 static void	verify_unlink (const char *);
 static void	selftest (void);
@@ -79,6 +100,36 @@ make_path (char *path, size_t pathlen, const char *root,
 	n = snprintf(path, pathlen, "%s/%s", root, name);
 	if (n < 0 || (size_t)n >= pathlen)
 		errx(1, "path too long: %s", name);
+}
+
+static void
+make_entry_name (char *name, size_t namelen, unsigned int index)
+{
+	size_t i;
+	int n;
+
+	n = snprintf(name, namelen, "%06u-", index);
+	if (n < 0 || (size_t)n >= namelen ||
+	    DIR_ENTRY_NAME_LEN >= namelen ||
+	    (size_t)n >= DIR_ENTRY_NAME_LEN)
+		errx(1, "directory entry name is too long");
+	for (i = (size_t)n; i < DIR_ENTRY_NAME_LEN; i++)
+		name[i] = (char)('a' + i % 26);
+	name[DIR_ENTRY_NAME_LEN] = '\0';
+}
+
+static void
+make_entry_path (char *path, size_t pathlen, const char *root,
+    const char *directory, unsigned int index)
+{
+	char name[NAME_MAX + 1];
+	int n;
+
+	make_entry_name(name, sizeof(name), index);
+	n = snprintf(path, pathlen, "%s/%s/%s", root, directory,
+	    name);
+	if (n < 0 || (size_t)n >= pathlen)
+		errx(1, "directory entry path is too long");
 }
 
 static unsigned char
@@ -114,6 +165,89 @@ open_output (const char *path, int exclusive)
 	if (fd == -1)
 		err(1, "open %s", path);
 	return (fd);
+}
+
+static void
+create_empty (const char *path)
+{
+	int fd;
+
+	fd = open_output(path, 1);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static unsigned int
+directory_entries (const char *path)
+{
+	struct dirent *entry;
+	DIR *dir;
+	unsigned int count;
+
+	dir = opendir(path);
+	if (dir == NULL)
+		err(1, "opendir %s", path);
+	count = 0;
+	while ((entry = readdir(dir)) != NULL) {
+		if (strcmp(entry->d_name, ".") == 0 ||
+		    strcmp(entry->d_name, "..") == 0)
+			continue;
+		if (count == UINT_MAX)
+			errx(1, "%s has too many entries", path);
+		count++;
+	}
+	if (closedir(dir) == -1)
+		err(1, "closedir %s", path);
+	return (count);
+}
+
+static void
+write_growth_marker (const char *path, unsigned int count,
+    off_t initial, off_t grown)
+{
+	char buf[128];
+	ssize_t written;
+	int fd, len;
+
+	len = snprintf(buf, sizeof(buf), "%u %lld %lld\n", count,
+	    (long long)initial, (long long)grown);
+	if (len < 0 || (size_t)len >= sizeof(buf))
+		errx(1, "growth marker is too long");
+	fd = open_output(path, 0);
+	written = write(fd, buf, (size_t)len);
+	if (written == -1)
+		err(1, "write %s", path);
+	if (written != len)
+		errx(1, "short write to %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+read_growth_marker (const char *path, unsigned int *countp,
+    off_t *initialp, off_t *grownp)
+{
+	long long initial, grown;
+	FILE *file;
+
+	file = fopen(path, "r");
+	if (file == NULL)
+		err(1, "fopen %s", path);
+	if (fscanf(file, "%u %lld %lld", countp, &initial,
+	    &grown) != 3)
+		errx(1, "%s has an invalid growth marker", path);
+	if (fclose(file) == EOF)
+		err(1, "fclose %s", path);
+	if (*countp == 0 || *countp > DIR_ENTRY_LIMIT ||
+	    initial <= 0 || grown < initial)
+		errx(1, "%s has invalid growth values", path);
+	*initialp = (off_t)initial;
+	*grownp = (off_t)grown;
+	if ((long long)*initialp != initial ||
+	    (long long)*grownp != grown)
+		errx(1, "%s growth values exceed off_t", path);
 }
 
 static void
@@ -294,6 +428,103 @@ classify_journal (const char *path)
 }
 
 static void
+run_dir_growth (const char *stage, const char *root, int boundary)
+{
+	struct stat st;
+	char entry[PATH_MAX], grow[PATH_MAX], marker[PATH_MAX];
+	char probe[PATH_MAX];
+	off_t grown, initial;
+	unsigned int count, i;
+
+	make_path(probe, sizeof(probe), root, PROBE_DIR);
+	make_path(grow, sizeof(grow), root, GROW_DIR);
+	make_path(marker, sizeof(marker), root, GROW_MARKER);
+	/*
+	 * Probe the filesystem itself so dot entries, record rounding,
+	 * checksum tails, and block size are included in the boundary.
+	 */
+	if (mkdir(probe, 0755) == -1)
+		err(1, "mkdir %s", probe);
+	if (stat(probe, &st) == -1)
+		err(1, "stat %s", probe);
+	initial = st.st_size;
+	grown = 0;
+	for (count = 1; count <= DIR_ENTRY_LIMIT; count++) {
+		make_entry_path(entry, sizeof(entry), root, PROBE_DIR,
+		    count - 1);
+		create_empty(entry);
+		if (stat(probe, &st) == -1)
+			err(1, "stat %s", probe);
+		if (st.st_size < initial)
+			errx(1, "%s shrank during growth probe", probe);
+		if (st.st_size > initial) {
+			grown = st.st_size;
+			break;
+		}
+	}
+	if (grown == 0)
+		errx(1, "%s did not grow", probe);
+	for (i = 0; i < count; i++) {
+		make_entry_path(entry, sizeof(entry), root, PROBE_DIR, i);
+		if (unlink(entry) == -1)
+			err(1, "unlink %s", entry);
+	}
+	if (rmdir(probe) == -1)
+		err(1, "rmdir %s", probe);
+
+	if (mkdir(grow, 0755) == -1)
+		err(1, "mkdir %s", grow);
+	for (i = 0; i + 1 < count; i++) {
+		make_entry_path(entry, sizeof(entry), root, GROW_DIR, i);
+		create_empty(entry);
+	}
+	if (stat(grow, &st) == -1)
+		err(1, "stat %s", grow);
+	if (st.st_size != initial)
+		errx(1, "%s grew before the boundary", grow);
+	write_growth_marker(marker, count, initial, grown);
+
+	if (boundary)
+		arm_boundary(stage);
+	else
+		arm_cut(stage);
+	make_entry_path(entry, sizeof(entry), root, GROW_DIR,
+	    count - 1);
+	create_empty(entry);
+	if (printf("DONE %s\n", stage) < 0 ||
+	    fflush(stdout) == EOF)
+		err(1, "publish completion marker");
+	for (;;)
+		(void)pause();
+}
+
+static void
+run_rmdir_open (const char *stage, const char *root, int boundary)
+{
+	char path[PATH_MAX];
+	int fd;
+
+	make_path(path, sizeof(path), root, REMOVE_DIR);
+	if (mkdir(path, 0755) == -1)
+		err(1, "mkdir %s", path);
+	/* Keep the removed directory active until the VM is stopped. */
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (boundary)
+		arm_boundary(stage);
+	else
+		arm_cut(stage);
+	if (rmdir(path) == -1)
+		err(1, "rmdir %s", path);
+	if (printf("DONE %s\n", stage) < 0 ||
+	    fflush(stdout) == EOF)
+		err(1, "publish completion marker");
+	for (;;)
+		(void)pause();
+}
+
+static void
 run_workload (const char *stage, const char *root, int boundary)
 {
 	char current[PATH_MAX], next[PATH_MAX];
@@ -301,6 +532,14 @@ run_workload (const char *stage, const char *root, int boundary)
 
 	make_path(current, sizeof(current), root, "current");
 	make_path(next, sizeof(next), root, "next");
+	if (strcmp(stage, "dir-grow") == 0) {
+		run_dir_growth(stage, root, boundary);
+		return;
+	}
+	if (strcmp(stage, "rmdir-open") == 0) {
+		run_rmdir_open(stage, root, boundary);
+		return;
+	}
 	if (strcmp(stage, "unlink-open") == 0) {
 		/* Keep the unlinked inode active until the VM is stopped. */
 		fd = open(current, O_RDWR | O_CLOEXEC);
@@ -354,6 +593,83 @@ run_workload (const char *stage, const char *root, int boundary)
 		err(1, "publish completion marker");
 	for (;;)
 		(void)pause();
+}
+
+static void
+verify_dir_growth (const char *root)
+{
+	struct stat dir_st, entry_st;
+	char entry[PATH_MAX], grow[PATH_MAX], marker[PATH_MAX];
+	char probe[PATH_MAX];
+	off_t grown, initial;
+	unsigned int count, entries, expected, i;
+	int present;
+
+	make_path(grow, sizeof(grow), root, GROW_DIR);
+	make_path(marker, sizeof(marker), root, GROW_MARKER);
+	make_path(probe, sizeof(probe), root, PROBE_DIR);
+	read_growth_marker(marker, &count, &initial, &grown);
+	if (stat(grow, &dir_st) == -1)
+		err(1, "stat %s", grow);
+	if (! S_ISDIR(dir_st.st_mode))
+		errx(1, "%s is not a directory", grow);
+	for (i = 0; i + 1 < count; i++) {
+		make_entry_path(entry, sizeof(entry), root, GROW_DIR, i);
+		if (lstat(entry, &entry_st) == -1)
+			err(1, "lstat %s", entry);
+		if (! S_ISREG(entry_st.st_mode) || entry_st.st_size != 0)
+			errx(1, "%s has invalid shape", entry);
+	}
+	make_entry_path(entry, sizeof(entry), root, GROW_DIR,
+	    count - 1);
+	present = 1;
+	if (lstat(entry, &entry_st) == -1) {
+		if (errno != ENOENT)
+			err(1, "lstat %s", entry);
+		present = 0;
+	} else if (! S_ISREG(entry_st.st_mode) ||
+	    entry_st.st_size != 0)
+		errx(1, "%s has invalid shape", entry);
+	expected = present ? count : count - 1;
+	entries = directory_entries(grow);
+	if (entries != expected)
+		errx(1, "%s has %u entries, expected %u", grow,
+		    entries, expected);
+	if (dir_st.st_size != (present ? grown : initial))
+		errx(1, "%s has unexpected size %lld", grow,
+		    (long long)dir_st.st_size);
+	if (lstat(probe, &entry_st) != -1)
+		errx(1, "%s unexpectedly exists", probe);
+	if (errno != ENOENT)
+		err(1, "lstat %s", probe);
+	printf("state=directory-%s\n", present ? "grown" : "old");
+	if (fflush(stdout) == EOF)
+		err(1, "publish directory-growth state");
+}
+
+static void
+verify_rmdir (const char *root)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	int present;
+
+	make_path(path, sizeof(path), root, REMOVE_DIR);
+	present = 1;
+	if (lstat(path, &st) == -1) {
+		if (errno != ENOENT)
+			err(1, "lstat %s", path);
+		present = 0;
+	} else {
+		if (! S_ISDIR(st.st_mode))
+			errx(1, "%s is not a directory", path);
+		if (directory_entries(path) != 0)
+			errx(1, "%s is not empty", path);
+	}
+	printf("state=directory-%s\n",
+	    present ? "linked" : "absent");
+	if (fflush(stdout) == EOF)
+		err(1, "publish directory-removal state");
 }
 
 static void
@@ -434,9 +750,12 @@ static void
 selftest (void)
 {
 	unsigned char journal[JBD2_SUPER_BYTES];
-	char current[PATH_MAX], next[PATH_MAX];
+	struct stat st;
+	char current[PATH_MAX], entry[PATH_MAX], grow[PATH_MAX];
 	char journal_path[PATH_MAX];
+	char marker[PATH_MAX], next[PATH_MAX], removed[PATH_MAX];
 	char root[] = "/tmp/ext4fs_crash.XXXXXXXX";
+	off_t grown, initial;
 	int fd;
 
 	if (mkdtemp(root) == NULL)
@@ -446,6 +765,37 @@ selftest (void)
 	make_old_pattern(current);
 	verify_workload(root);
 	verify_unlink(root);
+
+	make_path(grow, sizeof(grow), root, GROW_DIR);
+	make_path(marker, sizeof(marker), root, GROW_MARKER);
+	if (mkdir(grow, 0755) == -1)
+		err(1, "mkdir %s", grow);
+	if (stat(grow, &st) == -1)
+		err(1, "stat %s", grow);
+	initial = st.st_size;
+	write_growth_marker(marker, 1, initial, initial);
+	verify_dir_growth(root);
+	make_entry_path(entry, sizeof(entry), root, GROW_DIR, 0);
+	create_empty(entry);
+	if (stat(grow, &st) == -1)
+		err(1, "stat %s", grow);
+	grown = st.st_size;
+	write_growth_marker(marker, 1, initial, grown);
+	verify_dir_growth(root);
+	if (unlink(entry) == -1)
+		err(1, "unlink %s", entry);
+	if (unlink(marker) == -1)
+		err(1, "unlink %s", marker);
+	if (rmdir(grow) == -1)
+		err(1, "rmdir %s", grow);
+
+	make_path(removed, sizeof(removed), root, REMOVE_DIR);
+	if (mkdir(removed, 0755) == -1)
+		err(1, "mkdir %s", removed);
+	verify_rmdir(root);
+	if (rmdir(removed) == -1)
+		err(1, "rmdir %s", removed);
+	verify_rmdir(root);
 
 	fd = open_output(next, 1);
 	write_pattern(fd, 12345, NEW_SEED);
@@ -523,9 +873,14 @@ main (int argc, char **argv)
 		verify_workload(argv[2]);
 	else if (argc == 3 && strcmp(argv[1], "verify-unlink") == 0)
 		verify_unlink(argv[2]);
+	else if (argc == 3 && strcmp(argv[1], "verify-dir-growth") == 0)
+		verify_dir_growth(argv[2]);
+	else if (argc == 3 && strcmp(argv[1], "verify-rmdir") == 0)
+		verify_rmdir(argv[2]);
 	else
 		errx(1, "usage: ext4fs_crash pattern-old path | "
 		    "journal-state path | workload stage root | boundary "
-		    "stage root | verify root | verify-unlink root");
+		    "stage root | verify root | verify-unlink root | "
+		    "verify-dir-growth root | verify-rmdir root");
 	return (0);
 }
