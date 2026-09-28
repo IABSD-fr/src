@@ -18,6 +18,7 @@
 
 #include <sys/types.h>
 #include <sys/endian.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 
 #include <dirent.h>
@@ -47,6 +48,12 @@
 #define PROBE_DIR	"grow.probe"
 #define REMOVE_DIR	"removed"
 
+#define EXTENT_FILE	"extent-probe"
+#define EXTENT_ROOT_ENTRIES	4
+#define EXTENT_NODE_HEADER_BYTES	12
+#define EXTENT_NODE_ENTRY_BYTES	12
+#define EXTENT_SPLIT_SEED	0x68U
+
 #define JBD2_MAGIC		UINT32_C(0xc03b3998)
 #define JBD2_SUPERBLOCK_V2	4
 #define JBD2_SUPER_BYTES	256
@@ -74,6 +81,15 @@ static void	write_growth_marker (const char *, unsigned int, off_t,
     off_t);
 static void	read_growth_marker (const char *, unsigned int *, off_t *,
     off_t *);
+static size_t	filesystem_block_size (const char *);
+static size_t	extent_leaf_capacity (size_t);
+static off_t	extent_lbn_offset (size_t, size_t);
+static void	read_extent_block (int, unsigned char *, size_t, off_t);
+static void	check_extent_zero (const unsigned char *, size_t,
+    const char *);
+static int	check_extent_growth (const char *, size_t, size_t,
+    size_t);
+static void	write_extent_block (int, size_t, off_t);
 static void	write_pattern (int, off_t, unsigned int);
 static void	check_pattern (const char *, off_t, unsigned int);
 static void	arm_cut (const char *);
@@ -84,9 +100,12 @@ static void	store_be32 (unsigned char *, size_t, uint32_t);
 static void	classify_journal (const char *);
 static void	run_dir_growth (const char *, const char *, int);
 static void	run_rmdir_open (const char *, const char *, int);
+static void	run_extent_growth (const char *, const char *, int);
 static void	run_workload (const char *, const char *, int);
 static void	verify_dir_growth (const char *);
 static void	verify_rmdir (const char *);
+static void	verify_extent_promote (const char *);
+static void	verify_extent_split (const char *);
 static void	verify_workload (const char *);
 static void	verify_unlink (const char *);
 static void	selftest (void);
@@ -248,6 +267,146 @@ read_growth_marker (const char *path, unsigned int *countp,
 	if ((long long)*initialp != initial ||
 	    (long long)*grownp != grown)
 		errx(1, "%s growth values exceed off_t", path);
+}
+
+static size_t
+filesystem_block_size (const char *root)
+{
+	struct statfs sfs;
+
+	if (statfs(root, &sfs) == -1)
+		err(1, "statfs %s", root);
+	if (sfs.f_bsize != 1024 && sfs.f_bsize != 2048 &&
+	    sfs.f_bsize != 4096)
+		errx(1, "%s has unsupported block size %u", root,
+		    (unsigned int)sfs.f_bsize);
+	return ((size_t)sfs.f_bsize);
+}
+
+static size_t
+extent_leaf_capacity (size_t block_size)
+{
+	return ((block_size - EXTENT_NODE_HEADER_BYTES) /
+	    EXTENT_NODE_ENTRY_BYTES);
+}
+
+static off_t
+extent_lbn_offset (size_t block_size, size_t lbn)
+{
+	return ((off_t)block_size * (off_t)lbn);
+}
+
+static void
+read_extent_block (int fd, unsigned char *buf, size_t block_size,
+    off_t offset)
+{
+	ssize_t n;
+
+	n = pread(fd, buf, block_size, offset);
+	if (n == -1)
+		err(1, "pread extent block at %lld", (long long)offset);
+	if ((size_t)n != block_size)
+		errx(1, "short extent read at %lld", (long long)offset);
+}
+
+static void
+check_extent_zero (const unsigned char *buf, size_t block_size,
+    const char *description)
+{
+	size_t i;
+
+	for (i = 0; i < block_size; i++) {
+		if (buf[i] != 0)
+			errx(1, "%s is not zero at byte %zu", description,
+			    i);
+	}
+}
+
+static int
+check_extent_growth (const char *root, size_t entries,
+    size_t old_metadata, size_t new_metadata)
+{
+	unsigned char buf[IO_BYTES];
+	struct stat st;
+	char path[PATH_MAX];
+	blkcnt_t expected_sectors;
+	off_t new_size, old_size, offset;
+	size_t block_size, expected_blocks, i, target_lbn;
+	int fd, state;
+
+	block_size = filesystem_block_size(root);
+	if (block_size > sizeof(buf))
+		errx(1, "extent block exceeds input buffer");
+	target_lbn = 2 * entries;
+	old_size = extent_lbn_offset(block_size, target_lbn - 1);
+	new_size = extent_lbn_offset(block_size, target_lbn + 1);
+	make_path(path, sizeof(path), root, EXTENT_FILE);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (! S_ISREG(st.st_mode) || st.st_nlink != 1)
+		errx(1, "%s has invalid inode shape", path);
+	if (st.st_size == old_size) {
+		state = 0;
+		expected_blocks = entries + old_metadata;
+	} else if (st.st_size == new_size) {
+		state = 1;
+		expected_blocks = entries + 1 + new_metadata;
+	} else
+		errx(1, "%s has unexpected size %lld", path,
+		    (long long)st.st_size);
+	expected_sectors = (blkcnt_t)expected_blocks *
+	    (blkcnt_t)(block_size / 512);
+	if (st.st_blocks != expected_sectors)
+		errx(1, "%s has unexpected block count %lld", path,
+		    (long long)st.st_blocks);
+	for (i = 0; i < entries; i++) {
+		offset = extent_lbn_offset(block_size, 2 * i);
+		read_extent_block(fd, buf, block_size, offset);
+		if (buf[0] != 'x')
+			errx(1, "%s source extent %zu is corrupt", path,
+			    i);
+		buf[0] = 0;
+		check_extent_zero(buf, block_size, "source extent");
+		if (i + 1 < entries) {
+			offset += (off_t)block_size;
+			read_extent_block(fd, buf, block_size, offset);
+			check_extent_zero(buf, block_size, "sparse hole");
+		}
+	}
+	if (state != 0) {
+		offset = extent_lbn_offset(block_size, target_lbn - 1);
+		read_extent_block(fd, buf, block_size, offset);
+		check_extent_zero(buf, block_size, "growth hole");
+		offset = extent_lbn_offset(block_size, target_lbn);
+		read_extent_block(fd, buf, block_size, offset);
+		for (i = 0; i < block_size; i++) {
+			if (buf[i] != pattern_byte(offset + (off_t)i,
+			    EXTENT_SPLIT_SEED))
+				errx(1, "%s growth data is corrupt", path);
+		}
+	}
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	return (state);
+}
+
+static void
+write_extent_block (int fd, size_t block_size, off_t offset)
+{
+	unsigned char buf[IO_BYTES];
+	ssize_t n;
+
+	if (block_size > sizeof(buf))
+		errx(1, "extent block exceeds output buffer");
+	fill_pattern(buf, block_size, offset, EXTENT_SPLIT_SEED);
+	n = pwrite(fd, buf, block_size, offset);
+	if (n == -1)
+		err(1, "pwrite extent block at %lld", (long long)offset);
+	if ((size_t)n != block_size)
+		errx(1, "short extent write at %lld", (long long)offset);
 }
 
 static void
@@ -525,6 +684,47 @@ run_rmdir_open (const char *stage, const char *root, int boundary)
 }
 
 static void
+run_extent_growth (const char *stage, const char *root, int boundary)
+{
+	char path[PATH_MAX];
+	off_t offset;
+	size_t block_size, entries, new_metadata, old_metadata;
+	int fd;
+
+	block_size = filesystem_block_size(root);
+	if (strcmp(stage, "extent-promote") == 0) {
+		entries = EXTENT_ROOT_ENTRIES;
+		old_metadata = 0;
+		new_metadata = 1;
+	} else if (strcmp(stage, "extent-split") == 0) {
+		entries = extent_leaf_capacity(block_size);
+		old_metadata = 1;
+		new_metadata = 2;
+	} else
+		errx(1, "unknown extent stage: %s", stage);
+	if (check_extent_growth(root, entries, old_metadata,
+	    new_metadata) != 0)
+		errx(1, "%s fixture has already grown", stage);
+	make_path(path, sizeof(path), root, EXTENT_FILE);
+	fd = open(path, O_RDWR | O_CLOEXEC);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (boundary)
+		arm_boundary(stage);
+	else
+		arm_cut(stage);
+	offset = extent_lbn_offset(block_size, 2 * entries);
+	write_extent_block(fd, block_size, offset);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (printf("DONE %s\n", stage) < 0 ||
+	    fflush(stdout) == EOF)
+		err(1, "publish completion marker");
+	for (;;)
+		(void)pause();
+}
+
+static void
 run_workload (const char *stage, const char *root, int boundary)
 {
 	char current[PATH_MAX], next[PATH_MAX];
@@ -532,6 +732,11 @@ run_workload (const char *stage, const char *root, int boundary)
 
 	make_path(current, sizeof(current), root, "current");
 	make_path(next, sizeof(next), root, "next");
+	if (strcmp(stage, "extent-promote") == 0 ||
+	    strcmp(stage, "extent-split") == 0) {
+		run_extent_growth(stage, root, boundary);
+		return;
+	}
 	if (strcmp(stage, "dir-grow") == 0) {
 		run_dir_growth(stage, root, boundary);
 		return;
@@ -670,6 +875,31 @@ verify_rmdir (const char *root)
 	    present ? "linked" : "absent");
 	if (fflush(stdout) == EOF)
 		err(1, "publish directory-removal state");
+}
+
+static void
+verify_extent_promote (const char *root)
+{
+	int state;
+
+	state = check_extent_growth(root, EXTENT_ROOT_ENTRIES, 0, 1);
+	printf("state=extent-%s\n", state ? "promoted" : "inline");
+	if (fflush(stdout) == EOF)
+		err(1, "publish extent-promotion state");
+}
+
+static void
+verify_extent_split (const char *root)
+{
+	size_t entries;
+	int state;
+
+	entries = extent_leaf_capacity(filesystem_block_size(root));
+	state = check_extent_growth(root, entries, 1, 2);
+	printf("state=extent-%s\n",
+	    state ? "two-leaves" : "one-leaf");
+	if (fflush(stdout) == EOF)
+		err(1, "publish extent-split state");
 }
 
 static void
@@ -877,10 +1107,18 @@ main (int argc, char **argv)
 		verify_dir_growth(argv[2]);
 	else if (argc == 3 && strcmp(argv[1], "verify-rmdir") == 0)
 		verify_rmdir(argv[2]);
+	else if (argc == 3 &&
+	    strcmp(argv[1], "verify-extent-promote") == 0)
+		verify_extent_promote(argv[2]);
+	else if (argc == 3 &&
+	    strcmp(argv[1], "verify-extent-split") == 0)
+		verify_extent_split(argv[2]);
 	else
 		errx(1, "usage: ext4fs_crash pattern-old path | "
 		    "journal-state path | workload stage root | boundary "
 		    "stage root | verify root | verify-unlink root | "
-		    "verify-dir-growth root | verify-rmdir root");
+		    "verify-dir-growth root | verify-rmdir root | "
+		    "verify-extent-promote root | "
+		    "verify-extent-split root");
 	return (0);
 }

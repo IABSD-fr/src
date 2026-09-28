@@ -1063,8 +1063,20 @@ durability boundaries for both workloads.  On 2026-09-28, all twelve
 cases passed against the installed production kernel, including
 recovery idempotence and offline `e2fsck -fn` acceptance.
 
-The remaining extent, truncate/revoke, exhaustion, wraparound, error
-injection, and Linux verification matrices remain Phase 6 work.
+The deterministic extent matrix is now integrated.  Its first fixture
+holds four sparse extents in the inode root and crashes the write which
+promotes them into a depth-1 tree.  Its second fixture fills one
+external leaf and crashes the write which splits it into two leaves.
+Every recovered state must have the exact old-or-new size, allocated
+block count, sparse holes, source data, appended data, and external-leaf
+count.  Recovery idempotence and offline `e2fsck -fn` remain mandatory.
+The non-root helper self-test, fixture-shape checks, build, and shell
+validation pass.  The explicit
+`run-regress-ext4fs-crash-extent-vmm` target still awaits the
+production-kernel root VMM run.
+
+The remaining truncate/revoke, exhaustion, wraparound, error injection,
+and Linux verification matrices remain Phase 6 work.
 
 Use filesystem images created by Linux tools and run IABSD in a VM.
 Inject an abrupt power loss after each commit phase and at journal

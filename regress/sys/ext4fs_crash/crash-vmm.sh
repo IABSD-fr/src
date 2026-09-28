@@ -102,7 +102,7 @@ for stage in $EXT4FS_CRASH_STAGES; do
 	esac
 done
 case "$EXT4FS_CRASH_MODE" in
-timed|flush|orphan|directory) ;;
+timed|flush|orphan|directory|extent) ;;
 *)	fail "unsupported crash mode: $EXT4FS_CRASH_MODE" ;;
 esac
 if [ "$EXT4FS_CRASH_MODE" != timed ]; then
@@ -482,6 +482,42 @@ recover_case()
 	    fail "recovered image is not clean"
 }
 
+extent_leaf_count()
+{
+	image=$1
+	output=$2
+	if ! "$DEBUGFS" -R 'stat /crash/extent-probe' "$image" \
+	    >"$output" 2>&1; then
+		cat "$output" >&2
+		fail "could not inspect recovered extent tree"
+	fi
+	awk '
+	    {
+		line = $0
+		while (match(line, /\(ETB0\):/)) {
+			count++
+			line = substr(line, RSTART + RLENGTH)
+		}
+	    }
+	    END { print count + 0 }
+	' "$output"
+}
+
+check_extent_leaf_count()
+{
+	image=$1
+	expected=$2
+	output=$3
+	actual=$(extent_leaf_count "$image" "$output")
+	case "$actual" in
+	''|*[!0-9]*)
+		fail "could not count recovered extent leaves"
+		;;
+	esac
+	[ "$actual" -eq "$expected" ] ||
+	    fail "expected $expected extent leaves, got $actual"
+}
+
 run_flush_matrix()
 {
 	base=$1
@@ -491,6 +527,8 @@ run_flush_matrix()
 	verifier=$5
 	before_state=$6
 	after_state=$7
+	before_leaves=${8:-}
+	after_leaves=${9:-}
 
 	for flush_count in $EXT4FS_CRASH_FLUSH_COUNTS; do
 		test_name="$label flush $flush_count, "
@@ -510,18 +548,22 @@ run_flush_matrix()
 		1|2)
 			expected_journal=clean
 			expected_state=$before_state
+			expected_leaves=$before_leaves
 			;;
 		3)
 			expected_journal=recover
 			expected_state=$before_state
+			expected_leaves=$before_leaves
 			;;
 		4|5)
 			expected_journal=recover
 			expected_state=$after_state
+			expected_leaves=$after_leaves
 			;;
 		6)
 			expected_journal=clean
 			expected_state=$after_state
+			expected_leaves=$after_leaves
 			;;
 		esac
 		[ "$durable_journal_state" = "$expected_journal" ] ||
@@ -532,8 +574,50 @@ $durable_journal_state != $expected_journal"
 			cat "$case_dir/recovery.log" >&2
 			fail "$label flush $flush_count recovered wrong state"
 		}
+		if [ -n "$expected_leaves" ]; then
+			check_extent_leaf_count "$image" \
+			    "$expected_leaves" \
+			    "$case_dir/recovered-extents.log"
+		fi
 		echo ' ok'
 	done
+}
+
+prepare_extent_base()
+{
+	image=$1
+	block_size=$2
+	fixture_entries=$3
+	expected_leaves=$4
+	fixture_name=$5
+	source_root=$work/source-$fixture_name-$block_size
+	source_file=$source_root/crash/extent-probe
+	fixture_size=$(((2 * fixture_entries - 1) * block_size))
+
+	mkdir -p "$source_root/crash"
+	dd if=/dev/zero of="$source_file" bs=1 count=0 \
+	    seek="$fixture_size" status=none
+	fixture_entry=0
+	while [ "$fixture_entry" -lt "$fixture_entries" ]; do
+		fixture_offset=$((2 * fixture_entry * block_size))
+		printf x | dd of="$source_file" bs=1 \
+		    seek="$fixture_offset" conv=notrunc status=none
+		fixture_entry=$((fixture_entry + 1))
+	done
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_CRASH_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O 'metadata_csum,^orphan_file' -d "$source_root" \
+	    "$image" >"$work/mke2fs-$fixture_name-$block_size.log" \
+	    2>&1; then
+		cat "$work/mke2fs-$fixture_name-$block_size.log" >&2
+		fail "could not create $fixture_name extent fixture"
+	fi
+	"$E2FSCK" -fn "$image" \
+	    >"$work/e2fsck-$fixture_name-$block_size.log" 2>&1 ||
+	    fail "e2fsck rejected $fixture_name extent fixture"
+	check_extent_leaf_count "$image" "$expected_leaves" \
+	    "$work/extents-$fixture_name-$block_size.log"
 }
 
 "$SYSCTL" -n kern.version >"$work/host-version.log"
@@ -541,6 +625,26 @@ old_data=$work/old.data
 "$EXT4FS_CRASH" pattern-old "$old_data"
 
 for block_size in $EXT4FS_CRASH_BLOCK_SIZES; do
+	if [ "$EXT4FS_CRASH_MODE" = extent ]; then
+		extent_capacity=$(((block_size - 12) / 12))
+		promote_base=$work/base-extent-promote-$block_size.img
+		prepare_extent_base "$promote_base" "$block_size" 4 0 \
+		    promote
+		run_flush_matrix "$promote_base" "$block_size" \
+		    extent-promote 'extent root promotion' \
+		    verify-extent-promote 'state=extent-inline' \
+		    'state=extent-promoted' 0 1
+
+		split_base=$work/base-extent-split-$block_size.img
+		prepare_extent_base "$split_base" "$block_size" \
+		    "$extent_capacity" 1 split
+		run_flush_matrix "$split_base" "$block_size" \
+		    extent-split 'extent leaf split' \
+		    verify-extent-split 'state=extent-one-leaf' \
+		    'state=extent-two-leaves' 1 2
+		continue
+	fi
+
 	base=$work/base-$block_size.img
 	dd if=/dev/zero of="$base" bs=1m count=0 \
 	    seek="$EXT4FS_CRASH_IMAGE_MB" status=none
