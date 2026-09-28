@@ -67,6 +67,12 @@ ulimit -c 0
 KERNEL_VND=
 KERNEL_MOUNTPOINT=
 KERNEL_MOUNTED=0
+RO_OUTER_VND=
+RO_INNER_VND=
+RO_OUTER_MOUNTPOINT=
+RO_INNER_MOUNTPOINT=
+RO_OUTER_MOUNTED=0
+RO_INNER_MOUNTED=0
 
 work=$(mktemp -d /tmp/fsck_ext4fs_journal.XXXXXXXX)
 case "$work" in
@@ -80,6 +86,26 @@ cleanup()
 {
 	rc=$?
 	trap - EXIT HUP INT TERM
+	if [ "$RO_INNER_MOUNTED" -eq 1 ]; then
+		run_privileged "$UMOUNT" "$RO_INNER_MOUNTPOINT" \
+		    >/dev/null 2>&1 || :
+		RO_INNER_MOUNTED=0
+	fi
+	if [ -n "$RO_INNER_VND" ]; then
+		run_privileged "$VNCONFIG" -u "$RO_INNER_VND" \
+		    >/dev/null 2>&1 || :
+		RO_INNER_VND=
+	fi
+	if [ "$RO_OUTER_MOUNTED" -eq 1 ]; then
+		run_privileged "$UMOUNT" "$RO_OUTER_MOUNTPOINT" \
+		    >/dev/null 2>&1 || :
+		RO_OUTER_MOUNTED=0
+	fi
+	if [ -n "$RO_OUTER_VND" ]; then
+		run_privileged "$VNCONFIG" -u "$RO_OUTER_VND" \
+		    >/dev/null 2>&1 || :
+		RO_OUTER_VND=
+	fi
 	if [ "$KERNEL_MOUNTED" -eq 1 ]; then
 		run_privileged "$UMOUNT" "$KERNEL_MOUNTPOINT" >/dev/null 2>&1 || :
 		KERNEL_MOUNTED=0
@@ -1342,18 +1368,24 @@ test_randomized_mutations()
 	done
 }
 
-kernel_vnd_attach()
+vnd_attach()
 {
-	kva_image=$1
-	if ! kva_output=$(run_privileged "$VNCONFIG" "$kva_image"); then
+	va_image=$1
+	if ! va_output=$(run_privileged "$VNCONFIG" "$va_image"); then
 		fail "could not attach vnode disk"
 	fi
-	set -- $kva_output
-	KERNEL_VND=${1:-}
-	case "$KERNEL_VND" in
+	set -- $va_output
+	VND_ATTACHED=${1:-}
+	case "$VND_ATTACHED" in
 	vnd[0-9]*) ;;
-	*)	fail "vnconfig returned an invalid device: $kva_output" ;;
+	*)	fail "vnconfig returned an invalid device: $va_output" ;;
 	esac
+}
+
+kernel_vnd_attach()
+{
+	vnd_attach "$1"
+	KERNEL_VND=$VND_ATTACHED
 }
 
 kernel_vnd_detach()
@@ -1402,6 +1434,120 @@ kernel_replay()
 	read_le32_image "$kr_image" "$kr_feature_offset"
 	[ $((IMAGE_WORD & 4)) -eq 0 ] ||
 	    fail "kernel replay did not clear RECOVER"
+}
+
+expect_write_protected_recovery_failure()
+{
+	wpr_image=$1
+	wpr_label=$2
+	wpr_feature_offset=$((1024 + 96))
+	before=$(sha256 -q "$wpr_image")
+	read_le32_image "$wpr_image" "$wpr_feature_offset"
+	[ $((IMAGE_WORD & 4)) -ne 0 ] ||
+	    fail "$wpr_label fixture does not have RECOVER set"
+
+	vnd_attach "$wpr_image"
+	RO_INNER_VND=$VND_ATTACHED
+	wpr_device=/dev/${RO_INNER_VND}c
+	if run_privileged "$TIMEOUT" -k 2 "$FSCK_TIMEOUT" \
+	    "$MOUNT_EXT4FS" -o ro "$wpr_device" \
+	    "$RO_INNER_MOUNTPOINT" \
+	    >"$case_dir/mount-$wpr_label.log" 2>&1; then
+		RO_INNER_MOUNTED=1
+		fail "$wpr_label recovery mounted a read-only device"
+	else
+		wpr_status=$?
+	fi
+	case "$wpr_status" in
+	124|137) fail "$wpr_label recovery mount timed out" ;;
+	esac
+	run_privileged "$VNCONFIG" -u "$RO_INNER_VND" ||
+	    fail "could not detach read-only recovery device"
+	RO_INNER_VND=
+
+	after=$(sha256 -q "$wpr_image")
+	[ "$before" = "$after" ] ||
+	    fail "$wpr_label recovery changed a read-only device"
+	read_le32_image "$wpr_image" "$wpr_feature_offset"
+	[ $((IMAGE_WORD & 4)) -ne 0 ] ||
+	    fail "$wpr_label recovery cleared RECOVER"
+}
+
+test_read_only_device_recovery()
+{
+	case_dir=$work/read-only-device-recovery
+	mkdir "$case_dir"
+	pending_image=$case_dir/pending.img
+	empty_image=$case_dir/empty.img
+	outer_image=$case_dir/outer.img
+	create_image "$pending_image" 4096
+	find_free_blocks "$pending_image" 1
+	make_payload "$case_dir/payload" 4096 1 W
+	{
+		printf 'journal_open\n'
+		printf 'journal_write -b %s %s\n' "$FREE_FIRST" \
+		    "$case_dir/payload"
+		printf 'journal_close\n'
+	} >"$case_dir/pending.cmd"
+	run_debugfs "$pending_image" "$case_dir/pending.cmd"
+
+	# Model recovery after the journal was emptied but before RECOVER
+	# was cleared.  This state still requires device write access.
+	cp "$pending_image" "$empty_image"
+	dd if="$case_dir/payload" of="$empty_image" bs=4096 \
+	    seek="$FREE_FIRST" count=1 conv=notrunc status=none
+	mark_journal_clean "$empty_image"
+
+	dd if=/dev/zero of="$outer_image" bs=1m count=0 seek=192 \
+	    status=none
+	if ! "$MKE2FS" -q -F -t ext4 -b 4096 -O '^orphan_file' \
+	    "$outer_image" >"$case_dir/mke2fs-outer.log" 2>&1; then
+		cat "$case_dir/mke2fs-outer.log" >&2
+		fail "could not create outer filesystem"
+	fi
+	{
+		printf 'write %s /pending.img\n' "$pending_image"
+		printf 'write %s /empty.img\n' "$empty_image"
+	} >"$case_dir/outer.cmd"
+	run_debugfs "$outer_image" "$case_dir/outer.cmd"
+	verify_e2fsck "$outer_image"
+	outer_before=$(sha256 -q "$outer_image")
+
+	RO_OUTER_MOUNTPOINT=$case_dir/outer-mnt
+	RO_INNER_MOUNTPOINT=$case_dir/inner-mnt
+	mkdir "$RO_OUTER_MOUNTPOINT" "$RO_INNER_MOUNTPOINT"
+	vnd_attach "$outer_image"
+	RO_OUTER_VND=$VND_ATTACHED
+	outer_device=/dev/${RO_OUTER_VND}c
+	if ! run_privileged "$TIMEOUT" -k 2 "$FSCK_TIMEOUT" \
+	    "$MOUNT_EXT4FS" -o ro "$outer_device" \
+	    "$RO_OUTER_MOUNTPOINT" \
+	    >"$case_dir/mount-outer.log" 2>&1; then
+		cat "$case_dir/mount-outer.log" >&2
+		fail "could not mount outer filesystem read-only"
+	fi
+	RO_OUTER_MOUNTED=1
+	[ "$(sha256 -q "$pending_image")" = \
+	    "$(sha256 -q "$RO_OUTER_MOUNTPOINT/pending.img")" ] ||
+	    fail "outer filesystem changed the pending fixture"
+	[ "$(sha256 -q "$empty_image")" = \
+	    "$(sha256 -q "$RO_OUTER_MOUNTPOINT/empty.img")" ] ||
+	    fail "outer filesystem changed the empty fixture"
+
+	expect_write_protected_recovery_failure \
+	    "$RO_OUTER_MOUNTPOINT/pending.img" pending
+	expect_write_protected_recovery_failure \
+	    "$RO_OUTER_MOUNTPOINT/empty.img" empty
+
+	run_privileged "$UMOUNT" "$RO_OUTER_MOUNTPOINT" ||
+	    fail "could not unmount outer filesystem"
+	RO_OUTER_MOUNTED=0
+	run_privileged "$VNCONFIG" -u "$RO_OUTER_VND" ||
+	    fail "could not detach outer filesystem"
+	RO_OUTER_VND=
+	outer_after=$(sha256 -q "$outer_image")
+	[ "$outer_before" = "$outer_after" ] ||
+	    fail "read-only recovery test changed the outer image"
 }
 
 kernel_expect_mount_failure_unchanged()
@@ -1843,6 +1989,8 @@ else
 	run_test 'kernel: log wraparound' test_log_wraparound
 	run_test 'kernel: sequence wraparound' test_sequence_wraparound
 	run_test 'kernel: read-only mount recovery' test_read_only
+	run_test 'kernel: read-only device blocks recovery' \
+	    test_read_only_device_recovery
 	run_test 'kernel: clean journal with RECOVER' \
 	    test_clean_journal_recovery
 	run_test 'kernel: bad data checksum is non-mutating' \
