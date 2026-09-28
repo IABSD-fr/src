@@ -8,6 +8,7 @@ set -eu
 
 MKE2FS=${MKE2FS:-mke2fs}
 DEBUGFS=${DEBUGFS:-debugfs}
+DUMPE2FS=${DUMPE2FS:-dumpe2fs}
 E2FSCK=${E2FSCK:-e2fsck}
 VNCONFIG=${VNCONFIG:-vnconfig}
 MOUNT_EXT4FS=${MOUNT_EXT4FS:-mount_ext4fs}
@@ -26,10 +27,11 @@ fixtures|kernel) ;;
 	;;
 esac
 
-tools="$MKE2FS $DEBUGFS $E2FSCK $TIMEOUT $EXT4FS_CORRUPT awk cat \
-cmp cp dd id sha256 wc"
+tools="$MKE2FS $DEBUGFS $DUMPE2FS $E2FSCK $TIMEOUT \
+    $EXT4FS_CORRUPT awk cat cmp cp dd id sha256 wc"
 if [ "$EXT4FS_CORRUPT_MODE" = kernel ]; then
-	tools="$tools $VNCONFIG $MOUNT_EXT4FS $MOUNT $UMOUNT $TIMEOUT grep"
+	tools="$tools $VNCONFIG $MOUNT_EXT4FS $MOUNT $UMOUNT \
+    $TIMEOUT grep"
 fi
 for tool in $tools; do
 	if ! command -v "$tool" >/dev/null 2>&1; then
@@ -39,7 +41,8 @@ for tool in $tools; do
 done
 
 if [ "$EXT4FS_CORRUPT_MODE" = kernel ] && [ "$(id -u)" -ne 0 ]; then
-	echo "SKIPPED: ext4fs corruption kernel regress must run as root"
+	echo "SKIPPED: ext4fs corruption kernel regress must run" \
+	    "as root"
 	exit 0
 fi
 
@@ -165,7 +168,8 @@ create_base()
 		printf 'set_inode_field /extent-depth1 size %s\n' \
 		    "$((11 * block_size))"
 	} >"$commands"
-	if ! "$DEBUGFS" -w -f "$commands" "$base" >"$debuglog" 2>&1; then
+	if ! "$DEBUGFS" -w -f "$commands" "$base" \
+	    >"$debuglog" 2>&1; then
 		cat "$debuglog" >&2
 		fail "debugfs could not create extent controls"
 	fi
@@ -174,7 +178,9 @@ create_base()
 	depth1_inode=$("$DEBUGFS" -R 'stat /extent-depth1' "$base" \
 	    2>/dev/null | awk '/^Inode:/ { print $2; exit }')
 	case "$inline_inode:$depth1_inode" in
-	*[!0-9:]*)	fail "debugfs returned an invalid extent inode" ;;
+	*[!0-9:]*)
+		fail "debugfs returned an invalid extent inode"
+		;;
 	:*|*:)		fail "debugfs did not return extent inodes" ;;
 	esac
 	printf '%s\n' "$inline_inode" >"$base.inline-inode"
@@ -287,7 +293,8 @@ mount_control()
 	mounted=1
 	for target in extent-inline extent-depth1; do
 		if ! "$TIMEOUT" -k 2 "$EXT4FS_CORRUPT_TIMEOUT" dd \
-		    if="$mountpoint/$target" of="$case_dir/$target.data" \
+		    if="$mountpoint/$target" \
+		    of="$case_dir/$target.data" \
 		    bs=1 count="$payload_size" status=none \
 		    >"$case_dir/$target.log" 2>&1; then
 			cat "$case_dir/$target.log" >&2
@@ -337,10 +344,13 @@ reject_extent_fixture()
 	    fail "failed read-only extent access modified the image"
 	case "$status" in
 	124|137|143)	fail "extent access exceeded timeout" ;;
-	0)		fail "kernel accepted malformed extent metadata" ;;
+	0)
+		fail "kernel accepted malformed extent metadata"
+		;;
 	esac
 	if [ "$status" -ge 128 ]; then
-		fail "extent access terminated abnormally (status $status)"
+		fail "extent access terminated abnormally " \
+		    "(status $status)"
 	fi
 	echo " ok"
 }
@@ -398,7 +408,8 @@ test_journal_abort_policy()
 	block_size=$3
 	test_name="journal abort $policy, $block_size-byte blocks"
 	printf '%-64s' "kernel: $test_name"
-	make_fixture runtime-block-bitmap-checksum "$block_size" "$profile"
+	make_fixture runtime-block-bitmap-checksum \
+	    "$block_size" "$profile"
 	attach_image
 	if ! "$TIMEOUT" -k 2 "$EXT4FS_CORRUPT_TIMEOUT" \
 	    "$MOUNT_EXT4FS" "/dev/${vnd}c" "$mountpoint" \
@@ -424,8 +435,12 @@ test_journal_abort_policy()
 		status=$?
 	fi
 	case "$status" in
-	124|137|143)	fail "abort-triggering mkdir exceeded timeout" ;;
-	0)		fail "corrupt block bitmap did not abort journal" ;;
+	124|137|143)
+		fail "abort-triggering mkdir exceeded timeout"
+		;;
+	0)
+		fail "corrupt block bitmap did not abort journal"
+		;;
 	esac
 	if [ "$status" -ge 128 ]; then
 		fail "abort-triggering mkdir terminated abnormally"
@@ -444,13 +459,13 @@ test_journal_abort_policy()
 	mounted=0
 	"$VNCONFIG" -u "$vnd" || fail "could not detach $vnd"
 	vnd=
-	if ! "$DEBUGFS" -R stats "$image" \
-	    >"$case_dir/debugfs-stats.log" 2>&1; then
-		cat "$case_dir/debugfs-stats.log" >&2
-		fail "debugfs rejected the aborted filesystem"
+	if ! "$DUMPE2FS" -h "$image" \
+	    >"$case_dir/dumpe2fs-stats.log" 2>&1; then
+		cat "$case_dir/dumpe2fs-stats.log" >&2
+		fail "dumpe2fs rejected the aborted filesystem"
 	fi
 	grep -q '^Filesystem features:.*needs_recovery' \
-	    "$case_dir/debugfs-stats.log" ||
+	    "$case_dir/dumpe2fs-stats.log" ||
 	    fail "aborted unmount cleared RECOVER"
 	echo " ok"
 }
@@ -501,11 +516,12 @@ for block_size in 1024 2048 4096; do
 		fi
 	done
 	if [ "$EXT4FS_CORRUPT_MODE" = fixtures ]; then
-		test_name="runtime abort fixtures, $block_size-byte blocks"
-		make_fixture runtime-block-bitmap-checksum "$block_size" \
-		    abort-continue
-		make_fixture runtime-block-bitmap-checksum "$block_size" \
-		    abort-readonly
+		test_name="runtime abort fixtures,"
+		test_name="$test_name $block_size-byte blocks"
+		make_fixture runtime-block-bitmap-checksum \
+		    "$block_size" abort-continue
+		make_fixture runtime-block-bitmap-checksum \
+		    "$block_size" abort-readonly
 	else
 		test_journal_abort_policy abort-continue continue \
 		    "$block_size"

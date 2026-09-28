@@ -856,7 +856,7 @@ Wrap each compound namespace operation in one transaction:
       can be safely opened for writing; otherwise fail without modifying
       it.
 - [x] Define remount read-only/read-write behavior.
-- [ ] Implement consistent journal abort and ext4 error-policy handling.
+- [x] Implement consistent journal abort and ext4 error-policy handling.
 - [x] Expose useful journal state and failure diagnostics without
       excessive normal-operation logging.
 
@@ -967,7 +967,15 @@ every exact diagnostic stage name.  The kernel corruption suite covers
 both non-panic policies at every filesystem block size.  On 2026-09-28,
 the final production kernel built and booted after the commit-stage
 locking refinement, and the complete ext4fs regression suite passed.
-Only the isolated panic-policy test remains for abort-policy completion.
+
+A subsequent corruption run exposed an allocation-goal ambiguity on
+2 KiB and 4 KiB filesystems.  Callers use block zero to mean no
+preference, but those filesystems also include block zero in their
+numeric block range.  The direct and journaled allocators now share a
+validator which rejects zero as a goal, so new inode data starts in the
+inode's group and its bitmap is authenticated.  After rebuilding and
+booting the production kernel, the complete corruption suite passed all
+non-panic abort-policy cases with 1 KiB, 2 KiB, and 4 KiB blocks.
 
 `errors=panic` must be tested only in a disposable vmd guest.  The guest
 will boot the host's installed production `/bsd`, attach a copied IABSD
@@ -976,6 +984,14 @@ abort over SSH.  A root-only VMM regression must capture the serial
 console, require the exact ext4fs panic diagnostic, stop the guest, and
 verify that the fixture retained `RECOVER`.  It must have a watchdog and
 must never run as part of an ordinary non-root regression invocation.
+The manual disposable-guest panic gate passed on 2026-09-28, including
+the exact diagnostic and retained recovery state.  An explicit
+root-only VMM regression target is integrated, excluded from ordinary
+regression runs, and protected by boot, panic, and shutdown watchdogs.
+On 2026-09-28, it passed against the production kernel using the clean
+SSH-enabled base image.  It captured the exact panic diagnostic and
+verified that the stopped guest's ext4 fixture retained `RECOVER`,
+completing Phase 5.
 
 ## Phase 6: Crash-consistency test matrix
 

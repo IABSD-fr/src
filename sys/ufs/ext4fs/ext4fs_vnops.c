@@ -719,6 +719,18 @@ ext4fs_block_bitmap_csum_verify (struct m_ext4fs *fs, u_int32_t group,
 }
 
 /*
+ * Block zero is the callers' no-preference sentinel.  It is also in
+ * the filesystem block range when blocks exceed 1 KiB, but it holds
+ * filesystem metadata and is never a valid allocation goal.
+ */
+static int
+ext4fs_block_goal_valid (struct m_ext4fs *fs, u_int64_t goal)
+{
+	return (goal != 0 && goal >= fs->m_first_data_block &&
+	    goal < fs->m_blocks_count);
+}
+
+/*
  * Allocate a filesystem block on journal-less ext4.  Journal-bearing
  * mounts are dispatched to ext4fs_blkalloc_handle() below.
  */
@@ -750,7 +762,7 @@ ext4fs_blkalloc_direct (struct inode *ip, u_int64_t goal,
 	ngroups = fs->m_block_group_count;
 
 	/* Pick starting group from goal */
-	if (goal >= fs->m_first_data_block && goal < fs->m_blocks_count)
+	if (ext4fs_block_goal_valid(fs, goal))
 		group = (goal - fs->m_first_data_block) /
 		    fs->m_blocks_per_group;
 	else
@@ -802,8 +814,7 @@ ext4fs_blkalloc_direct (struct inode *ip, u_int64_t goal,
 
 		/* Start scan from goal bit if goal is in this group */
 		start_bit = 0;
-		if (goal >= fs->m_first_data_block &&
-		    goal < fs->m_blocks_count) {
+		if (ext4fs_block_goal_valid(fs, goal)) {
 			u_int32_t goal_group;
 
 			goal_group = (goal - fs->m_first_data_block) /
@@ -914,7 +925,7 @@ ext4fs_blkalloc_handle (struct inode *ip,
 		return (EFBIG);
 
 	ngroups = (u_int32_t)fs->m_block_group_count;
-	if (goal >= fs->m_first_data_block && goal < fs->m_blocks_count)
+	if (ext4fs_block_goal_valid(fs, goal))
 		group = (u_int32_t)((goal - fs->m_first_data_block) /
 		    fs->m_blocks_per_group);
 	else
@@ -976,8 +987,7 @@ ext4fs_blkalloc_handle (struct inode *ip,
 		}
 
 		start = 0;
-		if (goal >= fs->m_first_data_block &&
-		    goal < fs->m_blocks_count) {
+		if (ext4fs_block_goal_valid(fs, goal)) {
 			goal_group = (u_int32_t)((goal -
 			    fs->m_first_data_block) /
 			    fs->m_blocks_per_group);
