@@ -849,7 +849,7 @@ Wrap each compound namespace operation in one transaction:
 
 - [x] Make `fsync()` commit the transaction containing the inode and
       wait for ordered data and the commit record to become durable.
-- [ ] Make synchronous mounts and `O_SYNC` writes force the required
+- [x] Make synchronous mounts and `O_SYNC` writes force the required
       commit.
 - [ ] Make VFS sync commit and checkpoint outstanding journal work.
 - [ ] Ensure read-only mounts may replay recovery only when the device
@@ -874,6 +874,24 @@ that a clean `fsync()` creates no transaction, verifies remounted data,
 and finishes with offline `e2fsck -fn`.  On 2026-09-28, the focused
 target and complete ext4fs suite passed against the rebuilt and booted
 production kernel.
+
+Synchronous-mount and `O_SYNC` write semantics are complete.  The BSD
+VFS layer supplies `IO_SYNC` for both cases, and ext4fs now propagates
+synchronous data-buffer write failures instead of committing inode
+metadata after a failed write.  A successful write commits and
+checkpoints its inode transaction before returning.  `mount_ext4fs`
+accepts the standard BSD `sync` option and passes `MNT_SYNCHRONOUS` to
+the kernel.
+
+The focused `run-regress-ext4fsops-sync` target exercises `O_SYNC`
+writes and ordinary writes on a synchronous mount with 1 KiB, 2 KiB,
+and 4 KiB filesystem blocks.  It observes the journal sequence while
+the filesystem is still mounted, proving that the write returned only
+after its commit and that unmount had no delayed transaction to finish.
+It also verifies that an empty `O_SYNC` write creates no transaction,
+checks remounted data, and runs offline `e2fsck -fn`.  On 2026-09-28,
+the focused target and complete ext4fs suite passed against the rebuilt
+and booted production kernel.
 
 ## Phase 6: Crash-consistency test matrix
 

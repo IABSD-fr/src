@@ -45,6 +45,7 @@ void ext4fs_usage(void);
 
 static const struct mntopt mopts[] = {
 	MOPT_STDOPTS,
+	MOPT_SYNC,
 	MOPT_UPDATE,
 	{ NULL }
 };
