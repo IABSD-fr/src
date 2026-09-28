@@ -1111,7 +1111,16 @@ idempotence and offline `e2fsck -fn` remain mandatory.  The non-root
 helper self-test, shell validation, and fixture audits pass for 1 KiB,
 2 KiB, and 4 KiB blocks.  The explicit
 `run-regress-ext4fs-crash-reuse-vmm` target covers all six durability
-boundaries and awaits its production-kernel run.
+boundaries.  The first all-size production run passed all six 1 KiB
+cuts and the first three 2 KiB cuts.  At the first committed 2 KiB
+cut, replay restored the inode, extent, and block bitmap, but the
+fixed-offset 1 KiB superblock buffer retained its pre-replay free-block
+count.  Clearing `RECOVER` then wrote that stale count over the
+recovered superblock.  Replay now flushes the home blocks and
+invalidates clean device buffers before rereading the fixed-offset
+superblock, preventing the block-zero and sector-two cache aliases
+used by 2 KiB and 4 KiB filesystems.  A focused production-kernel
+rerun is pending.
 
 The remaining exhaustion, wraparound, error injection, and Linux
 verification matrices remain Phase 6 work.

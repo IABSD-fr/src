@@ -1598,6 +1598,8 @@ ext4fs_journal_replay (struct vnode *devvp, struct m_ext4fs *fs,
 	u_int64_t jblock0;
 	int error;
 
+	if (p == NULL)
+		p = curproc;
 	bp = NULL;
 	error = jbd2_journal_open(devvp, fs, &ctx, &jblock0);
 	if (error)
@@ -1651,6 +1653,21 @@ ext4fs_journal_replay (struct vnode *devvp, struct m_ext4fs *fs,
 	error = jbd2_flush_device(devvp, p);
 	if (error) {
 		printf("ext4fs: can't flush replayed journal blocks\n");
+		goto out;
+	}
+	/*
+	 * Above 1 KiB, filesystem block zero contains the superblock
+	 * at byte 1024.  Mount initially cached that 1 KiB region at
+	 * sector two, while replay writes the complete filesystem
+	 * block through a buffer keyed at sector zero.  Invalidate the
+	 * clean device buffers so the fixed-offset read below cannot
+	 * return the pre-replay alias.
+	 */
+	vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
+	error = vinvalbuf(devvp, 0, NOCRED, p, 0, INFSLP);
+	VOP_UNLOCK(devvp);
+	if (error) {
+		printf("ext4fs: can't invalidate replay cache aliases\n");
 		goto out;
 	}
 	error = jbd2_recovered_super_check(&ctx);
