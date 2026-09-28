@@ -933,8 +933,9 @@ state.  As in FFS and ext2fs, the existing block-device open is retained
 across a transition.  A writable-to-read-only remount synchronizes dirty
 vnodes, commits and checkpoints the journal, refuses active writable or
 unlinked inodes, clears `RECOVER`, and marks the filesystem valid.  A
-read-only-to-writable remount revalidates writable feature and clean-state
-requirements, performs restartable orphan cleanup, checks counters,
+read-only-to-writable remount revalidates writable feature and
+clean-state requirements, performs restartable orphan cleanup, checks
+counters,
 rebuilds the runtime journal, sets `RECOVER`, and durably marks the
 filesystem dirty.  Failed upgrades restore a usable read-only runtime.
 
