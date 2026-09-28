@@ -851,7 +851,8 @@ ext4fs_blkalloc_direct (struct inode *ip, u_int64_t goal,
 				/* Update BGD */
 				free_blocks -= nalloced;
 				ext4fs_bgd_set_count(fs, gd,
-				    EXT4FS_BGD_FREE_BLOCKS, free_blocks);
+				    EXT4FS_BGD_FREE_BLOCKS,
+				    free_blocks);
 
 				ext4fs_bgd_write_direct(fs,
 				    ip->i_devvp, g);
@@ -4867,10 +4868,10 @@ ext4fs_fsync (void *v)
 	}
 
 	/*
-	 * On a journaled mount, ext4fs_update() attaches the inode-table
-	 * block to the running transaction.  Its synchronous commit
-	 * flushes prior data first, makes the commit record durable, and
-	 * checkpoints the inode.
+	 * On a journaled mount, ext4fs_update() attaches the
+	 * inode-table block to the running transaction.  Its
+	 * synchronous commit flushes prior data first, makes the commit
+	 * record durable, and checkpoints the inode.
 	 */
 	return (ext4fs_update(VTOI(vp),
 	    ap->a_waitfor == MNT_WAIT));
@@ -7926,7 +7927,6 @@ int
 ext4fs_pathconf (void *v)
 {
 	struct vop_pathconf_args *ap = v;
-
 
 	switch (ap->a_name) {
 	case _PC_LINK_MAX:

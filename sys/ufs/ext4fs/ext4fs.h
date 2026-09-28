@@ -81,7 +81,8 @@ struct ext4fs_runtime_orphan;
 
 #define EXT4FS_LBLKNO(fs, offset) \
 	((offset) >> (fs)->m_block_size_shift)
-#define EXT4FS_BLKOFF(fs, offset)  ((offset) & ((fs)->m_block_size - 1))
+#define EXT4FS_BLKOFF(fs, offset) \
+	((offset) & ((fs)->m_block_size - 1))
 #define EXT4FS_FSBTODB(fs, b) \
 	((b) << (fs)->m_fs_block_to_disk_block)
 
@@ -95,7 +96,7 @@ struct ext4fs_runtime_orphan;
 
 #define EXT4FS_ENCODING_FLAG_NONE	 0x0000
 /* Reject invalid encoding. */
-#define EXT4FS_ENCODING_FLAG_STRICT_MODE 0x0001
+#define EXT4FS_ENCODING_FLAG_STRICT_MODE	0x0001
 
 /* Log the error and continue. */
 #define EXT4FS_ERRORS_CONTINUE	1
@@ -136,21 +137,21 @@ struct ext4fs_runtime_orphan;
 	 EXT4FS_FEATURE_INCOMPAT_FLEX_BG |	\
 	 EXT4FS_FEATURE_INCOMPAT_CSUM_SEED)
 
-#define EXT4FS_FEATURE_RO_COMPAT_SPARSE_SUPER   0x0001
-#define EXT4FS_FEATURE_RO_COMPAT_LARGE_FILE     0x0002
-#define EXT4FS_FEATURE_RO_COMPAT_BTREE_DIR      0x0004
-#define EXT4FS_FEATURE_RO_COMPAT_HUGE_FILE      0x0008
-#define EXT4FS_FEATURE_RO_COMPAT_GDT_CSUM       0x0010
-#define EXT4FS_FEATURE_RO_COMPAT_DIR_NLINK      0x0020
-#define EXT4FS_FEATURE_RO_COMPAT_EXTRA_ISIZE    0x0040
-#define EXT4FS_FEATURE_RO_COMPAT_HAS_SNAPSHOT   0x0080
-#define EXT4FS_FEATURE_RO_COMPAT_QUOTA          0x0100
-#define EXT4FS_FEATURE_RO_COMPAT_BIGALLOC       0x0200
-#define EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM  0x0400
-#define EXT4FS_FEATURE_RO_COMPAT_REPLICA        0x0800
-#define EXT4FS_FEATURE_RO_COMPAT_READONLY       0x1000
-#define EXT4FS_FEATURE_RO_COMPAT_PROJECT        0x2000
-#define EXT4FS_FEATURE_RO_COMPAT_ORPHAN_PRESENT 0x10000
+#define EXT4FS_FEATURE_RO_COMPAT_SPARSE_SUPER	0x0001
+#define EXT4FS_FEATURE_RO_COMPAT_LARGE_FILE	0x0002
+#define EXT4FS_FEATURE_RO_COMPAT_BTREE_DIR	0x0004
+#define EXT4FS_FEATURE_RO_COMPAT_HUGE_FILE	0x0008
+#define EXT4FS_FEATURE_RO_COMPAT_GDT_CSUM	0x0010
+#define EXT4FS_FEATURE_RO_COMPAT_DIR_NLINK	0x0020
+#define EXT4FS_FEATURE_RO_COMPAT_EXTRA_ISIZE	0x0040
+#define EXT4FS_FEATURE_RO_COMPAT_HAS_SNAPSHOT	0x0080
+#define EXT4FS_FEATURE_RO_COMPAT_QUOTA		0x0100
+#define EXT4FS_FEATURE_RO_COMPAT_BIGALLOC	0x0200
+#define EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM	0x0400
+#define EXT4FS_FEATURE_RO_COMPAT_REPLICA		0x0800
+#define EXT4FS_FEATURE_RO_COMPAT_READONLY	0x1000
+#define EXT4FS_FEATURE_RO_COMPAT_PROJECT		0x2000
+#define EXT4FS_FEATURE_RO_COMPAT_ORPHAN_PRESENT	0x10000
 
 #define EXT4FS_FEATURE_RO_COMPAT_SUPPORTED		\
 	(EXT4FS_FEATURE_RO_COMPAT_SPARSE_SUPER |	\
@@ -453,7 +454,7 @@ struct m_ext4fs {
 	int		m_read_only;
 	int		m_fs_was_modified;
 	/* computed by ext4fs_sbfill */
-	u_int64_t       m_block_group_descriptor_blocks_count;
+	u_int64_t	m_block_group_descriptor_blocks_count;
 	u_int64_t	m_block_group_count;
 	u_int64_t	m_block_size;
 	u_int64_t	m_block_size_shift;
@@ -497,8 +498,6 @@ struct ext4fs_block_group_descriptor {
 	u_int32_t bgd_reserved_3c;
 	/* 0x40 */
 } __attribute__((packed));
-
-
 /* Directory entry file types */
 #define EXT4FS_FT_UNKNOWN	0
 #define EXT4FS_FT_REG_FILE	1
@@ -511,11 +510,11 @@ struct ext4fs_block_group_descriptor {
 #define EXT4FS_FT_MAX		8
 
 struct ext4fs_directory {
-	u_int32_t e4d_ino;
-	u_int16_t e4d_reclen;
-	u_int8_t  e4d_namlen;
-	u_int8_t  e4d_type;
-	char      e4d_name[EXT4FS_MAXNAMLEN];
+	u_int32_t	e4d_ino;
+	u_int16_t	e4d_reclen;
+	u_int8_t	e4d_namlen;
+	u_int8_t	e4d_type;
+	char		e4d_name[EXT4FS_MAXNAMLEN];
 } __attribute__((packed));
 
 /*
@@ -527,14 +526,14 @@ struct ext4fs_directory {
 
 struct ext4fs_directory_tail {
 	/* Must be zero: fake inode 0. */
-	u_int32_t det_reserved_zero1;
+	u_int32_t	det_reserved_zero1;
 	/* Always EXT4FS_DIR_TAIL_SIZE. */
-	u_int16_t det_rec_len;
+	u_int16_t	det_rec_len;
 	/* Must be zero: name length 0. */
-	u_int8_t  det_reserved_zero2;
+	u_int8_t	det_reserved_zero2;
 	/* EXT4FS_DIR_TAIL_FT */
-	u_int8_t  det_reserved_ft;
-	u_int32_t det_checksum;
+	u_int8_t	det_reserved_ft;
+	u_int32_t	det_checksum;
 } __attribute__((packed));
 
 struct ext4fs_feature {
@@ -543,39 +542,39 @@ struct ext4fs_feature {
 };
 
 static const struct ext4fs_feature ext4fs_feature_incompat[] = {
-  {EXT4FS_FEATURE_INCOMPAT_COMPRESSION, "compression"},
-  {EXT4FS_FEATURE_INCOMPAT_FILETYPE,    "filetype"},
-  {EXT4FS_FEATURE_INCOMPAT_RECOVER,     "recover"},
-  {EXT4FS_FEATURE_INCOMPAT_JOURNAL_DEV, "journal_dev"},
-  {EXT4FS_FEATURE_INCOMPAT_META_BG,     "meta_bg"},
-  {EXT4FS_FEATURE_INCOMPAT_EXTENTS,     "extents"},
-  {EXT4FS_FEATURE_INCOMPAT_64BIT,       "64bit"},
-  {EXT4FS_FEATURE_INCOMPAT_MMP,         "mmp"},
-  {EXT4FS_FEATURE_INCOMPAT_FLEX_BG,     "flex_bg"},
-  {EXT4FS_FEATURE_INCOMPAT_EA_INODE,    "ea_inode"},
-  {EXT4FS_FEATURE_INCOMPAT_DIRDATA,     "dirdata"},
-  {EXT4FS_FEATURE_INCOMPAT_CSUM_SEED,   "csum_seed"},
-  {EXT4FS_FEATURE_INCOMPAT_LARGEDIR,    "largedir"},
-  {EXT4FS_FEATURE_INCOMPAT_INLINE_DATA, "inline_data"},
-  {EXT4FS_FEATURE_INCOMPAT_ENCRYPT,     "encrypt"},
+	{ EXT4FS_FEATURE_INCOMPAT_COMPRESSION, "compression" },
+	{ EXT4FS_FEATURE_INCOMPAT_FILETYPE, "filetype" },
+	{ EXT4FS_FEATURE_INCOMPAT_RECOVER, "recover" },
+	{ EXT4FS_FEATURE_INCOMPAT_JOURNAL_DEV, "journal_dev" },
+	{ EXT4FS_FEATURE_INCOMPAT_META_BG, "meta_bg" },
+	{ EXT4FS_FEATURE_INCOMPAT_EXTENTS, "extents" },
+	{ EXT4FS_FEATURE_INCOMPAT_64BIT, "64bit" },
+	{ EXT4FS_FEATURE_INCOMPAT_MMP, "mmp" },
+	{ EXT4FS_FEATURE_INCOMPAT_FLEX_BG, "flex_bg" },
+	{ EXT4FS_FEATURE_INCOMPAT_EA_INODE, "ea_inode" },
+	{ EXT4FS_FEATURE_INCOMPAT_DIRDATA, "dirdata" },
+	{ EXT4FS_FEATURE_INCOMPAT_CSUM_SEED, "csum_seed" },
+	{ EXT4FS_FEATURE_INCOMPAT_LARGEDIR, "largedir" },
+	{ EXT4FS_FEATURE_INCOMPAT_INLINE_DATA, "inline_data" },
+	{ EXT4FS_FEATURE_INCOMPAT_ENCRYPT, "encrypt" },
 };
 
 static const struct ext4fs_feature ext4fs_feature_ro_compat[] = {
-  {EXT4FS_FEATURE_RO_COMPAT_SPARSE_SUPER,  "sparse-super"},
-  {EXT4FS_FEATURE_RO_COMPAT_LARGE_FILE,    "large-file"},
-  {EXT4FS_FEATURE_RO_COMPAT_BTREE_DIR,     "btree-dir"},
-  {EXT4FS_FEATURE_RO_COMPAT_HUGE_FILE,     "huge-file"},
-  {EXT4FS_FEATURE_RO_COMPAT_GDT_CSUM,      "gdt-csum"},
-  {EXT4FS_FEATURE_RO_COMPAT_DIR_NLINK,     "dir-nlink"},
-  {EXT4FS_FEATURE_RO_COMPAT_EXTRA_ISIZE,   "extra-isize"},
-  {EXT4FS_FEATURE_RO_COMPAT_HAS_SNAPSHOT,  "has-snapshot"},
-  {EXT4FS_FEATURE_RO_COMPAT_QUOTA,         "quota"},
-  {EXT4FS_FEATURE_RO_COMPAT_BIGALLOC,      "bigalloc"},
-  {EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM, "metadata-csum"},
-  {EXT4FS_FEATURE_RO_COMPAT_REPLICA,       "replica"},
-  {EXT4FS_FEATURE_RO_COMPAT_READONLY,      "readonly"},
-  {EXT4FS_FEATURE_RO_COMPAT_PROJECT,        "project"},
-  {EXT4FS_FEATURE_RO_COMPAT_ORPHAN_PRESENT, "orphan_present"},
+	{ EXT4FS_FEATURE_RO_COMPAT_SPARSE_SUPER, "sparse-super" },
+	{ EXT4FS_FEATURE_RO_COMPAT_LARGE_FILE, "large-file" },
+	{ EXT4FS_FEATURE_RO_COMPAT_BTREE_DIR, "btree-dir" },
+	{ EXT4FS_FEATURE_RO_COMPAT_HUGE_FILE, "huge-file" },
+	{ EXT4FS_FEATURE_RO_COMPAT_GDT_CSUM, "gdt-csum" },
+	{ EXT4FS_FEATURE_RO_COMPAT_DIR_NLINK, "dir-nlink" },
+	{ EXT4FS_FEATURE_RO_COMPAT_EXTRA_ISIZE, "extra-isize" },
+	{ EXT4FS_FEATURE_RO_COMPAT_HAS_SNAPSHOT, "has-snapshot" },
+	{ EXT4FS_FEATURE_RO_COMPAT_QUOTA, "quota" },
+	{ EXT4FS_FEATURE_RO_COMPAT_BIGALLOC, "bigalloc" },
+	{ EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM, "metadata-csum" },
+	{ EXT4FS_FEATURE_RO_COMPAT_REPLICA, "replica" },
+	{ EXT4FS_FEATURE_RO_COMPAT_READONLY, "readonly" },
+	{ EXT4FS_FEATURE_RO_COMPAT_PROJECT, "project" },
+	{ EXT4FS_FEATURE_RO_COMPAT_ORPHAN_PRESENT, "orphan_present" },
 };
 
 #define EXT4FS_ITIMES(ip) do { \

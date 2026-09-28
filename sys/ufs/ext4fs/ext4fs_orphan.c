@@ -2146,7 +2146,8 @@ ext4fs_orphan_file_runtime_scan (struct mount *mp,
 			if (ino == 0) {
 				if (state->ofs_free_block ==
 				    UINT32_MAX) {
-					state->ofs_free_physical = physical;
+					state->ofs_free_physical =
+					    physical;
 					state->ofs_free_block = block;
 					state->ofs_free_entry = entry;
 				}
@@ -2175,7 +2176,8 @@ ext4fs_orphan_file_runtime_scan (struct mount *mp,
 				return (error);
 			}
 			if (letoh16(dp.dinode.i_links_count) != 0 ||
-			    letoh16(ip->i_e4din->dinode.i_links_count) != 0) {
+			    letoh16(
+			    ip->i_e4din->dinode.i_links_count) != 0) {
 				brelse(bp);
 				return (EINVAL);
 			}
@@ -2323,9 +2325,9 @@ ext4fs_orphan_file_add_handle (struct inode *ip,
 
 	/*
 	 * Preflight authenticated the complete orphan file while the
-	 * orphan lock was held.  Recheck only the selected block through
-	 * the handle: a full bread-based rescan could reacquire an inode
-	 * table buffer already owned by this transaction.
+	 * orphan lock was held.  Recheck only the selected block
+	 * through the handle: a full bread-based rescan could reacquire
+	 * an inode table buffer already owned by this transaction.
 	 */
 	ip->i_flag |= IN_CHANGE;
 	error = ext4fs_update_handle(ip, handle);

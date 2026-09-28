@@ -37,14 +37,10 @@
 #include <sys/proc.h>
 #include <sys/kernel.h>
 #include <sys/vnode.h>
-//#include <sys/socket.h>
 #include <sys/mount.h>
 #include <sys/buf.h>
 #include <sys/disk.h>
-//#include <sys/mbuf.h>
 #include <sys/fcntl.h>
-//#include <sys/disklabel.h>
-//#include <sys/ioctl.h>
 #include <sys/errno.h>
 #include <sys/malloc.h>
 #include <sys/pool.h>
@@ -56,7 +52,6 @@
 #include <ufs/ufs/quota.h>
 #include <ufs/ufs/ufsmount.h>
 #include <ufs/ufs/inode.h>
-//#include <ufs/ufs/dir.h>
 #include <ufs/ufs/ufs_extern.h>
 
 #include <ufs/ext4fs/ext4fs.h>
@@ -288,7 +283,8 @@ ext4fs_counters_check (struct m_ext4fs *fs)
 	}
 	if (free_blocks != fs->m_free_blocks_count ||
 	    free_inodes != fs->m_free_inodes_count) {
-		printf("ext4fs: group and superblock counters differ\n");
+		printf("ext4fs: group and superblock "
+		    "counters differ\n");
 		return (EINVAL);
 	}
 	return (0);
@@ -463,7 +459,10 @@ ext4fs_remount_writable (struct mount *mp, struct proc *p)
 	if (error == 0)
 		return (0);
 
-	/* Recovery progress is restartable; restore a usable r/o mount. */
+	/*
+	 * Recovery progress is restartable; restore a usable r/o
+	 * mount.
+	 */
 	if (fs->m_journal != NULL &&
 	    (fs->m_feature_incompat &
 	    EXT4FS_FEATURE_INCOMPAT_RECOVER))
@@ -1556,10 +1555,13 @@ ext4fs_inode_alloc (struct inode *pip, mode_t mode, struct ucred *cred,
 				/* Update BGD free count */
 				free_inodes--;
 				ext4fs_bgd_set_count(fs, gd,
-				    EXT4FS_BGD_FREE_INODES, free_inodes);
+				    EXT4FS_BGD_FREE_INODES,
+				    free_inodes);
 
-				if ((mode & S_IFMT) == S_IFDIR) {
-					dirs = ext4fs_bgd_get_count(fs, gd,
+				if ((mode & S_IFMT) ==
+				    S_IFDIR) {
+					dirs =
+					    ext4fs_bgd_get_count(fs, gd,
 					    EXT4FS_BGD_USED_DIRS);
 					dirs++;
 					ext4fs_bgd_set_count(fs, gd,
@@ -2314,7 +2316,7 @@ ext4fs_vget (struct mount *mp, ino_t ino, struct vnode **vpp)
 	dev = ump->um_dev;
 	fs = ump->um_e4fs;
 
- retry:
+retry:
 	if ((*vpp = ufs_ihashget(dev, ino)) != NULL) {
 		return (0);
 	}

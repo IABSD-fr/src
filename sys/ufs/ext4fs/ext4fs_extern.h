@@ -28,4 +28,4 @@ int	ext4fs_vinit (struct mount *, struct vnode **);
 int	ext4fsfifo_reclaim (void *);
 #endif
 
-#define IS_EXT4_VNODE(vp)   ((vp)->v_tag == VT_EXT4FS)
+#define IS_EXT4_VNODE(vp)	((vp)->v_tag == VT_EXT4FS)
