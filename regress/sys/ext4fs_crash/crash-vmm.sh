@@ -102,10 +102,10 @@ for stage in $EXT4FS_CRASH_STAGES; do
 	esac
 done
 case "$EXT4FS_CRASH_MODE" in
-timed|flush) ;;
+timed|flush|orphan) ;;
 *)	fail "unsupported crash mode: $EXT4FS_CRASH_MODE" ;;
 esac
-if [ "$EXT4FS_CRASH_MODE" = flush ]; then
+if [ "$EXT4FS_CRASH_MODE" != timed ]; then
 	[ -n "$EXT4FS_CRASH_FLUSH_COUNTS" ] ||
 	    fail "flush-count list must not be empty"
 	for flush_count in $EXT4FS_CRASH_FLUSH_COUNTS; do
@@ -113,7 +113,7 @@ if [ "$EXT4FS_CRASH_MODE" = flush ]; then
 		''|*[!0-9]*|0)	fail "invalid flush count: $flush_count" ;;
 		esac
 		[ "$flush_count" -le 6 ] ||
-		    fail "flush count exceeds rename transaction"
+		    fail "flush count exceeds transaction"
 	done
 fi
 
@@ -395,7 +395,8 @@ validate_guest()
 {
 	image=$1
 	options=$2
-	log=$3
+	verifier=$3
+	log=$4
 	start_guest "$image"
 	if [ -n "$options" ]; then
 		mount_command="mount_ext4fs -o $options \
@@ -406,7 +407,7 @@ validate_guest()
 	verify="set -e
 mkdir -p /mnt/ext4
 $mount_command
-/tmp/ext4fs_crash verify /mnt/ext4/crash
+/tmp/ext4fs_crash $verifier /mnt/ext4/crash
 umount /mnt/ext4"
 	if ! ssh_step "root@$guest" "$verify" >"$log" 2>&1; then
 		cat "$log" >&2
@@ -456,9 +457,12 @@ recover_case()
 {
 	image=$1
 	case_dir=$2
-	validate_guest "$image" '' "$case_dir/recovery.log"
+	verifier=$3
+	validate_guest "$image" '' "$verifier" \
+	    "$case_dir/recovery.log"
 	hash_before=$($SHA256 -q "$image")
-	validate_guest "$image" ro "$case_dir/idempotence.log"
+	validate_guest "$image" ro "$verifier" \
+	    "$case_dir/idempotence.log"
 	hash_after=$($SHA256 -q "$image")
 	[ "$hash_before" = "$hash_after" ] ||
 	    fail "second read-only mount modified the image"
@@ -476,6 +480,60 @@ recover_case()
 	grep -q '^Filesystem state:.*clean' \
 	    "$case_dir/dumpe2fs.log" ||
 	    fail "recovered image is not clean"
+}
+
+run_flush_matrix()
+{
+	base=$1
+	block_size=$2
+	stage=$3
+	label=$4
+	verifier=$5
+	before_state=$6
+	after_state=$7
+
+	for flush_count in $EXT4FS_CRASH_FLUSH_COUNTS; do
+		test_name="$label flush $flush_count, "
+		test_name="$test_name$block_size-byte blocks"
+		printf '%-64s' "vmm: $test_name"
+		case_dir=$work/$stage-flush-$flush_count-$block_size
+		mkdir "$case_dir"
+		image=$case_dir/ext4.img
+		cp "$base" "$image"
+
+		start_guest "$image"
+		run_flush_crash "$image" "$stage" "$flush_count" \
+		    "$case_dir/workload.log" \
+		    "$case_dir/flush-stop.log"
+		preserve_durable "$image" "$case_dir"
+		case "$flush_count" in
+		1|2)
+			expected_journal=clean
+			expected_state=$before_state
+			;;
+		3)
+			expected_journal=recover
+			expected_state=$before_state
+			;;
+		4|5)
+			expected_journal=recover
+			expected_state=$after_state
+			;;
+		6)
+			expected_journal=clean
+			expected_state=$after_state
+			;;
+		esac
+		[ "$durable_journal_state" = "$expected_journal" ] ||
+		    fail "$label flush $flush_count journal mismatch: \
+$durable_journal_state != $expected_journal"
+		recover_case "$image" "$case_dir" "$verifier"
+		grep -qx "$expected_state" "$case_dir/recovery.log" || {
+			cat "$case_dir/recovery.log" >&2
+			fail "$label flush $flush_count recovered wrong state"
+		}
+		echo ' ok'
+	done
 }
 
 "$SYSCTL" -n kern.version >"$work/host-version.log"
@@ -511,52 +569,19 @@ for block_size in $EXT4FS_CRASH_BLOCK_SIZES; do
 			run_crash "$image" "$stage" \
 			    "$case_dir/workload.log"
 			preserve_durable "$image" "$case_dir"
-			recover_case "$image" "$case_dir"
+			recover_case "$image" "$case_dir" verify
 			echo ' ok'
 		done
 		continue
 	fi
 
-	for flush_count in $EXT4FS_CRASH_FLUSH_COUNTS; do
-		test_name="rename flush $flush_count, "
-		test_name="$test_name$block_size-byte blocks"
-		printf '%-64s' "vmm: $test_name"
-		case_dir=$work/flush-$flush_count-$block_size
-		mkdir "$case_dir"
-		image=$case_dir/ext4.img
-		cp "$base" "$image"
-
-		start_guest "$image"
-		run_flush_crash "$image" rename "$flush_count" \
-		    "$case_dir/workload.log" \
-		    "$case_dir/flush-stop.log"
-		preserve_durable "$image" "$case_dir"
-		case "$flush_count" in
-		1|2)
-			expected_journal=clean
-			expected_state='state=old next=full'
-			;;
-		3)
-			expected_journal=recover
-			expected_state='state=old next=full'
-			;;
-		4|5)
-			expected_journal=recover
-			expected_state='state=new next=absent'
-			;;
-		6)
-			expected_journal=clean
-			expected_state='state=new next=absent'
-			;;
-		esac
-		[ "$durable_journal_state" = "$expected_journal" ] ||
-		    fail "flush $flush_count journal state mismatch: \
-$durable_journal_state != $expected_journal"
-		recover_case "$image" "$case_dir"
-		grep -qx "$expected_state" "$case_dir/recovery.log" || {
-			cat "$case_dir/recovery.log" >&2
-			fail "flush $flush_count recovered wrong state"
-		}
-		echo ' ok'
-	done
+	if [ "$EXT4FS_CRASH_MODE" = flush ]; then
+		run_flush_matrix "$base" "$block_size" rename rename \
+		    verify 'state=old next=full' \
+		    'state=new next=absent'
+	else
+		run_flush_matrix "$base" "$block_size" unlink-open \
+		    'open unlink' verify-unlink 'state=linked' \
+		    'state=absent'
+	fi
 done

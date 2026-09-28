@@ -1039,6 +1039,15 @@ On 2026-09-28, the focused first-boundary test and the complete
 six-boundary matrix passed with the installed production `vmd` and
 `vmctl` after restarting `vmd`.
 
+The next deterministic matrix covers unlinking a regular file while a
+descriptor keeps its inode active.  Cuts before the commit must recover
+the linked file and its exact data; cuts after the commit must recover
+an absent name and complete classic-orphan cleanup.  Every case also
+requires idempotent second recovery and offline `e2fsck -fn`
+acceptance.  The non-root helper self-test passes, and the explicit
+`run-regress-ext4fs-crash-orphan-vmm` production-kernel target awaits
+its root VMM run.
+
 The remaining workload matrix, wraparound, and Linux verification remain
 Phase 6 work.
 

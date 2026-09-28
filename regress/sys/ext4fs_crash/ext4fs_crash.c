@@ -67,6 +67,7 @@ static void	store_be32 (unsigned char *, size_t, uint32_t);
 static void	classify_journal (const char *);
 static void	run_workload (const char *, const char *, int);
 static void	verify_workload (const char *);
+static void	verify_unlink (const char *);
 static void	selftest (void);
 
 static void
@@ -300,6 +301,23 @@ run_workload (const char *stage, const char *root, int boundary)
 
 	make_path(current, sizeof(current), root, "current");
 	make_path(next, sizeof(next), root, "next");
+	if (strcmp(stage, "unlink-open") == 0) {
+		/* Keep the unlinked inode active until the VM is stopped. */
+		fd = open(current, O_RDWR | O_CLOEXEC);
+		if (fd == -1)
+			err(1, "open %s", current);
+		if (boundary)
+			arm_boundary(stage);
+		else
+			arm_cut(stage);
+		if (unlink(current) == -1)
+			err(1, "unlink %s", current);
+		if (printf("DONE %s\n", stage) < 0 ||
+		    fflush(stdout) == EOF)
+			err(1, "publish completion marker");
+		for (;;)
+			(void)pause();
+	}
 	fd = open_output(next, 1);
 	if (strcmp(stage, "write") == 0) {
 		if (boundary)
@@ -387,6 +405,32 @@ verify_workload (const char *root)
 }
 
 static void
+verify_unlink (const char *root)
+{
+	struct stat st;
+	char current[PATH_MAX], next[PATH_MAX];
+
+	make_path(current, sizeof(current), root, "current");
+	make_path(next, sizeof(next), root, "next");
+	if (lstat(current, &st) == -1) {
+		if (errno != ENOENT)
+			err(1, "lstat %s", current);
+		printf("state=absent\n");
+	} else {
+		if (! S_ISREG(st.st_mode) || st.st_size != OLD_BYTES)
+			errx(1, "%s has invalid shape", current);
+		check_pattern(current, OLD_BYTES, OLD_SEED);
+		printf("state=linked\n");
+	}
+	if (lstat(next, &st) != -1)
+		errx(1, "%s unexpectedly exists", next);
+	if (errno != ENOENT)
+		err(1, "lstat %s", next);
+	if (fflush(stdout) == EOF)
+		err(1, "publish unlink state");
+}
+
+static void
 selftest (void)
 {
 	unsigned char journal[JBD2_SUPER_BYTES];
@@ -401,6 +445,7 @@ selftest (void)
 	make_path(next, sizeof(next), root, "next");
 	make_old_pattern(current);
 	verify_workload(root);
+	verify_unlink(root);
 
 	fd = open_output(next, 1);
 	write_pattern(fd, 12345, NEW_SEED);
@@ -456,6 +501,7 @@ selftest (void)
 		err(1, "unlink %s", journal_path);
 	if (unlink(current) == -1)
 		err(1, "unlink %s", current);
+	verify_unlink(root);
 	if (rmdir(root) == -1)
 		err(1, "rmdir %s", root);
 }
@@ -475,10 +521,11 @@ main (int argc, char **argv)
 		run_workload(argv[2], argv[3], 1);
 	else if (argc == 3 && strcmp(argv[1], "verify") == 0)
 		verify_workload(argv[2]);
+	else if (argc == 3 && strcmp(argv[1], "verify-unlink") == 0)
+		verify_unlink(argv[2]);
 	else
 		errx(1, "usage: ext4fs_crash pattern-old path | "
 		    "journal-state path | workload stage root | boundary "
-		    "stage root | "
-		    "verify root");
+		    "stage root | verify root | verify-unlink root");
 	return (0);
 }
