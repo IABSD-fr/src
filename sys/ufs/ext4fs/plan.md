@@ -852,7 +852,7 @@ Wrap each compound namespace operation in one transaction:
 - [x] Make synchronous mounts and `O_SYNC` writes force the required
       commit.
 - [x] Make VFS sync commit and checkpoint outstanding journal work.
-- [ ] Ensure read-only mounts may replay recovery only when the device
+- [x] Ensure read-only mounts may replay recovery only when the device
       can be safely opened for writing; otherwise fail without modifying
       it.
 - [ ] Define remount read-only/read-write behavior.
@@ -908,6 +908,23 @@ that unmount has no delayed transaction to finish and that a clean
 read-only non-mutation, and offline `e2fsck -fn` acceptance.  On
 2026-09-28, the focused target and complete ext4fs suite passed against
 the rebuilt and booted production kernel.
+
+Read-only recovery authorization is complete.  A read-only mount first
+opens the device for reading.  If `RECOVER` requires replay, mountfs
+must successfully reopen it with `FREAD | FWRITE` before calling the
+replay engine.  A failed write open exits before any recovery write and
+retains `RECOVER`.  Successful recovery restores a read-only device
+open before publishing the mount.
+
+The kernel journal regression stores valid recovery images inside a
+read-only mounted ext4 filesystem and attaches those files as nested
+read-only vnd devices.  It covers both a pending transaction and the
+restartable `RECOVER` with `s_start == 0` state.  Both mounts must fail,
+the image hashes must remain unchanged, and `RECOVER` must remain set.
+The existing writable-device control proves that a requested read-only
+mount still performs valid recovery when write access is available.
+On 2026-09-28, the complete kernel journal suite passed against the
+booted production kernel.
 
 ## Phase 6: Crash-consistency test matrix
 
