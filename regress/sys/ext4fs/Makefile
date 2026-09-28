@@ -3,6 +3,7 @@
 PROG=	journal_core_test
 SRCS=	journal_core_test.c ext4fs_journal_state.c
 CPPFLAGS+=	-I${.CURDIR}/../../../sys
+CFLAGS+=	-Wall -Werror -Wextra
 NOMAN=
 
 .PATH:	${.CURDIR}/../../../sys/ufs/ext4fs

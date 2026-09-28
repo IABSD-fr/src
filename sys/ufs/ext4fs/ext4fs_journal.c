@@ -238,7 +238,7 @@ jbd2_extent_lookup (struct jbd2_replay_ctx *ctx,
 				brelse(bp);
 			return (error);
 		}
-		if (!jbd2_extent_block_csum_verify(ctx, bp->b_data)) {
+		if (! jbd2_extent_block_csum_verify(ctx, bp->b_data)) {
 			brelse(bp);
 			return (EINVAL);
 		}
@@ -333,7 +333,7 @@ jbd2_fill_blockmap_from_eh (struct jbd2_replay_ctx *ctx,
 				    "can't read index block\n");
 				return (error);
 			}
-			if (!jbd2_extent_block_csum_verify(ctx,
+			if (! jbd2_extent_block_csum_verify(ctx,
 			    bp->b_data)) {
 				brelse(bp);
 				return (EINVAL);
@@ -498,7 +498,7 @@ jbd2_metadata_block_csum_verify (struct jbd2_replay_ctx *ctx,
 	struct jbd2_block_tail *tail;
 	u_int32_t provided, calculated;
 
-	if (!jbd2_has_csum_v2or3(ctx))
+	if (! jbd2_has_csum_v2or3(ctx))
 		return (1);
 
 	tail = (struct jbd2_block_tail *)((char *)data +
@@ -517,7 +517,7 @@ jbd2_commit_block_csum_verify (struct jbd2_replay_ctx *ctx, void *data)
 	struct jbd2_commit_header *commit;
 	u_int32_t provided, calculated;
 
-	if (!jbd2_has_csum_v2or3(ctx))
+	if (! jbd2_has_csum_v2or3(ctx))
 		return (1);
 
 	commit = data;
@@ -526,7 +526,7 @@ jbd2_commit_block_csum_verify (struct jbd2_replay_ctx *ctx, void *data)
 	 * superblock and may leave the legacy per-commit type/size pair
 	 * zero.
 	 */
-	if (!((commit->h_checksum_type == 0 &&
+	if (! ((commit->h_checksum_type == 0 &&
 	    commit->h_checksum_size == 0) ||
 	    (commit->h_checksum_type == JBD2_CHECKSUM_CRC32C &&
 	    commit->h_checksum_size == JBD2_CHECKSUM_SIZE)))
@@ -545,7 +545,7 @@ jbd2_data_block_csum_verify (struct jbd2_replay_ctx *ctx, void *data,
 {
 	u_int32_t crc;
 
-	if (!jbd2_has_csum_v2or3(ctx))
+	if (! jbd2_has_csum_v2or3(ctx))
 		return (1);
 
 	crc = jbd2_data_block_checksum(ctx, data, sequence);
@@ -658,7 +658,7 @@ jbd2_parse_tag (struct jbd2_replay_ctx *ctx, char *buf,
 		return (EINVAL);
 
 	if (*flags & JBD2_FLAG_SAME_UUID) {
-		if (!*uuid_seen)
+		if (! *uuid_seen)
 			return (EINVAL);
 	} else {
 		/*
@@ -754,9 +754,9 @@ jbd2_revoke_block_check (struct jbd2_replay_ctx *ctx, struct buf *bp,
 	struct jbd2_revoke_header *rh;
 	u_int32_t bytes, limit, record_size;
 
-	if (!(ctx->rc_features_incompat & JBD2_FEATURE_INCOMPAT_REVOKE))
+	if (! (ctx->rc_features_incompat & JBD2_FEATURE_INCOMPAT_REVOKE))
 		return (EINVAL);
-	if (!jbd2_metadata_block_csum_verify(ctx, bp->b_data))
+	if (! jbd2_metadata_block_csum_verify(ctx, bp->b_data))
 		return (EINVAL);
 
 	rh = (struct jbd2_revoke_header *)bp->b_data;
@@ -797,7 +797,7 @@ jbd2_count_tags (struct jbd2_replay_ctx *ctx, struct buf *bp,
 		if (error)
 			return (error);
 		seen = 1;
-		if (!(flags & JBD2_FLAG_DELETED))
+		if (! (flags & JBD2_FLAG_DELETED))
 			(*count)++;
 		if (flags & JBD2_FLAG_LAST_TAG)
 			return (0);
@@ -855,7 +855,7 @@ jbd2_pass_scan (struct jbd2_replay_ctx *ctx)
 		switch (betoh32(hdr->h_blocktype)) {
 		case JBD2_DESCRIPTOR_BLOCK:
 			in_transaction = 1;
-			if (!jbd2_metadata_block_csum_verify(ctx,
+			if (! jbd2_metadata_block_csum_verify(ctx,
 			    bp->b_data)) {
 				brelse(bp);
 				printf("ext4fs: bad journal descriptor "
@@ -890,11 +890,11 @@ jbd2_pass_scan (struct jbd2_replay_ctx *ctx)
 			break;
 
 		case JBD2_COMMIT_BLOCK:
-			if (!in_transaction) {
+			if (! in_transaction) {
 				brelse(bp);
 				return (EINVAL);
 			}
-			if (!jbd2_commit_block_csum_verify(ctx,
+			if (! jbd2_commit_block_csum_verify(ctx,
 			    bp->b_data)) {
 				brelse(bp);
 				printf("ext4fs: bad journal commit "
@@ -965,7 +965,7 @@ jbd2_pass_revoke (struct jbd2_replay_ctx *ctx)
 
 		switch (betoh32(hdr->h_blocktype)) {
 		case JBD2_DESCRIPTOR_BLOCK:
-			if (!jbd2_metadata_block_csum_verify(ctx,
+			if (! jbd2_metadata_block_csum_verify(ctx,
 			    bp->b_data)) {
 				brelse(bp);
 				return (EINVAL);
@@ -1042,7 +1042,7 @@ jbd2_pass_revoke (struct jbd2_replay_ctx *ctx)
 			break;
 
 		case JBD2_COMMIT_BLOCK:
-			if (!jbd2_commit_block_csum_verify(ctx,
+			if (! jbd2_commit_block_csum_verify(ctx,
 			    bp->b_data)) {
 				brelse(bp);
 				return (EINVAL);
@@ -1106,7 +1106,7 @@ jbd2_pass_replay (struct jbd2_replay_ctx *ctx, int apply)
 
 		switch (betoh32(hdr->h_blocktype)) {
 		case JBD2_DESCRIPTOR_BLOCK:
-			if (!jbd2_metadata_block_csum_verify(ctx,
+			if (! jbd2_metadata_block_csum_verify(ctx,
 			    bp->b_data)) {
 				brelse(bp);
 				return (EINVAL);
@@ -1165,7 +1165,7 @@ jbd2_pass_replay (struct jbd2_replay_ctx *ctx, int apply)
 					brelse(bp);
 					return (error);
 				}
-				if (!jbd2_data_block_csum_verify(ctx,
+				if (! jbd2_data_block_csum_verify(ctx,
 				    dbp->b_data, seq, checksum)) {
 					printf("ext4fs: journal "
 					    "replay: bad data checksum "
@@ -1174,7 +1174,7 @@ jbd2_pass_replay (struct jbd2_replay_ctx *ctx, int apply)
 					brelse(bp);
 					return (EINVAL);
 				}
-				if (!apply) {
+				if (! apply) {
 					brelse(dbp);
 					if (flags & JBD2_FLAG_LAST_TAG)
 						break;
@@ -1242,7 +1242,7 @@ jbd2_pass_replay (struct jbd2_replay_ctx *ctx, int apply)
 			break;
 
 		case JBD2_COMMIT_BLOCK:
-			if (!jbd2_commit_block_csum_verify(ctx,
+			if (! jbd2_commit_block_csum_verify(ctx,
 			    bp->b_data)) {
 				brelse(bp);
 				return (EINVAL);
@@ -1275,7 +1275,7 @@ jbd2_superblock_csum_verify (struct jbd2_replay_ctx *ctx,
 {
 	u_int32_t provided, calculated;
 
-	if (!jbd2_has_csum_v2or3(ctx))
+	if (! jbd2_has_csum_v2or3(ctx))
 		return (1);
 
 	provided = jsb->s_checksum;
@@ -1291,7 +1291,7 @@ jbd2_superblock_csum_set (struct jbd2_replay_ctx *ctx,
 {
 	u_int32_t checksum;
 
-	if (!jbd2_has_csum_v2or3(ctx))
+	if (! jbd2_has_csum_v2or3(ctx))
 		return;
 	jsb->s_checksum = 0;
 	checksum = ~crc32c(0, (const uint8_t *)jsb, sizeof(*jsb));
@@ -1383,7 +1383,7 @@ jbd2_journal_open (struct vnode *devvp, struct m_ext4fs *fs,
 	ctx->rc_journal_eh = &jdi->i_extent_header;
 	ctx->rc_journal_ino = fs->m_journal_inode_number;
 	ctx->rc_journal_gen = jdi->i_nfs_generation;
-	if (!(letoh32(jdi->i_flags) & EXTFS_INODE_FLAG_EXTENTS)) {
+	if (! (letoh32(jdi->i_flags) & EXTFS_INODE_FLAG_EXTENTS)) {
 		printf("ext4fs: journal inode does not use extents\n");
 		error = EINVAL;
 		goto out;
@@ -1540,7 +1540,7 @@ jbd2_journal_open (struct vnode *devvp, struct m_ext4fs *fs,
 		error = EINVAL;
 		goto out;
 	}
-	if (!jbd2_superblock_csum_verify(ctx, jsb)) {
+	if (! jbd2_superblock_csum_verify(ctx, jsb)) {
 		printf("ext4fs: invalid journal superblock checksum\n");
 		error = EINVAL;
 		goto out;

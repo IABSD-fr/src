@@ -324,7 +324,7 @@ check_directory (const char *path)
 
 	if (stat(path, &st) == -1)
 		err(1, "stat %s", path);
-	if (!S_ISDIR(st.st_mode))
+	if (! S_ISDIR(st.st_mode))
 		errx(1, "%s is not a directory", path);
 }
 
@@ -335,7 +335,7 @@ check_regular (const char *path)
 
 	if (stat(path, &st) == -1)
 		err(1, "stat %s", path);
-	if (!S_ISREG(st.st_mode))
+	if (! S_ISREG(st.st_mode))
 		errx(1, "%s is not a regular file", path);
 }
 
@@ -353,7 +353,7 @@ check_symlink (const char *path, const char *target)
 		err(1, "lstat %s", path);
 	blocks = target_len <= FAST_SYMLINK_BYTES ? 0 :
 	    (blkcnt_t)(block_size / 512);
-	if (!S_ISLNK(st.st_mode) || st.st_size != (off_t)target_len ||
+	if (! S_ISLNK(st.st_mode) || st.st_size != (off_t)target_len ||
 	    st.st_blocks != blocks)
 		errx(1, "symlink inode shape mismatch for %s", path);
 	n = readlink(path, buf, sizeof(buf));
@@ -376,7 +376,7 @@ check_data_file (const char *path, int mutated)
 	overwrite = (off_t)block_size - 17;
 	if (stat(path, &st) == -1)
 		err(1, "stat %s", path);
-	if (!S_ISREG(st.st_mode) || st.st_size != base + append)
+	if (! S_ISREG(st.st_mode) || st.st_size != base + append)
 		errx(1, "wrong type or size for %s", path);
 	if ((st.st_mode & 07777) != (mutated ? 0604 : 0640))
 		errx(1, "wrong mode for %s: %04o", path,
@@ -410,7 +410,7 @@ check_sparse_file (const char *path, int mutated)
 	fd = open(path, O_RDONLY);
 	if (fd == -1)
 		err(1, "open %s", path);
-	if (!mutated) {
+	if (! mutated) {
 		if (st.st_size != marker + 47)
 			errx(1, "wrong sparse-file size");
 		check_zero_fd(fd, 0, (size_t)marker);
@@ -508,7 +508,7 @@ check_empty_file (const char *path)
 
 	if (stat(path, &st) == -1)
 		err(1, "stat %s", path);
-	if (!S_ISREG(st.st_mode) || st.st_size != 0 || st.st_blocks != 0)
+	if (! S_ISREG(st.st_mode) || st.st_size != 0 || st.st_blocks != 0)
 		errx(1, "%s retained data or allocated blocks", path);
 }
 
@@ -585,7 +585,7 @@ check_link_growth_tree (int removed)
 	    "link-grow/journal-growth-link");
 	if (stat(directory, &directory_st) == -1)
 		err(1, "stat %s", directory);
-	if (!S_ISDIR(directory_st.st_mode) ||
+	if (! S_ISDIR(directory_st.st_mode) ||
 	    directory_st.st_size != (off_t)(2 * block_size))
 		errx(1, "link-growth directory has wrong type or size");
 	if (stat(target, &target_st) == -1)
@@ -651,7 +651,7 @@ check_extent_fixture (off_t expected_size, size_t expected_blocks)
 		err(1, "fstat %s", path);
 	expected_sectors = (blkcnt_t)expected_blocks *
 	    (blkcnt_t)(block_size / 512);
-	if (!S_ISREG(st.st_mode) || st.st_nlink != 1 ||
+	if (! S_ISREG(st.st_mode) || st.st_nlink != 1 ||
 	    st.st_size != expected_size ||
 	    st.st_blocks != expected_sectors)
 		errx(1, "extent fixture has wrong inode shape");
@@ -1272,7 +1272,7 @@ reject_corrupt_orphan_file (void)
 	check_orphan_reject_errno("rmdir");
 	if (stat(path, &st) == -1)
 		err(1, "stat %s", path);
-	if (!S_ISDIR(st.st_mode))
+	if (! S_ISDIR(st.st_mode))
 		errx(1, "rejected orphan rmdir changed file type");
 
 	if (statfs(root, &after) == -1)
@@ -1392,26 +1392,26 @@ verify_special_files (void)
 	make_path(path, sizeof(path), "fifo");
 	if (lstat(path, &st) == -1)
 		err(1, "lstat %s", path);
-	if (!S_ISFIFO(st.st_mode))
+	if (! S_ISFIFO(st.st_mode))
 		errx(1, "%s is not a fifo", path);
 	make_path(path, sizeof(path), "char-device");
 	if (lstat(path, &st) == -1)
 		err(1, "lstat %s", path);
-	if (!S_ISCHR(st.st_mode))
+	if (! S_ISCHR(st.st_mode))
 		errx(1, "%s is not a character device", path);
 	if (st.st_rdev != makedev(1, 7))
 		errx(1, "%s has wrong device number", path);
 	make_path(path, sizeof(path), "block-device");
 	if (lstat(path, &st) == -1)
 		err(1, "lstat %s", path);
-	if (!S_ISBLK(st.st_mode))
+	if (! S_ISBLK(st.st_mode))
 		errx(1, "%s is not a block device", path);
 	if (st.st_rdev != makedev(2, 3))
 		errx(1, "%s has wrong device number", path);
 	make_path(path, sizeof(path), "unix-socket");
 	if (lstat(path, &st) == -1)
 		err(1, "lstat %s", path);
-	if (!S_ISSOCK(st.st_mode))
+	if (! S_ISSOCK(st.st_mode))
 		errx(1, "%s is not a socket", path);
 }
 
@@ -2120,7 +2120,7 @@ mutate_filesystem_tree (void)
 		err(1, "mkdir %s", path);
 	if (stat(path, &directory) == -1)
 		err(1, "stat %s", path);
-	if (!S_ISDIR(directory.st_mode) || directory.st_nlink != 2 ||
+	if (! S_ISDIR(directory.st_mode) || directory.st_nlink != 2 ||
 	    directory.st_size != (off_t)block_size ||
 	    (directory.st_mode & 0777) != 0700)
 		errx(1, "new directory metadata mismatch");
@@ -2210,7 +2210,7 @@ verify_final_tree (void)
 	make_path(path, sizeof(path), "a/dir-replace-target");
 	if (stat(path, &st) == -1)
 		err(1, "stat %s", path);
-	if (!S_ISDIR(st.st_mode) || (st.st_mode & 0777) != 0710)
+	if (! S_ISDIR(st.st_mode) || (st.st_mode & 0777) != 0710)
 		errx(1, "same-parent replacement lost source directory mode");
 	make_path(path, sizeof(path), "a/cross-replace-source");
 	check_absent(path);
@@ -2219,7 +2219,7 @@ verify_final_tree (void)
 	make_path(path, sizeof(path), "b/cross-replace-target");
 	if (stat(path, &st) == -1)
 		err(1, "stat %s", path);
-	if (!S_ISDIR(st.st_mode) || (st.st_mode & 0777) != 0751)
+	if (! S_ISDIR(st.st_mode) || (st.st_mode & 0777) != 0751)
 		errx(1, "cross-parent replacement lost source directory mode");
 	make_path(path, sizeof(path), "b/replaced");
 	if (stat(path, &first) == -1)
@@ -2342,7 +2342,7 @@ verify_allocation_probe (void)
 	make_path(path, sizeof(path), "allocation-probe");
 	if (stat(path, &st) == -1)
 		err(1, "stat %s", path);
-	if (!S_ISREG(st.st_mode) || st.st_size != (off_t)block_size + 31)
+	if (! S_ISREG(st.st_mode) || st.st_size != (off_t)block_size + 31)
 		errx(1, "allocation probe has wrong type or size");
 	fd = open(path, O_RDONLY);
 	if (fd == -1)
@@ -2388,9 +2388,9 @@ verify_bitmap_probe (int allocated)
 	make_path(path, sizeof(path), "bitmap-probe");
 	if (stat(path, &st) == -1)
 		err(1, "stat %s", path);
-	if (!S_ISREG(st.st_mode))
+	if (! S_ISREG(st.st_mode))
 		errx(1, "bitmap probe is not a regular file");
-	if (!allocated) {
+	if (! allocated) {
 		if (st.st_size != 0 || st.st_blocks != 0)
 			errx(1, "freed bitmap probe retains blocks");
 		return;
@@ -2515,7 +2515,7 @@ verify_inode_probe (void)
 	make_path(path, sizeof(path), "inode-probe");
 	if (stat(path, &st) == -1)
 		err(1, "stat %s", path);
-	if (!S_ISREG(st.st_mode) || st.st_size != 0 ||
+	if (! S_ISREG(st.st_mode) || st.st_size != 0 ||
 	    st.st_blocks != 0 || st.st_nlink != 1)
 		errx(1, "inode probe has wrong shape");
 }
@@ -2556,7 +2556,7 @@ reject_block_counter (void)
 		err(1, "open %s", path);
 	if (fstat(fd, &st) == -1)
 		err(1, "fstat %s", path);
-	if (!S_ISREG(st.st_mode) || st.st_size != 0 || st.st_blocks != 0)
+	if (! S_ISREG(st.st_mode) || st.st_size != 0 || st.st_blocks != 0)
 		errx(1, "counter block probe has wrong shape");
 	if (statfs(root, &before) == -1)
 		err(1, "statfs before rejected block allocation");
@@ -2645,7 +2645,7 @@ update_fsync_fixture (void)
 		err(1, "open %s", path);
 	if (fstat(fd, &st) == -1)
 		err(1, "fstat %s", path);
-	if (!S_ISREG(st.st_mode) || st.st_size != (off_t)length)
+	if (! S_ISREG(st.st_mode) || st.st_size != (off_t)length)
 		errx(1, "fsync fixture has wrong shape");
 	write_pattern_fd(fd, 0, length, FSYNC_UPDATE_SEED);
 	if (fsync(fd) == -1)
@@ -2686,7 +2686,7 @@ verify_fsync_fixture (void)
 		err(1, "open %s", path);
 	if (fstat(fd, &st) == -1)
 		err(1, "fstat %s", path);
-	if (!S_ISREG(st.st_mode) || st.st_size != (off_t)length)
+	if (! S_ISREG(st.st_mode) || st.st_size != (off_t)length)
 		errx(1, "remounted fsync fixture has wrong shape");
 	check_pattern_fd(fd, 0, length, FSYNC_UPDATE_SEED);
 	if (close(fd) == -1)
@@ -2727,7 +2727,7 @@ update_sync_fixture (int flags, unsigned int seed, int do_vfs_sync)
 		err(1, "open %s", path);
 	if (fstat(fd, &before) == -1)
 		err(1, "fstat %s", path);
-	if (!S_ISREG(before.st_mode) ||
+	if (! S_ISREG(before.st_mode) ||
 	    before.st_size != (off_t)length)
 		errx(1, "synchronous-write fixture has wrong shape");
 	write_pattern_fd(fd, 0, length, seed);
@@ -2783,7 +2783,7 @@ verify_sync_fixture (unsigned int seed)
 		err(1, "open %s", path);
 	if (fstat(fd, &st) == -1)
 		err(1, "fstat %s", path);
-	if (!S_ISREG(st.st_mode) || st.st_size != (off_t)length)
+	if (! S_ISREG(st.st_mode) || st.st_size != (off_t)length)
 		errx(1, "remounted synchronous-write fixture is invalid");
 	check_pattern_fd(fd, 0, length, seed);
 	if (close(fd) == -1)
@@ -2824,7 +2824,7 @@ update_remount_fixture (unsigned int seed, int do_fsync)
 		err(1, "open %s", path);
 	if (fstat(fd, &before) == -1)
 		err(1, "fstat %s", path);
-	if (!S_ISREG(before.st_mode) ||
+	if (! S_ISREG(before.st_mode) ||
 	    before.st_size != (off_t)length)
 		errx(1, "remount fixture has wrong shape");
 	write_pattern_fd(fd, 0, length, seed);
@@ -2854,12 +2854,12 @@ verify_remount_fixture (unsigned int seed, int readonly)
 		err(1, "open %s", path);
 	if (fstat(fd, &st) == -1)
 		err(1, "fstat %s", path);
-	if (!S_ISREG(st.st_mode) || st.st_size != (off_t)length)
+	if (! S_ISREG(st.st_mode) || st.st_size != (off_t)length)
 		errx(1, "remounted fixture has wrong shape");
 	check_pattern_fd(fd, 0, length, seed);
 	if (close(fd) == -1)
 		err(1, "close %s", path);
-	if (!readonly)
+	if (! readonly)
 		return;
 
 	errno = 0;

@@ -441,7 +441,7 @@ ext4fs_remount_writable (struct mount *mp, struct proc *p)
 	struct m_ext4fs *fs = ump->um_e4fs;
 	int cleanup_error, error;
 
-	if (!fs->m_read_only)
+	if (! fs->m_read_only)
 		return (0);
 	error = ext4fs_sbcheck(&fs->m_sble, 0);
 	if (error)
@@ -488,7 +488,7 @@ ext4fs_mount_update (struct mount *mp, struct proc *p)
 		return (EBUSY);
 	if (mp->mnt_flag & MNT_RELOAD)
 		error = EOPNOTSUPP;
-	else if (!fs->m_read_only &&
+	else if (! fs->m_read_only &&
 	    (mp->mnt_flag & MNT_RDONLY))
 		error = ext4fs_remount_readonly(mp, p);
 	else if (fs->m_read_only &&
@@ -514,12 +514,12 @@ ext4fs_mount (struct mount *mp, const char *path, void *data,
 	update = (mp->mnt_flag & MNT_UPDATE) != 0;
 	ump = update ? VFSTOUFS(mp) : NULL;
 	if (args == NULL) {
-		if (!update)
+		if (! update)
 			return (EINVAL);
 		return (ext4fs_mount_update(mp, p));
 	}
 	if (args->fspec == NULL) {
-		if (!update)
+		if (! update)
 			return (EINVAL);
 		if (mp->mnt_flag & MNT_RELOAD)
 			return (EOPNOTSUPP);
@@ -549,7 +549,7 @@ ext4fs_mount (struct mount *mp, const char *path, void *data,
 		error = ENXIO;
 		goto error_devvp;
 	}
-	if (!update) {
+	if (! update) {
 		error = ext4fs_mountfs(devvp, mp, p);
 	} else {
 		if (devvp != ump->um_devvp &&
@@ -762,7 +762,7 @@ ext4fs_mountfs (struct vnode *devvp, struct mount *mp, struct proc *p)
 			goto out;
 	}
 	if (ronly == 0 || (mfs->m_last_orphan == 0 &&
-	    !(mfs->m_feature_ro_compat &
+	    ! (mfs->m_feature_ro_compat &
 	    EXT4FS_FEATURE_RO_COMPAT_ORPHAN_PRESENT))) {
 		error = ext4fs_counters_check(mfs);
 		if (error)
@@ -885,7 +885,7 @@ ext4fs_sbcheck (struct ext4fs *sble, int ronly)
 	desc_size = letoh16(sble->sb_block_group_descriptor_size);
 	if (((incompat & EXT4FS_FEATURE_INCOMPAT_64BIT) &&
 	    desc_size != EXT4FS_BGD_SIZE_64) ||
-	    (!(incompat & EXT4FS_FEATURE_INCOMPAT_64BIT) &&
+	    (! (incompat & EXT4FS_FEATURE_INCOMPAT_64BIT) &&
 	    desc_size != 0 && desc_size != EXT4FS_BGD_SIZE_32)) {
 		printf("ext4fs: block group descriptor size is 0x%x\n",
 		    desc_size);
@@ -905,7 +905,7 @@ ext4fs_sbcheck (struct ext4fs *sble, int ronly)
 
 	if (tmp & EXT4FS_FEATURE_INCOMPAT_RECOVER) {
 		printf("ext4fs: file system needs journal recovery\n");
-		if (!(letoh32(sble->sb_feature_compat) &
+		if (! (letoh32(sble->sb_feature_compat) &
 		    EXT4FS_FEATURE_COMPAT_HAS_JOURNAL)) {
 			printf("ext4fs: RECOVER set but no journal\n");
 			return (EINVAL);
@@ -915,7 +915,7 @@ ext4fs_sbcheck (struct ext4fs *sble, int ronly)
 
 	tmp = letoh32(sble->sb_feature_ro_compat) &
 		~EXT4FS_FEATURE_RO_COMPAT_SUPPORTED;
-	if (!ronly && tmp) {
+	if (! ronly && tmp) {
 		printf("ext4fs: unsupported R/O compat features: 0x%x ",
 		    tmp);
 		PRINTF_FEATURES(tmp, ext4fs_feature_ro_compat);
@@ -923,10 +923,10 @@ ext4fs_sbcheck (struct ext4fs *sble, int ronly)
 		return (EROFS);
 	}
 
-	if (!ronly &&
-	    !(letoh32(sble->sb_feature_incompat) &
+	if (! ronly &&
+	    ! (letoh32(sble->sb_feature_incompat) &
 	      EXT4FS_FEATURE_INCOMPAT_RECOVER) &&
-	    !(letoh16(sble->sb_state) & EXT4FS_STATE_VALID)) {
+	    ! (letoh16(sble->sb_state) & EXT4FS_STATE_VALID)) {
 		printf("ext4fs: file system not clean, run e2fsck\n");
 		return (EROFS);
 	}
@@ -1887,7 +1887,7 @@ ext4fs_inode_bitmap_csum_verify (struct m_ext4fs *fs, u_int32_t group,
 {
 	u_int32_t calculated, provided;
 
-	if (!(fs->m_feature_ro_compat &
+	if (! (fs->m_feature_ro_compat &
 	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
 		return (0);
 	provided = letoh16(gd->bgd_inode_bitmap_checksum_lo);
@@ -2186,7 +2186,6 @@ ext4fs_sysctl (int *name, u_int namelen, void *oldp, size_t *oldlenp,
 	(void)newp;
 	(void)newlen;
 	(void)p;
-	printf("ext4fs_sysctl: not implemented\n");
 	return (EOPNOTSUPP);
 }
 
@@ -2215,7 +2214,7 @@ ext4fs_unmount (struct mount *mp, int mntflags, struct proc *p)
 		if (journal_error == 0 &&
 		    (error = ext4fs_journal_mark_clean(mp)) != 0)
 			return (error);
-	} else if (!mfs->m_read_only && mfs->m_fs_was_modified) {
+	} else if (! mfs->m_read_only && mfs->m_fs_was_modified) {
 		mfs->m_state = EXT4FS_STATE_VALID;
 		if ((error = ext4fs_sbwrite_direct(mp)) != 0)
 			return (error);

@@ -935,9 +935,9 @@ vnodes, commits and checkpoints the journal, refuses active writable or
 unlinked inodes, clears `RECOVER`, and marks the filesystem valid.  A
 read-only-to-writable remount revalidates writable feature and
 clean-state requirements, performs restartable orphan cleanup, checks
-counters,
-rebuilds the runtime journal, sets `RECOVER`, and durably marks the
-filesystem dirty.  Failed upgrades restore a usable read-only runtime.
+counters, rebuilds the runtime journal, sets `RECOVER`, and durably
+marks the filesystem dirty.  Failed upgrades restore a usable read-only
+runtime.
 
 The focused `run-regress-ext4fsops-remount` target covers classic orphan
 metadata with 1 KiB, 2 KiB, and 4 KiB blocks and orphan-file metadata
@@ -948,6 +948,33 @@ transition must retain `RECOVER`, leave the filesystem dirty and
 writable, and succeed after the final close retires the orphan.  On
 2026-09-28, the focused target and complete ext4fs suite passed against
 the rebuilt and booted production kernel.
+
+Journal abort and error-policy handling is implemented but still awaits
+its production-kernel runtime gate.  The first journal error is sticky,
+marks the ext4 filesystem erroneous, publishes the mount read-only, and
+wakes journal waiters.  Both `errors=continue` and `errors=remount-ro`
+force read-only operation because metadata updates cannot safely
+continue without the journal; `errors=panic` panics.  Invalid on-disk
+policies are rejected during mount.  Aborted teardown preserves
+`RECOVER` and any durable orphan roots for the next recovery.
+
+Only the first abort emits a diagnostic.  It names the mount, exact
+caller and synchronized commit stage, error, transaction sequence, and
+journal head, tail, and free-space state.  Normal commits do not log,
+and the unsupported ext4fs VFS sysctl now returns `EOPNOTSUPP` silently.
+The shared non-root journal-core regression verifies sticky errors and
+every exact diagnostic stage name.  The kernel corruption suite covers
+both non-panic policies at every filesystem block size.  A final kernel
+build, boot, and root regression run remain the completion gate after
+the commit-stage locking refinement.
+
+`errors=panic` must be tested only in a disposable vmd guest.  The guest
+will boot the host's installed production `/bsd`, attach a copied IABSD
+root disk and a panic-policy ext4 corruption fixture, and trigger the
+abort over SSH.  A root-only VMM regression must capture the serial
+console, require the exact ext4fs panic diagnostic, stop the guest, and
+verify that the fixture retained `RECOVER`.  It must have a watchdog and
+must never run as part of an ordinary non-root regression invocation.
 
 ## Phase 6: Crash-consistency test matrix
 

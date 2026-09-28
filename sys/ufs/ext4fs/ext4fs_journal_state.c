@@ -39,12 +39,48 @@ ext4fs_journal_state_abort (int *aborted, int *stored_error, int error)
 {
 	if (error == 0)
 		error = EIO;
-	if (!*aborted) {
+	if (! *aborted) {
 		*aborted = 1;
 		*stored_error = error;
 		return (1);
 	}
 	return (0);
+}
+
+const char *
+ext4fs_journal_stage_name (enum ext4fs_journal_stage stage)
+{
+	static const char *const
+	    names[EXT4FS_JOURNAL_STAGE_COUNT] = {
+		[EXT4FS_JOURNAL_STAGE_OUTSIDE] = "outside commit",
+		[EXT4FS_JOURNAL_STAGE_VALIDATE] =
+		    "transaction validation",
+		[EXT4FS_JOURNAL_STAGE_ORDERED_DATA] = "ordered data",
+		[EXT4FS_JOURNAL_STAGE_ORDERED_FLUSH] =
+		    "ordered-data flush",
+		[EXT4FS_JOURNAL_STAGE_METADATA] = "metadata log",
+		[EXT4FS_JOURNAL_STAGE_REVOKES] = "revoke log",
+		[EXT4FS_JOURNAL_STAGE_COMMIT_CLEAR] =
+		    "commit-slot clear",
+		[EXT4FS_JOURNAL_STAGE_PRECOMMIT_FLUSH] =
+		    "pre-commit flush",
+		[EXT4FS_JOURNAL_STAGE_EXPOSE] = "journal exposure",
+		[EXT4FS_JOURNAL_STAGE_EXPOSE_FLUSH] =
+		    "journal-exposure flush",
+		[EXT4FS_JOURNAL_STAGE_COMMIT] = "commit record",
+		[EXT4FS_JOURNAL_STAGE_COMMIT_FLUSH] = "commit flush",
+		[EXT4FS_JOURNAL_STAGE_CHECKPOINT] = "checkpoint",
+		[EXT4FS_JOURNAL_STAGE_CHECKPOINT_FLUSH] =
+		    "checkpoint flush",
+		[EXT4FS_JOURNAL_STAGE_CLEAR] = "journal clear",
+		[EXT4FS_JOURNAL_STAGE_CLEAR_FLUSH] =
+		    "journal-clear flush"
+	};
+
+	if (stage < 0 || stage >= EXT4FS_JOURNAL_STAGE_COUNT ||
+	    ! names[stage])
+		return ("unknown");
+	return (names[stage]);
 }
 
 int

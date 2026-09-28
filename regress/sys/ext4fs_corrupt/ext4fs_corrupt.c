@@ -440,7 +440,7 @@ mutate_extent (int fd, uint8_t *sb, const struct mutation *mutation,
 	    strcmp(mutation->name, "extent-index-out-of-range") == 0 ||
 	    strncmp(mutation->name, "extent-leaf-", 12) == 0 ||
 	    strcmp(mutation->name, "extent-block-bad-checksum") == 0;
-	if ((!external && depth != 0) || (external && depth != 1))
+	if ((! external && depth != 0) || (external && depth != 1))
 		errx(1, "source inode has unexpected extent depth");
 
 	write_inode = 0;
@@ -568,7 +568,7 @@ mutate_extent (int fd, uint8_t *sb, const struct mutation *mutation,
 
 	if (write_inode)
 		write_exact(fd, inode, inode_size, offset, "inode");
-	if (!write_inode && !write_leaf)
+	if (! write_inode && ! write_leaf)
 		errx(1, "extent mutation changed no metadata");
 	free(leaf);
 	free(inode);
@@ -681,7 +681,7 @@ main (int argc, char **argv)
 	mutation = find_mutation(argv[2]);
 	if (mutation == NULL)
 		errx(1, "unknown mutation: %s", argv[2]);
-	if ((!mutation->needs_inode && argc != 3) ||
+	if ((! mutation->needs_inode && argc != 3) ||
 	    (mutation->needs_inode && argc != 4))
 		errx(1, "%s %s an inode argument", mutation->name,
 		    mutation->needs_inode ? "requires" : "does not accept");
@@ -692,7 +692,7 @@ main (int argc, char **argv)
 		err(1, "%s", argv[1]);
 	if (fstat(fd, &st) == -1)
 		err(1, "fstat %s", argv[1]);
-	if (!S_ISREG(st.st_mode))
+	if (! S_ISREG(st.st_mode))
 		errx(1, "%s is not a regular file", argv[1]);
 	if (st.st_size < EXT4_SUPER_OFFSET + EXT4_SUPER_SIZE)
 		errx(1, "%s is too small", argv[1]);
@@ -704,7 +704,7 @@ main (int argc, char **argv)
 		errx(1, "%s has no filesystem blocks", argv[1]);
 	ro_compat = get32(sb, EXT4_SB_FEATURE_RO_COMPAT);
 	has_checksum = (ro_compat & EXT4_FEATURE_RO_METADATA_CSUM) != 0;
-	if (mutation->checksum == CHECKSUM_REQUIRED && !has_checksum)
+	if (mutation->checksum == CHECKSUM_REQUIRED && ! has_checksum)
 		errx(1, "%s requires metadata_csum", mutation->name);
 	if (mutation->checksum == CHECKSUM_FORBIDDEN && has_checksum)
 		errx(1, "%s requires metadata_csum to be disabled",

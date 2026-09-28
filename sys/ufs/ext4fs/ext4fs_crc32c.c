@@ -88,7 +88,7 @@ ext4fs_bgd_csum (struct m_ext4fs *fs,
 	size_t size;
 	struct ext4fs_block_group_descriptor tmp;
 
-	if (!(fs->m_feature_ro_compat &
+	if (! (fs->m_feature_ro_compat &
 	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
 		return 0;
 
@@ -122,7 +122,7 @@ ext4fs_bgd_csum_verify (struct m_ext4fs *fs,
 {
 	u_int16_t provided, calculated;
 
-	if (!(fs->m_feature_ro_compat &
+	if (! (fs->m_feature_ro_compat &
 	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
 		return 0;
 
@@ -165,7 +165,7 @@ ext4fs_inode_csum (struct m_ext4fs *fs,
 	u_int32_t ino_le;
 	struct ext4fs_dinode_256 tmp;
 
-	if (!(fs->m_feature_ro_compat &
+	if (! (fs->m_feature_ro_compat &
 	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
 		return 0;
 
@@ -197,7 +197,7 @@ ext4fs_inode_csum_verify (struct m_ext4fs *fs,
 {
 	u_int32_t provided, calculated;
 
-	if (!(fs->m_feature_ro_compat &
+	if (! (fs->m_feature_ro_compat &
 	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
 		return 0;
 
@@ -225,7 +225,7 @@ ext4fs_bitmap_csum (struct m_ext4fs *fs, u_int32_t group,
 {
 	u_int32_t crc, seed;
 
-	if (!(fs->m_feature_ro_compat &
+	if (! (fs->m_feature_ro_compat &
 	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
 		return 0;
 
@@ -249,7 +249,7 @@ ext4fs_dir_set_csum (struct m_ext4fs *fs, u_int32_t ino,
 	struct ext4fs_directory_tail *tail;
 	u_int32_t crc, seed, ino_le;
 
-	if (!(fs->m_feature_ro_compat &
+	if (! (fs->m_feature_ro_compat &
 	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
 		return;
 
@@ -281,7 +281,7 @@ ext4fs_dir_csum_verify (struct m_ext4fs *fs, u_int32_t ino,
 	const struct ext4fs_directory_tail *tail;
 	u_int32_t crc, ino_le, provided;
 
-	if (!(fs->m_feature_ro_compat &
+	if (! (fs->m_feature_ro_compat &
 	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
 		return (0);
 	tail = (const struct ext4fs_directory_tail *)
@@ -315,7 +315,7 @@ ext4fs_sb_csum_verify (struct ext4fs *sb)
 	u_int32_t provided, calculated;
 
 	/* Check if metadata checksums are enabled */
-	if (!(letoh32(sb->sb_feature_ro_compat) &
+	if (! (letoh32(sb->sb_feature_ro_compat) &
 	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
 		return 0;
 
@@ -348,7 +348,7 @@ ext4fs_extent_block_csum_set (struct m_ext4fs *fs, u_int32_t ino,
 	struct ext4fs_extent_header *eh;
 	size_t tail_offset;
 
-	if (!(fs->m_feature_ro_compat &
+	if (! (fs->m_feature_ro_compat &
 	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
 		return;
 
@@ -383,7 +383,7 @@ ext4fs_extent_block_csum_verify (struct m_ext4fs *fs, u_int32_t ino,
 	u_int32_t crc, ino_le, provided;
 	size_t tail_offset;
 
-	if (!(fs->m_feature_ro_compat &
+	if (! (fs->m_feature_ro_compat &
 	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
 		return (0);
 
