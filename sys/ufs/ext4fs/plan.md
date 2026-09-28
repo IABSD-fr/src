@@ -1023,8 +1023,18 @@ requires that image to retain `RECOVER`, extracts the internal journal
 read-only, and records validated `s_start`, sequence, head, and
 geometry.
 It also proves that durable-state inspection does not modify the image.
-Stopping at every individual flush boundary, the remaining workload
-matrix, wraparound, and Linux verification remain Phase 6 work.
+An explicit `vmctl flush-stop` control now arms one vioblk disk and
+waits for a selected successful backing-file flush.  The device pauses
+every vCPU after that flush is durable but before reporting completion
+to the guest.  The separate root-only VMM target checks all six flushes
+of an isolated rename transaction and requires the expected journal and
+old-or-new namespace state at each boundary.  The production `vmd` and
+`vmctl` builds and the non-root release-gate test pass; the VMM boundary
+target still needs to be run after installing both programs and
+restarting `vmd`.
+
+The remaining workload matrix, wraparound, and Linux verification remain
+Phase 6 work.
 
 Use filesystem images created by Linux tools and run IABSD in a VM.
 Inject an abrupt power loss after each commit phase and at journal

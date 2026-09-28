@@ -27,6 +27,8 @@ EXT4FS_CRASH_IMAGE_MB=${EXT4FS_CRASH_IMAGE_MB:-128}
 EXT4FS_CRASH_BLOCK_SIZES=${EXT4FS_CRASH_BLOCK_SIZES:-1024}
 EXT4FS_CRASH_STAGES=${EXT4FS_CRASH_STAGES:-"write fsync rename"}
 EXT4FS_CRASH_CUT_DELAY=${EXT4FS_CRASH_CUT_DELAY:-2.01}
+EXT4FS_CRASH_MODE=${EXT4FS_CRASH_MODE:-timed}
+EXT4FS_CRASH_FLUSH_COUNTS=${EXT4FS_CRASH_FLUSH_COUNTS:-"1 2 3 4 5 6"}
 EXT4FS_CRASH_SSH_KEY=${EXT4FS_CRASH_SSH_KEY:-}
 
 test_name=ext4fs-crash-vmm
@@ -99,6 +101,21 @@ for stage in $EXT4FS_CRASH_STAGES; do
 	*)	fail "unsupported crash stage: $stage" ;;
 	esac
 done
+case "$EXT4FS_CRASH_MODE" in
+timed|flush) ;;
+*)	fail "unsupported crash mode: $EXT4FS_CRASH_MODE" ;;
+esac
+if [ "$EXT4FS_CRASH_MODE" = flush ]; then
+	[ -n "$EXT4FS_CRASH_FLUSH_COUNTS" ] ||
+	    fail "flush-count list must not be empty"
+	for flush_count in $EXT4FS_CRASH_FLUSH_COUNTS; do
+		case "$flush_count" in
+		''|*[!0-9]*|0)	fail "invalid flush count: $flush_count" ;;
+		esac
+		[ "$flush_count" -le 6 ] ||
+		    fail "flush count exceeds rename transaction"
+	done
+fi
 
 work=$(mktemp -d "$EXT4FS_CRASH_VMM_DIR/\
 ext4fs_crash.XXXXXXXX")
@@ -111,6 +128,7 @@ vm_started=0
 vm_name=
 guest=
 ssh_pid=
+control_pid=
 serial=0
 
 cleanup()
@@ -121,6 +139,11 @@ cleanup()
 		kill "$ssh_pid" >/dev/null 2>&1 || :
 		wait "$ssh_pid" >/dev/null 2>&1 || :
 		ssh_pid=
+	fi
+	if [ -n "$control_pid" ]; then
+		kill "$control_pid" >/dev/null 2>&1 || :
+		wait "$control_pid" >/dev/null 2>&1 || :
+		control_pid=
 	fi
 	if [ "$vm_started" -eq 1 ]; then
 		"$TIMEOUT" -k 2 10 "$VMCTL" stop -fw "$vm_name" \
@@ -193,6 +216,12 @@ ssh_workload()
 	fi
 }
 
+flush_stop_control()
+{
+	exec "$TIMEOUT" -k 5 "$EXT4FS_CRASH_STEP_TIMEOUT" \
+	    "$VMCTL" flush-stop "$@"
+}
+
 copy_helper()
 {
 	if [ -n "$EXT4FS_CRASH_SSH_KEY" ]; then
@@ -257,9 +286,12 @@ start_guest()
 
 stop_guest()
 {
-	"$TIMEOUT" -k 2 10 "$VMCTL" stop -fw "$vm_name" \
-	    >"$work/stop-$serial.log" 2>&1 ||
-	    fail "could not force-stop guest"
+	stop_log=$work/stop-$serial.log
+	if ! "$TIMEOUT" -k 2 10 "$VMCTL" stop -fw "$vm_name" \
+	    >"$stop_log" 2>&1; then
+		cat "$stop_log" >&2
+		fail "could not force-stop guest"
+	fi
 	vm_started=0
 }
 
@@ -296,6 +328,69 @@ exec /tmp/ext4fs_crash workload $stage /mnt/ext4/crash"
 	"$SYNC"
 }
 
+run_flush_crash()
+{
+	image=$1
+	stage=$2
+	flush_count=$3
+	log=$4
+	control_log=$5
+	trigger="set -e
+mkdir -p /mnt/ext4
+mount_ext4fs /dev/sd1c /mnt/ext4
+exec /tmp/ext4fs_crash boundary $stage /mnt/ext4/crash"
+	ssh_workload "root@$guest" "$trigger" >"$log" 2>&1 &
+	ssh_pid=$!
+	wait_ticks=0
+	max_ticks=$((EXT4FS_CRASH_STEP_TIMEOUT * 10))
+	while ! grep -q "^READY $stage\$" "$log" 2>/dev/null; do
+		if ! kill -0 "$ssh_pid" 2>/dev/null; then
+			wait "$ssh_pid" || status=$?
+			ssh_pid=
+			cat "$log" >&2
+			fail "workload exited before its boundary marker"
+		fi
+		[ "$wait_ticks" -lt "$max_ticks" ] ||
+		    fail "workload boundary marker timed out"
+		sleep 0.1
+		wait_ticks=$((wait_ticks + 1))
+	done
+	flush_stop_control "$vm_name" 1 "$flush_count" \
+	    >"$control_log" 2>&1 &
+	control_pid=$!
+	wait_ticks=0
+	while ! grep -q 'armed vm .* disk 1 at flush' \
+	    "$control_log" 2>/dev/null; do
+		if ! kill -0 "$control_pid" 2>/dev/null; then
+			wait "$control_pid" || status=$?
+			control_pid=
+			cat "$control_log" >&2
+			fail "flush-stop control exited before arming"
+		fi
+		[ "$wait_ticks" -lt "$max_ticks" ] ||
+		    fail "flush-stop arm timed out"
+		sleep 0.1
+		wait_ticks=$((wait_ticks + 1))
+	done
+	ssh_step "root@$guest" touch /tmp/ext4fs_crash.go ||
+	    fail "could not release boundary workload"
+	if ! wait "$control_pid"; then
+		control_pid=
+		cat "$control_log" >&2
+		fail "flush-stop control failed"
+	fi
+	control_pid=
+	grep -q 'paused vm .* at disk 1 flush' "$control_log" || {
+		cat "$control_log" >&2
+		fail "flush-stop did not report a paused VM"
+	}
+	stop_guest
+	kill "$ssh_pid" >/dev/null 2>&1 || :
+	wait "$ssh_pid" >/dev/null 2>&1 || :
+	ssh_pid=
+	"$SYNC"
+}
+
 validate_guest()
 {
 	image=$1
@@ -323,6 +418,66 @@ umount /mnt/ext4"
 	"$SYNC"
 }
 
+preserve_durable()
+{
+	image=$1
+	case_dir=$2
+	durable=$case_dir/durable.img
+	mv "$image" "$durable"
+	durable_hash=$($SHA256 -q "$durable")
+	"$DUMPE2FS" -h "$durable" \
+	    >"$case_dir/durable-super.log" 2>&1 ||
+	    fail "dumpe2fs rejected durable image"
+	grep -q '^Filesystem features:.*needs_recovery' \
+	    "$case_dir/durable-super.log" ||
+	    fail "durable image does not require recovery"
+	journal=$case_dir/journal.bin
+	"$DEBUGFS" -R "dump <8> $journal" "$durable" \
+	    >"$case_dir/durable-journal-dump.log" 2>&1 ||
+	    fail "could not extract durable journal"
+	"$EXT4FS_CRASH" journal-state "$journal" \
+	    >"$case_dir/durable-journal.log" 2>&1 || {
+		cat "$case_dir/durable-journal.log" >&2
+		fail "could not classify durable journal"
+	}
+	durable_journal_state=$(awk -F'[ =]' \
+	    '/^journal=/ { print $2; exit }' \
+	    "$case_dir/durable-journal.log")
+	case "$durable_journal_state" in
+	clean|recover) ;;
+	*)	fail "durable journal state was not reported" ;;
+	esac
+	[ "$durable_hash" = "$($SHA256 -q "$durable")" ] ||
+	    fail "durable-state inspection modified image"
+	cp "$durable" "$image"
+}
+
+recover_case()
+{
+	image=$1
+	case_dir=$2
+	validate_guest "$image" '' "$case_dir/recovery.log"
+	hash_before=$($SHA256 -q "$image")
+	validate_guest "$image" ro "$case_dir/idempotence.log"
+	hash_after=$($SHA256 -q "$image")
+	[ "$hash_before" = "$hash_after" ] ||
+	    fail "second read-only mount modified the image"
+	cmp -s "$case_dir/recovery.log" \
+	    "$case_dir/idempotence.log" ||
+	    fail "second mount changed the recovered state"
+	"$E2FSCK" -fn "$image" >"$case_dir/e2fsck.log" 2>&1 ||
+	    fail "e2fsck rejected the recovered image"
+	"$DUMPE2FS" -h "$image" >"$case_dir/dumpe2fs.log" 2>&1 ||
+	    fail "dumpe2fs rejected the recovered image"
+	if grep -q '^Filesystem features:.*needs_recovery' \
+	    "$case_dir/dumpe2fs.log"; then
+		fail "recovered image retained RECOVER"
+	fi
+	grep -q '^Filesystem state:.*clean' \
+	    "$case_dir/dumpe2fs.log" ||
+	    fail "recovered image is not clean"
+}
+
 "$SYSCTL" -n kern.version >"$work/host-version.log"
 old_data=$work/old.data
 "$EXT4FS_CRASH" pattern-old "$old_data"
@@ -343,65 +498,65 @@ for block_size in $EXT4FS_CRASH_BLOCK_SIZES; do
 	    >"$work/e2fsck-base-$block_size.log" 2>&1 ||
 	    fail "e2fsck rejected baseline image"
 
-	for stage in $EXT4FS_CRASH_STAGES; do
-		test_name="$stage crash, $block_size-byte blocks"
+	if [ "$EXT4FS_CRASH_MODE" = timed ]; then
+		for stage in $EXT4FS_CRASH_STAGES; do
+			test_name="$stage crash, $block_size-byte blocks"
+			printf '%-64s' "vmm: $test_name"
+			case_dir=$work/$stage-$block_size
+			mkdir "$case_dir"
+			image=$case_dir/ext4.img
+			cp "$base" "$image"
+
+			start_guest "$image"
+			run_crash "$image" "$stage" \
+			    "$case_dir/workload.log"
+			preserve_durable "$image" "$case_dir"
+			recover_case "$image" "$case_dir"
+			echo ' ok'
+		done
+		continue
+	fi
+
+	for flush_count in $EXT4FS_CRASH_FLUSH_COUNTS; do
+		test_name="rename flush $flush_count, "
+		test_name="$test_name$block_size-byte blocks"
 		printf '%-64s' "vmm: $test_name"
-		case_dir=$work/$stage-$block_size
+		case_dir=$work/flush-$flush_count-$block_size
 		mkdir "$case_dir"
 		image=$case_dir/ext4.img
 		cp "$base" "$image"
 
 		start_guest "$image"
-		run_crash "$image" "$stage" \
-		    "$case_dir/workload.log"
-		durable=$case_dir/durable.img
-		mv "$image" "$durable"
-		durable_hash=$($SHA256 -q "$durable")
-		"$DUMPE2FS" -h "$durable" \
-		    >"$case_dir/durable-super.log" 2>&1 ||
-		    fail "dumpe2fs rejected durable image"
-		grep -q '^Filesystem features:.*needs_recovery' \
-		    "$case_dir/durable-super.log" ||
-		    fail "durable image does not require recovery"
-		journal=$case_dir/journal.bin
-		"$DEBUGFS" -R "dump <8> $journal" "$durable" \
-		    >"$case_dir/durable-journal-dump.log" 2>&1 ||
-		    fail "could not extract durable journal"
-		"$EXT4FS_CRASH" journal-state "$journal" \
-		    >"$case_dir/durable-journal.log" 2>&1 || {
-			cat "$case_dir/durable-journal.log" >&2
-			fail "could not classify durable journal"
+		run_flush_crash "$image" rename "$flush_count" \
+		    "$case_dir/workload.log" \
+		    "$case_dir/flush-stop.log"
+		preserve_durable "$image" "$case_dir"
+		case "$flush_count" in
+		1|2)
+			expected_journal=clean
+			expected_state='state=old next=full'
+			;;
+		3)
+			expected_journal=recover
+			expected_state='state=old next=full'
+			;;
+		4|5)
+			expected_journal=recover
+			expected_state='state=new next=absent'
+			;;
+		6)
+			expected_journal=clean
+			expected_state='state=new next=absent'
+			;;
+		esac
+		[ "$durable_journal_state" = "$expected_journal" ] ||
+		    fail "flush $flush_count journal state mismatch: \
+$durable_journal_state != $expected_journal"
+		recover_case "$image" "$case_dir"
+		grep -qx "$expected_state" "$case_dir/recovery.log" || {
+			cat "$case_dir/recovery.log" >&2
+			fail "flush $flush_count recovered wrong state"
 		}
-		grep -q '^journal=' \
-		    "$case_dir/durable-journal.log" ||
-		    fail "durable journal state was not reported"
-		[ "$durable_hash" = "$($SHA256 -q "$durable")" ] ||
-		    fail "durable-state inspection modified image"
-		cp "$durable" "$image"
-		validate_guest "$image" '' \
-		    "$case_dir/recovery.log"
-		hash_before=$("$SHA256" -q "$image")
-		validate_guest "$image" ro \
-		    "$case_dir/idempotence.log"
-		hash_after=$("$SHA256" -q "$image")
-		[ "$hash_before" = "$hash_after" ] ||
-		    fail "second read-only mount modified the image"
-		cmp -s "$case_dir/recovery.log" \
-		    "$case_dir/idempotence.log" ||
-		    fail "second mount changed the recovered state"
-		"$E2FSCK" -fn "$image" \
-		    >"$case_dir/e2fsck.log" 2>&1 ||
-		    fail "e2fsck rejected the recovered image"
-		"$DUMPE2FS" -h "$image" \
-		    >"$case_dir/dumpe2fs.log" 2>&1 ||
-		    fail "dumpe2fs rejected the recovered image"
-		if grep -q '^Filesystem features:.*needs_recovery' \
-		    "$case_dir/dumpe2fs.log"; then
-			fail "recovered image retained RECOVER"
-		fi
-		grep -q '^Filesystem state:.*clean' \
-		    "$case_dir/dumpe2fs.log" ||
-		    fail "recovered image is not clean"
 		echo ' ok'
 	done
 done

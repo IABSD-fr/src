@@ -36,6 +36,8 @@
 #define OLD_SEED	0x35U
 #define NEW_SEED	0xc9U
 #define ARM_USEC	2000000
+#define GATE_USEC	10000
+#define GATE_PATH	"/tmp/ext4fs_crash.go"
 
 #define JBD2_MAGIC		UINT32_C(0xc03b3998)
 #define JBD2_SUPERBLOCK_V2	4
@@ -58,11 +60,12 @@ static int	open_output (const char *, int);
 static void	write_pattern (int, off_t, unsigned int);
 static void	check_pattern (const char *, off_t, unsigned int);
 static void	arm_cut (const char *);
+static void	arm_boundary (const char *);
 static void	make_old_pattern (const char *);
 static uint32_t	load_be32 (const unsigned char *, size_t);
 static void	store_be32 (unsigned char *, size_t, uint32_t);
 static void	classify_journal (const char *);
-static void	run_workload (const char *, const char *);
+static void	run_workload (const char *, const char *, int);
 static void	verify_workload (const char *);
 static void	selftest (void);
 
@@ -190,6 +193,23 @@ arm_cut (const char *stage)
 }
 
 static void
+arm_boundary (const char *stage)
+{
+	if (unlink(GATE_PATH) == -1 && errno != ENOENT)
+		err(1, "unlink %s", GATE_PATH);
+	if (printf("READY %s\n", stage) < 0 || fflush(stdout) == EOF)
+		err(1, "publish boundary marker");
+	while (access(GATE_PATH, F_OK) == -1) {
+		if (errno != ENOENT)
+			err(1, "access %s", GATE_PATH);
+		if (usleep(GATE_USEC) == -1 && errno != EINTR)
+			err(1, "boundary wait");
+	}
+	if (unlink(GATE_PATH) == -1)
+		err(1, "unlink %s", GATE_PATH);
+}
+
+static void
 make_old_pattern (const char *path)
 {
 	int fd;
@@ -273,7 +293,7 @@ classify_journal (const char *path)
 }
 
 static void
-run_workload (const char *stage, const char *root)
+run_workload (const char *stage, const char *root, int boundary)
 {
 	char current[PATH_MAX], next[PATH_MAX];
 	int fd;
@@ -282,11 +302,17 @@ run_workload (const char *stage, const char *root)
 	make_path(next, sizeof(next), root, "next");
 	fd = open_output(next, 1);
 	if (strcmp(stage, "write") == 0) {
-		arm_cut(stage);
+		if (boundary)
+			arm_boundary(stage);
+		else
+			arm_cut(stage);
 		write_pattern(fd, NEW_BYTES, NEW_SEED);
 	} else if (strcmp(stage, "fsync") == 0) {
 		write_pattern(fd, NEW_BYTES, NEW_SEED);
-		arm_cut(stage);
+		if (boundary)
+			arm_boundary(stage);
+		else
+			arm_cut(stage);
 		if (fsync(fd) == -1)
 			err(1, "fsync %s", next);
 	} else if (strcmp(stage, "rename") == 0) {
@@ -296,7 +322,10 @@ run_workload (const char *stage, const char *root)
 		if (close(fd) == -1)
 			err(1, "close %s", next);
 		fd = -1;
-		arm_cut(stage);
+		if (boundary)
+			arm_boundary(stage);
+		else
+			arm_cut(stage);
 		if (rename(next, current) == -1)
 			err(1, "rename %s", next);
 	} else
@@ -347,8 +376,11 @@ verify_workload (const char *root)
 		if (strcmp(state, "new") == 0)
 			errx(1, "new current and next both exist");
 		check_pattern(next, NEW_BYTES, NEW_SEED);
-		printf("state=old next=%lld\n",
-		    (long long)next_st.st_size);
+		if (next_st.st_size == NEW_BYTES)
+			printf("state=old next=full\n");
+		else
+			printf("state=old next=%lld\n",
+			    (long long)next_st.st_size);
 	}
 	if (fflush(stdout) == EOF)
 		err(1, "publish verification state");
@@ -386,6 +418,7 @@ selftest (void)
 		err(1, "fsync %s", next);
 	if (close(fd) == -1)
 		err(1, "close %s", next);
+	verify_workload(root);
 	if (rename(next, current) == -1)
 		err(1, "rename %s", next);
 	verify_workload(root);
@@ -437,12 +470,15 @@ main (int argc, char **argv)
 	else if (argc == 3 && strcmp(argv[1], "journal-state") == 0)
 		classify_journal(argv[2]);
 	else if (argc == 4 && strcmp(argv[1], "workload") == 0)
-		run_workload(argv[2], argv[3]);
+		run_workload(argv[2], argv[3], 0);
+	else if (argc == 4 && strcmp(argv[1], "boundary") == 0)
+		run_workload(argv[2], argv[3], 1);
 	else if (argc == 3 && strcmp(argv[1], "verify") == 0)
 		verify_workload(argv[2]);
 	else
 		errx(1, "usage: ext4fs_crash pattern-old path | "
-		    "journal-state path | workload stage root | "
+		    "journal-state path | workload stage root | boundary "
+		    "stage root | "
 		    "verify root");
 	return (0);
 }

@@ -14,6 +14,7 @@ EXT4FS_CRASH_IMAGE_MB?=	128
 EXT4FS_CRASH_BLOCK_SIZES?=	1024
 EXT4FS_CRASH_STAGES?=	write fsync rename
 EXT4FS_CRASH_CUT_DELAY?=	2.01
+EXT4FS_CRASH_FLUSH_COUNTS?=	1 2 3 4 5 6
 EXT4FS_CRASH_SSH_KEY?=
 
 # Explicit only: this target force-stops disposable vmd guests.
@@ -29,6 +30,22 @@ run-regress-ext4fs-crash-vmm: ${PROG}
 	    EXT4FS_CRASH_STAGES='${EXT4FS_CRASH_STAGES}' \
 	    EXT4FS_CRASH_CUT_DELAY='${EXT4FS_CRASH_CUT_DELAY}' \
 	    EXT4FS_CRASH_SSH_KEY='${EXT4FS_CRASH_SSH_KEY}' \
+	    EXT4FS_CRASH_MODE='timed' \
+	    sh ${.CURDIR}/crash-vmm.sh
+
+# Explicit only: stop at each durable rename-transaction boundary.
+run-regress-ext4fs-crash-flush-vmm: ${PROG}
+	env EXT4FS_CRASH='${.OBJDIR}/${PROG}' \
+	    EXT4FS_CRASH_VMM_BASE='${EXT4FS_CRASH_VMM_BASE}' \
+	    EXT4FS_CRASH_VMM_KERNEL='${EXT4FS_CRASH_VMM_KERNEL}' \
+	    EXT4FS_CRASH_VMM_DIR='${EXT4FS_CRASH_VMM_DIR}' \
+	    EXT4FS_CRASH_BOOT_TIMEOUT='${EXT4FS_CRASH_BOOT_TIMEOUT}' \
+	    EXT4FS_CRASH_STEP_TIMEOUT='${EXT4FS_CRASH_STEP_TIMEOUT}' \
+	    EXT4FS_CRASH_IMAGE_MB='${EXT4FS_CRASH_IMAGE_MB}' \
+	    EXT4FS_CRASH_BLOCK_SIZES='${EXT4FS_CRASH_BLOCK_SIZES}' \
+	    EXT4FS_CRASH_FLUSH_COUNTS='${EXT4FS_CRASH_FLUSH_COUNTS}' \
+	    EXT4FS_CRASH_SSH_KEY='${EXT4FS_CRASH_SSH_KEY}' \
+	    EXT4FS_CRASH_MODE='flush' \
 	    sh ${.CURDIR}/crash-vmm.sh
 
 .include <bsd.regress.mk>
