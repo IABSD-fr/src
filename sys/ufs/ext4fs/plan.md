@@ -1029,9 +1029,15 @@ every vCPU after that flush is durable but before reporting completion
 to the guest.  The separate root-only VMM target checks all six flushes
 of an isolated rename transaction and requires the expected journal and
 old-or-new namespace state at each boundary.  The production `vmd` and
-`vmctl` builds and the non-root release-gate test pass; the VMM boundary
-target still needs to be run after installing both programs and
-restarting `vmd`.
+`vmctl` builds and the non-root release-gate test pass.
+
+The first production run exposed a forced-stop deadlock after the VM
+had paused at a flush boundary: `VMM_IOC_TERM` could not wake vCPUs
+parked on vmd's userland pause condition.  Forced termination now
+notifies the VM process and wakes both normal and paused vCPU waiters.
+On 2026-09-28, the focused first-boundary test and the complete
+six-boundary matrix passed with the installed production `vmd` and
+`vmctl` after restarting `vmd`.
 
 The remaining workload matrix, wraparound, and Linux verification remain
 Phase 6 work.
