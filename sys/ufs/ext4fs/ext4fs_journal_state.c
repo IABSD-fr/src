@@ -34,7 +34,7 @@ ext4fs_journal_state_admission (int active, int aborted, int error,
 	return (0);
 }
 
-void
+int
 ext4fs_journal_state_abort (int *aborted, int *stored_error, int error)
 {
 	if (error == 0)
@@ -42,7 +42,9 @@ ext4fs_journal_state_abort (int *aborted, int *stored_error, int error)
 	if (!*aborted) {
 		*aborted = 1;
 		*stored_error = error;
+		return (1);
 	}
+	return (0);
 }
 
 int

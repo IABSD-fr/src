@@ -1,17 +1,19 @@
 /*
  * Copyright (c) 2026 kmx.io.
  *
- * Permission to use, copy, modify, and distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
+ * Permission to use, copy, modify, and distribute this software for
+ * any purpose with or without fee is hereby granted, provided that
+ * the above copyright notice and this permission notice appear in all
+ * copies.
  *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+ * WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE
+ * AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL
+ * DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA
+ * OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+ * TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+ * PERFORMANCE OF THIS SOFTWARE.
  */
 
 #include <sys/types.h>
@@ -47,9 +49,11 @@ test_admission (void)
 
 	aborted = 0;
 	error = 0;
-	ext4fs_journal_state_abort(&aborted, &error, 0);
+	check(ext4fs_journal_state_abort(&aborted, &error, 0) == 1,
+	    "initial abort transition");
 	check(aborted == 1 && error == EIO, "initial sticky abort");
-	ext4fs_journal_state_abort(&aborted, &error, ENOSPC);
+	check(ext4fs_journal_state_abort(&aborted, &error, ENOSPC) == 0,
+	    "repeated abort transition");
 	check(aborted == 1 && error == EIO, "first abort is sticky");
 }
 
@@ -94,20 +98,23 @@ test_reservations (void)
 	check(ext4fs_journal_state_consume(&handle, &reserved, &used) == 0 &&
 	    handle == 0 && reserved == 0 && used == 2,
 	    "consume final credit");
-	check(ext4fs_journal_state_consume(&handle, &reserved, &used) == ENOSPC &&
+	check(ext4fs_journal_state_consume(&handle, &reserved,
+	    &used) == ENOSPC &&
 	    handle == 0 && reserved == 0 && used == 2,
 	    "credit exhaustion is non-mutating");
 
 	handle = 1;
 	reserved = 0;
 	used = 7;
-	check(ext4fs_journal_state_consume(&handle, &reserved, &used) == EINVAL &&
+	check(ext4fs_journal_state_consume(&handle, &reserved,
+	    &used) == EINVAL &&
 	    handle == 1 && reserved == 0 && used == 7,
 	    "inconsistent reservation is rejected");
 	handle = 1;
 	reserved = 1;
 	used = 0xffffffffU;
-	check(ext4fs_journal_state_consume(&handle, &reserved, &used) == EINVAL &&
+	check(ext4fs_journal_state_consume(&handle, &reserved,
+	    &used) == EINVAL &&
 	    handle == 1 && reserved == 1 && used == 0xffffffffU,
 	    "used-credit overflow is rejected");
 
@@ -130,7 +137,8 @@ test_sequences (void)
 	sequence = 0xffffffffU;
 	check(ext4fs_journal_state_sequence(sequence) == 0xffffffffU,
 	    "sequence is only observed at begin");
-	check(sequence == 0xffffffffU, "empty handle does not consume sequence");
+	check(sequence == 0xffffffffU,
+	    "empty handle does not consume sequence");
 	ext4fs_journal_state_sequence_advance(&sequence);
 	check(sequence == 0, "transaction sequence wraparound");
 }

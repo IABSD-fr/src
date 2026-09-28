@@ -242,6 +242,7 @@ int	ext4fs_journal_replay (struct vnode *, struct m_ext4fs *,
 int	ext4fs_journal_init (struct mount *);
 void	ext4fs_journal_destroy (struct mount *);
 void	ext4fs_journal_abort (struct mount *, int);
+int	ext4fs_journal_error (struct mount *);
 
 /*
  * A buffer passed to get_write_access() must be B_BUSY.  On success,

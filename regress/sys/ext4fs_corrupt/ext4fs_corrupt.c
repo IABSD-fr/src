@@ -1,17 +1,19 @@
 /*
  * Copyright (c) 2026 kmx.io.
  *
- * Permission to use, copy, modify, and distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
+ * Permission to use, copy, modify, and distribute this software for
+ * any purpose with or without fee is hereby granted, provided that
+ * the above copyright notice and this permission notice appear in all
+ * copies.
  *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+ * WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE
+ * AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL
+ * DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA
+ * OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+ * TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+ * PERFORMANCE OF THIS SOFTWARE.
  */
 
 #include <sys/types.h>
@@ -36,6 +38,7 @@
 #define EXT4_SB_BLOCKS_PER_GROUP		0x020
 #define EXT4_SB_INODES_PER_GROUP		0x028
 #define EXT4_SB_MAGIC			0x038
+#define EXT4_SB_ERRORS			0x03c
 #define EXT4_SB_FIRST_INO		0x054
 #define EXT4_SB_INODE_SIZE		0x058
 #define EXT4_SB_FEATURE_COMPAT		0x05c
@@ -45,9 +48,16 @@
 #define EXT4_SB_BLOCKS_COUNT_HI		0x150
 #define EXT4_SB_CHECKSUM			0x3fc
 
+#define EXT4_BG_BLOCK_BITMAP_LO		0x000
 #define EXT4_BG_INODE_TABLE_LO		0x008
+#define EXT4_BG_FREE_INODES_LO		0x00e
+#define EXT4_BG_FLAGS			0x012
 #define EXT4_BG_CHECKSUM		0x01e
+#define EXT4_BG_BLOCK_BITMAP_HI		0x020
 #define EXT4_BG_INODE_TABLE_HI		0x028
+#define EXT4_BG_FREE_INODES_HI		0x02e
+
+#define EXT4_BG_BLOCK_UNINIT		0x0002
 
 #define EXT4_INODE_MODE			0x000
 #define EXT4_INODE_FLAGS		0x020
@@ -92,9 +102,11 @@ struct mutation {
 static const struct mutation mutations[] = {
 	{ "bad-superblock-checksum", CHECKSUM_REQUIRED, 0 },
 	{ "bad-group-descriptor-checksum", CHECKSUM_REQUIRED, 0 },
+	{ "runtime-block-bitmap-checksum", CHECKSUM_REQUIRED, 0 },
 	{ "block-size-too-large", CHECKSUM_FORBIDDEN, 0 },
 	{ "zero-blocks-per-group", CHECKSUM_FORBIDDEN, 0 },
 	{ "zero-inodes-per-group", CHECKSUM_FORBIDDEN, 0 },
+	{ "invalid-error-policy", CHECKSUM_FORBIDDEN, 0 },
 	{ "invalid-inode-size", CHECKSUM_FORBIDDEN, 0 },
 	{ "invalid-first-inode", CHECKSUM_FORBIDDEN, 0 },
 	{ "invalid-descriptor-size", CHECKSUM_FORBIDDEN, 0 },
@@ -118,7 +130,8 @@ static const struct mutation mutations[] = {
 };
 
 static void	read_exact (int, void *, size_t, off_t, const char *);
-static void	write_exact (int, const void *, size_t, off_t, const char *);
+static void	write_exact (int, const void *, size_t, off_t,
+		    const char *);
 static uint16_t	get16 (const uint8_t *, size_t);
 static uint32_t	get32 (const uint8_t *, size_t);
 static void	put16 (uint8_t *, size_t, uint16_t);
@@ -129,13 +142,15 @@ static uint32_t	filesystem_block_size (const uint8_t *);
 static uint64_t	filesystem_blocks (const uint8_t *);
 static off_t	inode_offset (int, const uint8_t *, uint32_t, off_t,
 		    uint32_t *);
+static void	mutate_block_bitmap (int, const uint8_t *, off_t);
 static void	mutate_extent (int, uint8_t *, const struct mutation *,
 		    uint32_t, off_t);
 static void	mutate (int, uint8_t *, const struct mutation *, uint32_t,
 		    off_t);
 
 static void
-read_exact (int fd, void *buf, size_t len, off_t offset, const char *what)
+read_exact (int fd, void *buf, size_t len, off_t offset,
+    const char *what)
 {
 	uint8_t *p;
 	ssize_t n;
@@ -307,6 +322,88 @@ inode_offset (int fd, const uint8_t *sb, uint32_t ino, off_t image_size,
 }
 
 static void
+mutate_block_bitmap (int fd, const uint8_t *sb, off_t image_size)
+{
+	uint8_t descriptor[64], value;
+	uint64_t bitmap, blocks, descriptor_block;
+	uint64_t descriptor_offset, first, groups, remaining;
+	uint64_t bitmap_offset;
+	uint32_t block_size, blocks_per_group, descriptor_size;
+	uint32_t best_free, best_group, free_inodes, group, per_block;
+	uint16_t best_flags;
+
+	block_size = filesystem_block_size(sb);
+	blocks = filesystem_blocks(sb);
+	first = get32(sb, EXT4_SB_FIRST_DATA_BLOCK);
+	blocks_per_group = get32(sb, EXT4_SB_BLOCKS_PER_GROUP);
+	if (blocks <= first || blocks_per_group == 0)
+		errx(1, "invalid block-group geometry");
+	remaining = blocks - first;
+	groups = remaining / blocks_per_group;
+	if (remaining % blocks_per_group != 0)
+		groups++;
+	if (groups == 0 || groups > UINT32_MAX)
+		errx(1, "unsupported block-group count");
+
+	descriptor_size = 32;
+	if (get32(sb, EXT4_SB_FEATURE_INCOMPAT) &
+	    EXT4_FEATURE_INCOMPAT_64BIT)
+		descriptor_size = get16(sb, EXT4_SB_DESC_SIZE);
+	if (descriptor_size != 32 && descriptor_size != 64)
+		errx(1, "unsupported group descriptor size");
+	per_block = block_size / descriptor_size;
+	if (per_block == 0)
+		errx(1, "group descriptor does not fit in a block");
+
+	best_free = 0;
+	best_group = 0;
+	best_flags = 0;
+	bitmap = 0;
+	for (group = 0; group < groups; group++) {
+		descriptor_block = first + 1 + group / per_block;
+		descriptor_offset = descriptor_block * block_size +
+		    (group % per_block) * descriptor_size;
+		if (descriptor_offset > (uint64_t)image_size ||
+		    descriptor_size >
+		    (uint64_t)image_size - descriptor_offset)
+			errx(1, "group descriptor lies outside image");
+		read_exact(fd, descriptor, descriptor_size,
+		    (off_t)descriptor_offset, "group descriptor");
+		free_inodes = get16(descriptor,
+		    EXT4_BG_FREE_INODES_LO);
+		if (descriptor_size == 64)
+			free_inodes |= (uint32_t)get16(descriptor,
+			    EXT4_BG_FREE_INODES_HI) << 16;
+		if (free_inodes <= best_free)
+			continue;
+		best_free = free_inodes;
+		best_group = group;
+		best_flags = get16(descriptor, EXT4_BG_FLAGS);
+		bitmap = get32(descriptor, EXT4_BG_BLOCK_BITMAP_LO);
+		if (descriptor_size == 64)
+			bitmap |= (uint64_t)get32(descriptor,
+			    EXT4_BG_BLOCK_BITMAP_HI) << 32;
+	}
+	if (best_free == 0)
+		errx(1, "filesystem has no free inode group");
+	if (best_flags & EXT4_BG_BLOCK_UNINIT)
+		errx(1, "selected group %u block bitmap is uninitialized",
+		    best_group);
+	if (bitmap >= blocks || bitmap > INT64_MAX / block_size)
+		errx(1, "group %u block bitmap is out of range",
+		    best_group);
+	bitmap_offset = bitmap * block_size;
+	if (bitmap_offset >= (uint64_t)image_size)
+		errx(1, "group %u block bitmap lies outside image",
+		    best_group);
+	read_exact(fd, &value, sizeof(value), (off_t)bitmap_offset,
+	    "block bitmap");
+	value ^= 0x01;
+	write_exact(fd, &value, sizeof(value), (off_t)bitmap_offset,
+	    "block bitmap");
+}
+
+static void
 mutate_extent (int fd, uint8_t *sb, const struct mutation *mutation,
     uint32_t ino, off_t image_size)
 {
@@ -338,7 +435,8 @@ mutate_extent (int fd, uint8_t *sb, const struct mutation *mutation,
 	if (max != 4 || entries == 0 || entries > max)
 		errx(1, "source inode has an unexpected extent root");
 
-	external = strcmp(mutation->name, "extent-root-depth-too-large") == 0 ||
+	external = strcmp(mutation->name,
+	    "extent-root-depth-too-large") == 0 ||
 	    strcmp(mutation->name, "extent-index-out-of-range") == 0 ||
 	    strncmp(mutation->name, "extent-leaf-", 12) == 0 ||
 	    strcmp(mutation->name, "extent-block-bad-checksum") == 0;
@@ -477,8 +575,8 @@ mutate_extent (int fd, uint8_t *sb, const struct mutation *mutation,
 }
 
 static void
-mutate (int fd, uint8_t *sb, const struct mutation *mutation, uint32_t ino,
-    off_t image_size)
+mutate (int fd, uint8_t *sb, const struct mutation *mutation,
+    uint32_t ino, off_t image_size)
 {
 	uint64_t descriptor_offset;
 	uint32_t block_size, compat, incompat, log_block_size;
@@ -486,6 +584,11 @@ mutate (int fd, uint8_t *sb, const struct mutation *mutation, uint32_t ino,
 
 	if (mutation->needs_inode) {
 		mutate_extent(fd, sb, mutation, ino, image_size);
+		return;
+	}
+	if (strcmp(mutation->name,
+	    "runtime-block-bitmap-checksum") == 0) {
+		mutate_block_bitmap(fd, sb, image_size);
 		return;
 	}
 	if (strcmp(mutation->name, "bad-superblock-checksum") == 0) {
@@ -520,6 +623,11 @@ mutate (int fd, uint8_t *sb, const struct mutation *mutation, uint32_t ino,
 		if (get32(sb, EXT4_SB_INODES_PER_GROUP) == 0)
 			errx(1, "source already has zero inodes per group");
 		put32(sb, EXT4_SB_INODES_PER_GROUP, 0);
+	} else if (strcmp(mutation->name, "invalid-error-policy") == 0) {
+		if (get16(sb, EXT4_SB_ERRORS) < 1 ||
+		    get16(sb, EXT4_SB_ERRORS) > 3)
+			errx(1, "source already has invalid error policy");
+		put16(sb, EXT4_SB_ERRORS, 0);
 	} else if (strcmp(mutation->name, "invalid-inode-size") == 0) {
 		if (get16(sb, EXT4_SB_INODE_SIZE) != 256)
 			errx(1, "source does not have 256-byte inodes");

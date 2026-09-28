@@ -20,7 +20,7 @@
 #define _UFS_EXT4FS_EXT4FS_JOURNAL_STATE_H_
 
 int	ext4fs_journal_state_admission (int, int, int, int);
-void	ext4fs_journal_state_abort (int *, int *, int);
+int	ext4fs_journal_state_abort (int *, int *, int);
 int	ext4fs_journal_state_reserve (u_int32_t, u_int32_t,
     u_int32_t *, u_int32_t);
 int	ext4fs_journal_state_consume (u_int32_t *, u_int32_t *,

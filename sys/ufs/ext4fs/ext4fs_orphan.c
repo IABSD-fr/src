@@ -392,6 +392,24 @@ ext4fs_orphan_pending (struct mount *mp)
 	return (pending);
 }
 
+void
+ext4fs_orphan_runtime_discard (struct mount *mp)
+{
+	struct m_ext4fs *fs = VFSTOUFS(mp)->um_e4fs;
+	struct ext4fs_runtime_orphan *orphan, *next;
+
+	rw_enter_write(&fs->m_runtime_orphan_lock);
+	orphan = fs->m_runtime_orphans;
+	fs->m_runtime_orphans = NULL;
+	rw_exit_write(&fs->m_runtime_orphan_lock);
+
+	while (orphan != NULL) {
+		next = orphan->ro_next;
+		free(orphan, M_UFSMNT, sizeof(*orphan));
+		orphan = next;
+	}
+}
+
 int
 ext4fs_orphan_retire (struct inode *ip, mode_t mode)
 {

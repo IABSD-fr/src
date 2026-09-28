@@ -835,6 +835,14 @@ ext4fs_sbcheck (struct ext4fs *sble, int ronly)
 		return (EINVAL);
 	}
 
+	tmp = letoh16(sble->sb_errors);
+	if (tmp != EXT4FS_ERRORS_CONTINUE &&
+	    tmp != EXT4FS_ERRORS_RO &&
+	    tmp != EXT4FS_ERRORS_PANIC) {
+		printf("ext4fs: invalid error policy: %u\n", tmp);
+		return (EINVAL);
+	}
+
 	tmp = letoh32(sble->sb_log_block_size);
 	if (tmp > 2) {
 		/* Skewed log: 1024 -> 0, 2048 -> 1, 4096 -> 2. */
@@ -2185,19 +2193,25 @@ ext4fs_unmount (struct mount *mp, int mntflags, struct proc *p)
 {
 	struct ufsmount *ump;
 	struct m_ext4fs *mfs;
-	int error, flags;
+	int error, flags, journal_error;
 
 	flags = 0;
 	if (mntflags & MNT_FORCE)
 		flags |= FORCECLOSE;
 	if ((error = ext4fs_flushfiles(mp, flags, p)) != 0)
 		return (error);
-	if (ext4fs_orphan_pending(mp))
-		return (EBUSY);
 	ump = VFSTOUFS(mp);
 	mfs = ump->um_e4fs;
+	journal_error = ext4fs_journal_error(mp);
+	if (ext4fs_orphan_pending(mp)) {
+		if (journal_error == 0)
+			return (EBUSY);
+		/* Durable orphan roots remain for recovery. */
+		ext4fs_orphan_runtime_discard(mp);
+	}
 	if (mfs->m_journal != NULL) {
-		if ((error = ext4fs_journal_mark_clean(mp)) != 0)
+		if (journal_error == 0 &&
+		    (error = ext4fs_journal_mark_clean(mp)) != 0)
 			return (error);
 	} else if (!mfs->m_read_only && mfs->m_fs_was_modified) {
 		mfs->m_state = EXT4FS_STATE_VALID;

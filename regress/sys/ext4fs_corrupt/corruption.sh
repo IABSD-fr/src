@@ -1,8 +1,8 @@
 #!/bin/sh
 #
-# Generate malformed ext4 images and require the production kernel to reject
-# them without changing a byte.  Fixture-only mode validates the generator
-# without requiring root privileges.
+# Generate malformed ext4 images and require the production kernel to
+# reject them without changing a byte.  Fixture-only mode validates the
+# generator without requiring root privileges.
 
 set -eu
 
@@ -26,8 +26,8 @@ fixtures|kernel) ;;
 	;;
 esac
 
-tools="$MKE2FS $DEBUGFS $E2FSCK $TIMEOUT $EXT4FS_CORRUPT awk cat cmp cp \
-dd id sha256 wc"
+tools="$MKE2FS $DEBUGFS $E2FSCK $TIMEOUT $EXT4FS_CORRUPT awk cat \
+cmp cp dd id sha256 wc"
 if [ "$EXT4FS_CORRUPT_MODE" = kernel ]; then
 	tools="$tools $VNCONFIG $MOUNT_EXT4FS $MOUNT $UMOUNT $TIMEOUT grep"
 fi
@@ -76,6 +76,7 @@ esac
 
 vnd=
 mounted=0
+orphan_fd_open=0
 mountpoint=$work/mnt
 mkdir "$mountpoint"
 payload=$work/extent-payload
@@ -91,6 +92,10 @@ cleanup()
 {
 	rc=$?
 	trap - EXIT HUP INT TERM
+	if [ "$orphan_fd_open" -eq 1 ]; then
+		exec 9>&-
+		orphan_fd_open=0
+	fi
 	if [ "$mounted" -eq 1 ] ||
 	    { [ "$EXT4FS_CORRUPT_MODE" = kernel ] && is_mounted; }; then
 		"$UMOUNT" "$mountpoint" >/dev/null 2>&1 || :
@@ -126,16 +131,26 @@ create_base()
 	commands=$work/debugfs-$profile-$block_size.cmd
 	debuglog=$work/debugfs-$profile-$block_size.log
 	checklog=$work/e2fsck-$profile-$block_size.log
+	mke2fs_errors=
 
 	dd if=/dev/zero of="$base" bs=1m count=0 \
 	    seek="$EXT4FS_CORRUPT_IMAGE_MB" status=none
 	case "$profile" in
 	checksum)	features='^orphan_file' ;;
 	no-checksum)	features='^metadata_csum,^orphan_file' ;;
+	abort-continue)
+		features='^orphan_file,^uninit_bg'
+		mke2fs_errors='-e continue'
+		;;
+	abort-readonly)
+		features='^orphan_file,^uninit_bg'
+		mke2fs_errors='-e remount-ro'
+		;;
 	*)		fail "unknown fixture profile: $profile" ;;
 	esac
 	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
-	    -O "$features" "$base" >"$log" 2>&1; then
+	    $mke2fs_errors -O "$features" "$base" \
+	    >"$log" 2>&1; then
 		cat "$log" >&2
 		fail "mke2fs failed for $profile profile"
 	fi
@@ -174,6 +189,9 @@ create_base()
 fixture_profile()
 {
 	case "$1" in
+runtime-block-bitmap-checksum)
+		FIXTURE_PROFILE=abort-continue
+		;;
 bad-superblock-checksum|bad-group-descriptor-checksum|\
 extent-block-bad-checksum)
 		FIXTURE_PROFILE=checksum
@@ -186,9 +204,13 @@ make_fixture()
 {
 	mutation=$1
 	block_size=$2
-	fixture_profile "$mutation"
+	if [ -n "${3:-}" ]; then
+		FIXTURE_PROFILE=$3
+	else
+		fixture_profile "$mutation"
+	fi
 	base=$work/base-$FIXTURE_PROFILE-$block_size.img
-	case_dir=$work/$block_size-$mutation
+	case_dir=$work/$block_size-$FIXTURE_PROFILE-$mutation
 	image=$case_dir/ext4.img
 	mkdir "$case_dir"
 	cp "$base" "$image"
@@ -279,7 +301,8 @@ mount_control()
 	done
 	detach_image
 	after=$(sha256 -q "$image")
-	[ "$before" = "$after" ] || fail "read-only control mount changed image"
+	[ "$before" = "$after" ] ||
+	    fail "read-only control mount changed image"
 	echo " ok"
 }
 
@@ -368,10 +391,77 @@ reject_fixture()
 	echo " ok"
 }
 
-checksum_mutations='bad-superblock-checksum bad-group-descriptor-checksum'
+test_journal_abort_policy()
+{
+	profile=$1
+	policy=$2
+	block_size=$3
+	test_name="journal abort $policy, $block_size-byte blocks"
+	printf '%-64s' "kernel: $test_name"
+	make_fixture runtime-block-bitmap-checksum "$block_size" "$profile"
+	attach_image
+	if ! "$TIMEOUT" -k 2 "$EXT4FS_CORRUPT_TIMEOUT" \
+	    "$MOUNT_EXT4FS" "/dev/${vnd}c" "$mountpoint" \
+	    >"$case_dir/mount.log" 2>&1; then
+		cat "$case_dir/mount.log" >&2
+		detach_image
+		fail "kernel rejected the runtime-corruption fixture"
+	fi
+	mounted=1
+	if ! exec 9>"$mountpoint/unlinked"; then
+		fail "could not open the orphan test file"
+	fi
+	orphan_fd_open=1
+	if ! rm "$mountpoint/unlinked"; then
+		fail "could not unlink the open orphan test file"
+	fi
+	status=0
+	if "$TIMEOUT" -k 2 "$EXT4FS_CORRUPT_TIMEOUT" \
+	    mkdir "$mountpoint/abort-directory" \
+	    >"$case_dir/mkdir.log" 2>&1; then
+		status=0
+	else
+		status=$?
+	fi
+	case "$status" in
+	124|137|143)	fail "abort-triggering mkdir exceeded timeout" ;;
+	0)		fail "corrupt block bitmap did not abort journal" ;;
+	esac
+	if [ "$status" -ge 128 ]; then
+		fail "abort-triggering mkdir terminated abnormally"
+	fi
+	if ! "$MOUNT" | grep -F " on $mountpoint " |
+	    grep -q 'read-only'; then
+		fail "journal abort did not force the mount read-only"
+	fi
+	exec 9>&-
+	orphan_fd_open=0
+	if ! "$TIMEOUT" -k 2 "$EXT4FS_CORRUPT_TIMEOUT" \
+	    "$UMOUNT" "$mountpoint" >"$case_dir/unmount.log" 2>&1; then
+		cat "$case_dir/unmount.log" >&2
+		fail "aborted filesystem did not unmount"
+	fi
+	mounted=0
+	"$VNCONFIG" -u "$vnd" || fail "could not detach $vnd"
+	vnd=
+	if ! "$DEBUGFS" -R stats "$image" \
+	    >"$case_dir/debugfs-stats.log" 2>&1; then
+		cat "$case_dir/debugfs-stats.log" >&2
+		fail "debugfs rejected the aborted filesystem"
+	fi
+	grep -q '^Filesystem features:.*needs_recovery' \
+	    "$case_dir/debugfs-stats.log" ||
+	    fail "aborted unmount cleared RECOVER"
+	echo " ok"
+}
+
+checksum_mutations='bad-superblock-checksum
+bad-group-descriptor-checksum'
 geometry_mutations='block-size-too-large zero-blocks-per-group
-zero-inodes-per-group invalid-inode-size invalid-first-inode
-invalid-descriptor-size unsupported-incompat-feature recover-without-journal'
+zero-inodes-per-group invalid-error-policy invalid-inode-size
+invalid-first-inode
+invalid-descriptor-size unsupported-incompat-feature
+recover-without-journal'
 extent_mutations='extent-root-bad-magic
 extent-root-physical-out-of-range extent-leaf-bad-magic
 extent-index-out-of-range extent-root-depth-too-large
@@ -384,10 +474,14 @@ for block_size in 1024 2048 4096; do
 	test_name="create base images, $block_size-byte blocks"
 	create_base checksum "$block_size"
 	create_base no-checksum "$block_size"
+	create_base abort-continue "$block_size"
+	create_base abort-readonly "$block_size"
 
 	if [ "$EXT4FS_CORRUPT_MODE" = kernel ]; then
 		mount_control checksum "$block_size"
 		mount_control no-checksum "$block_size"
+		mount_control abort-continue "$block_size"
+		mount_control abort-readonly "$block_size"
 	fi
 
 	for mutation in $checksum_mutations $geometry_mutations; do
@@ -406,6 +500,18 @@ for block_size in 1024 2048 4096; do
 			reject_extent_fixture "$mutation" "$block_size"
 		fi
 	done
+	if [ "$EXT4FS_CORRUPT_MODE" = fixtures ]; then
+		test_name="runtime abort fixtures, $block_size-byte blocks"
+		make_fixture runtime-block-bitmap-checksum "$block_size" \
+		    abort-continue
+		make_fixture runtime-block-bitmap-checksum "$block_size" \
+		    abort-readonly
+	else
+		test_journal_abort_policy abort-continue continue \
+		    "$block_size"
+		test_journal_abort_policy abort-readonly remount-ro \
+		    "$block_size"
+	fi
 done
 
 if [ "$EXT4FS_CORRUPT_MODE" = fixtures ]; then

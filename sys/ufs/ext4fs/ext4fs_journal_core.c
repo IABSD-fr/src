@@ -118,8 +118,9 @@ static int	ext4fs_journal_block_member (struct ext4fs_journal *,
 		    u_int64_t);
 static int	ext4fs_journal_handle_error (
 		    struct ext4fs_journal_handle *);
-static void	ext4fs_journal_abort_locked (
+static int	ext4fs_journal_abort_locked (
 		    struct ext4fs_journal *, int);
+static void	ext4fs_journal_abort_policy (struct mount *, int);
 static void	ext4fs_journal_checksum_ctx (struct ext4fs_journal *,
 		    struct jbd2_replay_ctx *);
 static u_int32_t	ext4fs_journal_next_block (
@@ -223,13 +224,14 @@ ext4fs_journal_handle_error (struct ext4fs_journal_handle *handle)
 	    journal->j_error, journal->j_shutting_down));
 }
 
-static void
+static int
 ext4fs_journal_abort_locked (struct ext4fs_journal *journal, int error)
 {
 	struct m_ext4fs *fs;
+	int first;
 
 	fs = VFSTOUFS(journal->j_mp)->um_e4fs;
-	ext4fs_journal_state_abort(&journal->j_aborted,
+	first = ext4fs_journal_state_abort(&journal->j_aborted,
 	    &journal->j_error, error);
 	fs->m_state = EXT4FS_STATE_ERROR;
 	fs->m_sble.sb_state = htole16(fs->m_state);
@@ -237,6 +239,26 @@ ext4fs_journal_abort_locked (struct ext4fs_journal *journal, int error)
 	journal->j_mp->mnt_flag |= MNT_RDONLY;
 	wakeup(&journal->j_active);
 	wakeup(&journal->j_committing);
+	return (first);
+}
+
+static void
+ext4fs_journal_abort_policy (struct mount *mp, int error)
+{
+	struct m_ext4fs *fs;
+
+	fs = VFSTOUFS(mp)->um_e4fs;
+	if (fs->m_errors == EXT4FS_ERRORS_PANIC)
+		panic("ext4fs: journal abort on %s: error %d",
+		    mp->mnt_stat.f_mntonname, error);
+	if (fs->m_errors == EXT4FS_ERRORS_CONTINUE) {
+		printf("ext4fs: journal abort on %s: error %d; "
+		    "cannot continue without a journal, forcing "
+		    "read-only\n", mp->mnt_stat.f_mntonname, error);
+		return;
+	}
+	printf("ext4fs: journal abort on %s: error %d; forcing "
+	    "read-only\n", mp->mnt_stat.f_mntonname, error);
 }
 
 static void
@@ -986,6 +1008,7 @@ ext4fs_journal_abort (struct mount *mp, int error)
 {
 	struct ext4fs_journal *journal;
 	struct m_ext4fs *fs;
+	int first;
 
 	fs = VFSTOUFS(mp)->um_e4fs;
 	journal = fs->m_journal;
@@ -995,8 +1018,29 @@ ext4fs_journal_abort (struct mount *mp, int error)
 		error = EIO;
 
 	mtx_enter(&journal->j_lock);
-	ext4fs_journal_abort_locked(journal, error);
+	first = ext4fs_journal_abort_locked(journal, error);
 	mtx_leave(&journal->j_lock);
+	if (first)
+		ext4fs_journal_abort_policy(mp, error);
+}
+
+int
+ext4fs_journal_error (struct mount *mp)
+{
+	struct ext4fs_journal *journal;
+	struct m_ext4fs *fs;
+	int error;
+
+	fs = VFSTOUFS(mp)->um_e4fs;
+	journal = fs->m_journal;
+	if (journal == NULL)
+		return (0);
+	mtx_enter(&journal->j_lock);
+	error = journal->j_aborted ? journal->j_error : 0;
+	if (journal->j_aborted && error == 0)
+		error = EIO;
+	mtx_leave(&journal->j_lock);
+	return (error);
 }
 
 int
@@ -1453,7 +1497,7 @@ ext4fs_journal_force_commit (struct mount *mp)
 	struct ext4fs_journal *journal;
 	struct m_ext4fs *fs;
 	u_int32_t new_head;
-	int error;
+	int error, first;
 
 	fs = VFSTOUFS(mp)->um_e4fs;
 	journal = fs->m_journal;
@@ -1461,6 +1505,7 @@ ext4fs_journal_force_commit (struct mount *mp)
 		return (0);
 	tx = NULL;
 	new_head = 0;
+	first = 0;
 
 	mtx_enter(&journal->j_lock);
 	for (;;) {
@@ -1504,7 +1549,7 @@ ext4fs_journal_force_commit (struct mount *mp)
 	if (error == 0 && journal->j_aborted)
 		error = journal->j_error != 0 ? journal->j_error : EIO;
 	if (error != 0) {
-		ext4fs_journal_abort_locked(journal, error);
+		first = ext4fs_journal_abort_locked(journal, error);
 	} else {
 		journal->j_committing = NULL;
 		journal->j_head = new_head;
@@ -1513,6 +1558,8 @@ ext4fs_journal_force_commit (struct mount *mp)
 	}
 	wakeup(&journal->j_committing);
 	mtx_leave(&journal->j_lock);
+	if (first)
+		ext4fs_journal_abort_policy(mp, error);
 
 	if (error == 0)
 		ext4fs_journal_transaction_free(tx);
