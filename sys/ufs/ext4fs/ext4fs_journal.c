@@ -754,7 +754,8 @@ jbd2_revoke_block_check (struct jbd2_replay_ctx *ctx, struct buf *bp,
 	struct jbd2_revoke_header *rh;
 	u_int32_t bytes, limit, record_size;
 
-	if (! (ctx->rc_features_incompat & JBD2_FEATURE_INCOMPAT_REVOKE))
+	if (! (ctx->rc_features_incompat &
+	    JBD2_FEATURE_INCOMPAT_REVOKE))
 		return (EINVAL);
 	if (! jbd2_metadata_block_csum_verify(ctx, bp->b_data))
 		return (EINVAL);

@@ -508,7 +508,8 @@ check_empty_file (const char *path)
 
 	if (stat(path, &st) == -1)
 		err(1, "stat %s", path);
-	if (! S_ISREG(st.st_mode) || st.st_size != 0 || st.st_blocks != 0)
+	if (! S_ISREG(st.st_mode) || st.st_size != 0 ||
+	    st.st_blocks != 0)
 		errx(1, "%s retained data or allocated blocks", path);
 }
 
@@ -2342,7 +2343,8 @@ verify_allocation_probe (void)
 	make_path(path, sizeof(path), "allocation-probe");
 	if (stat(path, &st) == -1)
 		err(1, "stat %s", path);
-	if (! S_ISREG(st.st_mode) || st.st_size != (off_t)block_size + 31)
+	if (! S_ISREG(st.st_mode) ||
+	    st.st_size != (off_t)block_size + 31)
 		errx(1, "allocation probe has wrong type or size");
 	fd = open(path, O_RDONLY);
 	if (fd == -1)
@@ -2556,7 +2558,8 @@ reject_block_counter (void)
 		err(1, "open %s", path);
 	if (fstat(fd, &st) == -1)
 		err(1, "fstat %s", path);
-	if (! S_ISREG(st.st_mode) || st.st_size != 0 || st.st_blocks != 0)
+	if (! S_ISREG(st.st_mode) || st.st_size != 0 ||
+	    st.st_blocks != 0)
 		errx(1, "counter block probe has wrong shape");
 	if (statfs(root, &before) == -1)
 		err(1, "statfs before rejected block allocation");

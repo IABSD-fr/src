@@ -4938,7 +4938,8 @@ ext4fs_remove (void *v)
 	if (nlink == 1) {
 		switch (vp->v_type) {
 		case VREG:
-			if (! (inode_flags & EXTFS_INODE_FLAG_EXTENTS) ||
+			if (! (inode_flags &
+			    EXTFS_INODE_FLAG_EXTENTS) ||
 			    letoh16(din->i_extent_header.eh_magic) !=
 			    EXT4FS_EXTENT_HEADER_MAGIC)
 				journal_final_error = EIO;
@@ -4965,7 +4966,8 @@ ext4fs_remove (void *v)
 		case VCHR:
 		case VFIFO:
 		case VSOCK:
-			if (! (inode_flags & EXTFS_INODE_FLAG_EXTENTS) &&
+			if (! (inode_flags &
+			    EXTFS_INODE_FLAG_EXTENTS) &&
 			    blocks == blockless_units && size == 0)
 				journal_final = 1;
 			else

@@ -974,7 +974,8 @@ ext4fs_journal_init (struct mount *mp)
 	fs = ump->um_e4fs;
 	if (fs->m_journal != NULL)
 		return (EBUSY);
-	if (! (fs->m_feature_compat & EXT4FS_FEATURE_COMPAT_HAS_JOURNAL))
+	if (! (fs->m_feature_compat &
+	    EXT4FS_FEATURE_COMPAT_HAS_JOURNAL))
 		return (0);
 
 	error = jbd2_journal_open(ump->um_devvp, fs, &ctx, &superblock);
