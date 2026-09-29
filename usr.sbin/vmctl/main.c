@@ -65,12 +65,15 @@ int		 ctl_stop(struct parse_result *, int, char *[]);
 int		 ctl_waitfor(struct parse_result *, int, char *[]);
 int		 ctl_pause(struct parse_result *, int, char *[]);
 int		 ctl_unpause(struct parse_result *, int, char *[]);
+int		 ctl_disk_fail(struct parse_result *, int, char *[]);
 int		 ctl_flush_stop(struct parse_result *, int, char *[]);
 
 struct ctl_command ctl_commands[] = {
 	{ "console",	CMD_CONSOLE,	ctl_console,	"id" },
 	{ "create",	CMD_CREATE,	ctl_create,
 		"[-b base | -i disk] [-s size] disk", 1 },
+	{ "disk-fail",	CMD_DISK_FAIL,	ctl_disk_fail,
+	    "id disk read|write|flush count" },
 	{ "flush-stop",	CMD_FLUSH_STOP,	ctl_flush_stop,
 	    "id disk count" },
 	{ "load",	CMD_LOAD,	ctl_load,	"filename" },
@@ -258,6 +261,10 @@ vmmaction(struct parse_result *res)
 	case CMD_UNPAUSE:
 		unpause_vm(res->id, res->name);
 		break;
+	case CMD_DISK_FAIL:
+		disk_fail_vm(res->id, res->name, res->disk_index,
+		    res->fail_operation, res->fail_count);
+		break;
 	case CMD_FLUSH_STOP:
 		flush_stop_vm(res->id, res->name, res->disk_index,
 		    res->flush_count);
@@ -324,6 +331,9 @@ vmmaction(struct parse_result *res)
 				break;
 			case CMD_UNPAUSE:
 				done = unpause_vm_complete(&imsg, &ret);
+				break;
+			case CMD_DISK_FAIL:
+				done = disk_fail_vm_complete(&imsg, &ret);
 				break;
 			case CMD_FLUSH_STOP:
 				done = flush_stop_vm_complete(&imsg, &ret);
@@ -1017,6 +1027,34 @@ ctl_unpause(struct parse_result *res, int argc, char *argv[])
 	} else if (argc != 2)
 		ctl_usage(res->ctl);
 
+	return (vmmaction(res));
+}
+
+int
+ctl_disk_fail(struct parse_result *res, int argc, char *argv[])
+{
+	const char *errstr;
+
+	if (argc != 5)
+		ctl_usage(res->ctl);
+	if (parse_vmid(res, argv[1], 0) == -1)
+		errx(1, "invalid id: %s", argv[1]);
+	res->disk_index = strtonum(argv[2], 0,
+	    VM_MAX_DISKS_PER_VM - 1, &errstr);
+	if (errstr != NULL)
+		errx(1, "disk index is %s: %s", errstr, argv[2]);
+	if (strcmp(argv[3], "read") == 0)
+		res->fail_operation = VMOP_DISK_FAIL_READ;
+	else if (strcmp(argv[3], "write") == 0)
+		res->fail_operation = VMOP_DISK_FAIL_WRITE;
+	else if (strcmp(argv[3], "flush") == 0)
+		res->fail_operation = VMOP_DISK_FAIL_FLUSH;
+	else
+		errx(1, "invalid disk operation: %s", argv[3]);
+	res->fail_count = strtonum(argv[4], 1, UINT32_MAX,
+	    &errstr);
+	if (errstr != NULL)
+		errx(1, "operation count is %s: %s", errstr, argv[4]);
 	return (vmmaction(res));
 }
 

@@ -123,6 +123,9 @@ enum imsg_type {
 	IMSG_VMDOP_FLUSH_STOP,
 	IMSG_VMDOP_FLUSH_STOP_ARMED,
 	IMSG_VMDOP_FLUSH_STOPPED,
+	IMSG_VMDOP_DISK_FAIL,
+	IMSG_VMDOP_DISK_FAIL_ARMED,
+	IMSG_VMDOP_DISK_FAILED,
 	IMSG_VMDOP_WAIT_VM_REQUEST,
 	IMSG_VMDOP_TERMINATE_VM_REQUEST,
 	IMSG_VMDOP_TERMINATE_VM_RESPONSE,
@@ -157,6 +160,9 @@ enum imsg_type {
 	IMSG_DEVOP_FLUSH_STOP_ARMED,
 	IMSG_DEVOP_FLUSH_STOPPED,
 	IMSG_DEVOP_FLUSH_CONTINUE,
+	IMSG_DEVOP_DISK_FAIL,
+	IMSG_DEVOP_DISK_FAIL_ARMED,
+	IMSG_DEVOP_DISK_FAILED,
 };
 
 struct vmop_result {
@@ -205,6 +211,29 @@ struct vmop_flush_stop_result {
 	uint32_t		 vfr_peer_id;
 	uint32_t		 vfr_disk;
 	uint32_t		 vfr_count;
+};
+
+#define VMOP_DISK_FAIL_READ	1
+#define VMOP_DISK_FAIL_WRITE	2
+#define VMOP_DISK_FAIL_FLUSH	3
+
+struct vmop_disk_fail {
+	uint32_t		 vdf_id;
+	char			 vdf_name[VMM_MAX_NAME_LEN];
+	uid_t			 vdf_uid;
+	uint32_t		 vdf_peer_id;
+	uint32_t		 vdf_disk;
+	uint32_t		 vdf_operation;
+	uint32_t		 vdf_count;
+};
+
+struct vmop_disk_fail_result {
+	int32_t			 vdfr_result;
+	uint32_t		 vdfr_id;
+	uint32_t		 vdfr_peer_id;
+	uint32_t		 vdfr_disk;
+	uint32_t		 vdfr_operation;
+	uint32_t		 vdfr_count;
 };
 
 struct vmop_ifreq {
@@ -530,6 +559,9 @@ void	 vmop_create_params_read(struct imsg *, struct vmop_create_params *);
 void	 vmop_flush_stop_read(struct imsg *, struct vmop_flush_stop *);
 void	 vmop_flush_stop_result_read(struct imsg *,
 	    struct vmop_flush_stop_result *);
+void	 vmop_disk_fail_read(struct imsg *, struct vmop_disk_fail *);
+void	 vmop_disk_fail_result_read(struct imsg *,
+	    struct vmop_disk_fail_result *);
 void	 vmop_config_read(struct imsg *, struct vmd_config *);
 
 /* priv.c */

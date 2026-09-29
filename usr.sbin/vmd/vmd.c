@@ -95,6 +95,8 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 	int				 cmd = IMSG_NONE, verbose;
 	unsigned int			 v = 0, flags;
 	struct vmop_create_params	 vmc;
+	struct vmop_disk_fail		 vdf;
+	struct vmop_disk_fail_result	 vdfr;
 	struct vmop_flush_stop		 vfs;
 	struct vmop_flush_stop_result	 vfr;
 	struct vmop_id			 vid;
@@ -277,6 +279,36 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 		proc_compose_imsg(ps, PROC_VMM, type, vm->vm_peerid, -1,
 		    &vid, sizeof(vid));
 		break;
+	case IMSG_VMDOP_DISK_FAIL:
+		vmop_disk_fail_read(imsg, &vdf);
+		cmd = IMSG_VMDOP_DISK_FAIL_ARMED;
+		if (vdf.vdf_id == 0) {
+			if ((vm = vm_getbyname(vdf.vdf_name)) == NULL) {
+				res = ENOENT;
+				break;
+			}
+			vdf.vdf_id = vm->vm_vmid;
+		} else if ((vm = vm_getbyid(vdf.vdf_id)) == NULL) {
+			res = ENOENT;
+			break;
+		}
+		if (vm_checkperm(vm, &vm->vm_params.vmc_owner,
+		    vdf.vdf_uid) != 0)
+			res = EPERM;
+		else if (! (vm->vm_state & VM_STATE_RUNNING))
+			res = EINVAL;
+		else if (vdf.vdf_disk >= vm->vm_params.vmc_ndisks ||
+		    vdf.vdf_count == 0 ||
+		    vdf.vdf_operation < VMOP_DISK_FAIL_READ ||
+		    vdf.vdf_operation > VMOP_DISK_FAIL_FLUSH)
+			res = EINVAL;
+		if (res != 0)
+			break;
+		cmd = IMSG_NONE;
+		if (proc_compose_imsg(ps, PROC_VMM, type, peer_id,
+		    -1, &vdf, sizeof(vdf)) == -1)
+			return (-1);
+		break;
 	case IMSG_VMDOP_FLUSH_STOP:
 		vmop_flush_stop_read(imsg, &vfs);
 		cmd = IMSG_VMDOP_FLUSH_STOP_ARMED;
@@ -335,6 +367,18 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 		    -1, &vfr, sizeof(vfr)) == -1)
 			return (-1);
 		break;
+	case IMSG_VMDOP_DISK_FAIL_ARMED:
+		memset(&vdfr, 0, sizeof(vdfr));
+		vdfr.vdfr_result = res;
+		vdfr.vdfr_id = vdf.vdf_id;
+		vdfr.vdfr_peer_id = vdf.vdf_peer_id;
+		vdfr.vdfr_disk = vdf.vdf_disk;
+		vdfr.vdfr_operation = vdf.vdf_operation;
+		vdfr.vdfr_count = vdf.vdf_count;
+		if (proc_compose_imsg(ps, PROC_CONTROL, cmd, peer_id,
+		    -1, &vdfr, sizeof(vdfr)) == -1)
+			return (-1);
+		break;
 	default:
 		if (proc_compose_imsg(ps, PROC_CONTROL, cmd, peer_id, -1,
 		    &res, sizeof(res)) == -1)
@@ -348,6 +392,7 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 int
 vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 {
+	struct vmop_disk_fail_result vdfr;
 	struct vmop_flush_stop_result vfr;
 	struct vmop_result	 vmr;
 	struct privsep		*ps = p->p_ps;
@@ -359,6 +404,19 @@ vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 	type = imsg_get_type(imsg);
 
 	switch (type) {
+	case IMSG_VMDOP_DISK_FAIL_ARMED:
+	case IMSG_VMDOP_DISK_FAILED:
+		vmop_disk_fail_result_read(imsg, &vdfr);
+		if ((vm = vm_getbyvmid(vdfr.vdfr_id)) == NULL)
+			break;
+		proc_compose_imsg(ps, PROC_CONTROL, type,
+		    vdfr.vdfr_peer_id, -1, &vdfr, sizeof(vdfr));
+		if (type == IMSG_VMDOP_DISK_FAILED) {
+			log_info("%s: failed disk %u operation %u at %u",
+			    vm->vm_params.vmc_name, vdfr.vdfr_disk,
+			    vdfr.vdfr_operation, vdfr.vdfr_count);
+		}
+		break;
 	case IMSG_VMDOP_FLUSH_STOP_ARMED:
 	case IMSG_VMDOP_FLUSH_STOPPED:
 		vmop_flush_stop_result_read(imsg, &vfr);
@@ -1960,6 +2018,22 @@ vmop_flush_stop_result_read(struct imsg *imsg,
     struct vmop_flush_stop_result *vfr)
 {
 	if (imsg_get_data(imsg, vfr, sizeof(*vfr)))
+		fatal("%s", __func__);
+}
+
+void
+vmop_disk_fail_read(struct imsg *imsg, struct vmop_disk_fail *vdf)
+{
+	if (imsg_get_data(imsg, vdf, sizeof(*vdf)))
+		fatal("%s", __func__);
+	vdf->vdf_name[sizeof(vdf->vdf_name) - 1] = '\0';
+}
+
+void
+vmop_disk_fail_result_read(struct imsg *imsg,
+    struct vmop_disk_fail_result *vdfr)
+{
+	if (imsg_get_data(imsg, vdfr, sizeof(*vdfr)))
 		fatal("%s", __func__);
 }
 

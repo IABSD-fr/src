@@ -274,6 +274,11 @@ struct vioblk_dev {
 	uint32_t flush_stop_target;
 	uint32_t flush_stop_seen;
 	int flush_stop_pending;
+	struct vmop_disk_fail disk_fail;
+	uint32_t disk_fail_target;
+	uint32_t disk_fail_seen;
+	uint32_t disk_fail_operation;
+	int disk_fail_pending;
 };
 
 /* vioscsi will use at least 3 queues - 5.6.2 Virtqueues
@@ -403,6 +408,7 @@ void virtio_broadcast_imsg(struct vmd_vm *, uint16_t, void *, uint16_t);
 void virtio_stop(struct vmd_vm *);
 void virtio_start(struct vmd_vm *);
 int vioblk_flush_stop(struct vmd_vm *, struct vmop_flush_stop *);
+int vioblk_disk_fail(struct vmd_vm *, struct vmop_disk_fail *);
 void virtio_shutdown(struct vmd_vm *);
 const char *virtio_reg_name(uint8_t);
 uint32_t vring_size(uint32_t);

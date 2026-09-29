@@ -109,6 +109,8 @@ static int virtio_io_notify(int, uint16_t, uint32_t *, uint8_t *, void *,
     uint8_t);
 static void vioblk_flush_stop_response(struct virtio_dev *, uint32_t,
     int);
+static void vioblk_disk_fail_response(struct virtio_dev *, uint32_t,
+    int);
 static int viornd_notifyq(struct virtio_dev *, uint16_t);
 
 static void vmmci_ack(struct virtio_dev *, unsigned int);
@@ -1533,7 +1535,8 @@ vioblk_flush_stop(struct vmd_vm *vm, struct vmop_flush_stop *vfs)
 	}
 	if (dev == NULL)
 		return (ENODEV);
-	if (dev->vioblk.flush_stop_pending)
+	if (dev->vioblk.flush_stop_pending ||
+	    dev->vioblk.disk_fail_pending)
 		return (EBUSY);
 	dev->vioblk.flush_stop = *vfs;
 	dev->vioblk.flush_stop_pending = 1;
@@ -1542,6 +1545,38 @@ vioblk_flush_stop(struct vmd_vm *vm, struct vmop_flush_stop *vfs)
 	    sizeof(vfs->vfs_count));
 	if (ret == -1) {
 		dev->vioblk.flush_stop_pending = 0;
+		return (EIO);
+	}
+	return (0);
+}
+
+int
+vioblk_disk_fail(struct vmd_vm *vm, struct vmop_disk_fail *vdf)
+{
+	struct virtio_dev *dev;
+	int ret;
+
+	if (vdf->vdf_count == 0 ||
+	    vdf->vdf_operation < VMOP_DISK_FAIL_READ ||
+	    vdf->vdf_operation > VMOP_DISK_FAIL_FLUSH ||
+	    vdf->vdf_disk >= vm->vm_params.vmc_ndisks)
+		return (EINVAL);
+	SLIST_FOREACH(dev, &virtio_devs, dev_next) {
+		if (dev->dev_type == VMD_DEVTYPE_DISK &&
+		    dev->vioblk.idx == vdf->vdf_disk)
+			break;
+	}
+	if (dev == NULL)
+		return (ENODEV);
+	if (dev->vioblk.disk_fail_pending ||
+	    dev->vioblk.flush_stop_pending)
+		return (EBUSY);
+	dev->vioblk.disk_fail = *vdf;
+	dev->vioblk.disk_fail_pending = 1;
+	ret = imsg_compose_event(&dev->async_iev,
+	    IMSG_DEVOP_DISK_FAIL, 0, 0, -1, vdf, sizeof(*vdf));
+	if (ret == -1) {
+		dev->vioblk.disk_fail_pending = 0;
 		return (EIO);
 	}
 	return (0);
@@ -1987,6 +2022,27 @@ virtio_dispatch_dev(int fd, short event, void *arg)
 			viodev_msg_read(&imsg, &msg);
 			handle_dev_msg(&msg, dev);
 			break;
+		case IMSG_DEVOP_DISK_FAIL_ARMED:
+			if (dev->dev_type != VMD_DEVTYPE_DISK ||
+			    ! dev->vioblk.disk_fail_pending) {
+				log_warnx("%s: unexpected disk-fail arm",
+				    __func__);
+				break;
+			}
+			vioblk_disk_fail_response(dev,
+			    IMSG_VMDOP_DISK_FAIL_ARMED, 0);
+			break;
+		case IMSG_DEVOP_DISK_FAILED:
+			if (dev->dev_type != VMD_DEVTYPE_DISK ||
+			    ! dev->vioblk.disk_fail_pending) {
+				log_warnx("%s: unexpected disk failure",
+				    __func__);
+				break;
+			}
+			vioblk_disk_fail_response(dev,
+			    IMSG_VMDOP_DISK_FAILED, 0);
+			dev->vioblk.disk_fail_pending = 0;
+			break;
 		case IMSG_DEVOP_FLUSH_STOP_ARMED:
 			if (dev->dev_type != VMD_DEVTYPE_DISK ||
 			    !dev->vioblk.flush_stop_pending) {
@@ -2020,6 +2076,26 @@ virtio_dispatch_dev(int fd, short event, void *arg)
 		imsg_free(&imsg);
 	}
 	imsg_event_add(iev);
+}
+
+static void
+vioblk_disk_fail_response(struct virtio_dev *dev, uint32_t type,
+    int error)
+{
+	struct vmop_disk_fail *vdf;
+	struct vmop_disk_fail_result vdfr;
+
+	vdf = &dev->vioblk.disk_fail;
+	memset(&vdfr, 0, sizeof(vdfr));
+	vdfr.vdfr_result = error;
+	vdfr.vdfr_id = vdf->vdf_id;
+	vdfr.vdfr_peer_id = vdf->vdf_peer_id;
+	vdfr.vdfr_disk = vdf->vdf_disk;
+	vdfr.vdfr_operation = vdf->vdf_operation;
+	vdfr.vdfr_count = vdf->vdf_count;
+	if (imsg_compose_event(&current_vm->vm_iev, type,
+	    vdfr.vdfr_peer_id, 0, -1, &vdfr, sizeof(vdfr)) == -1)
+		fatal("%s", __func__);
 }
 
 static void
