@@ -1125,8 +1125,28 @@ Together with the earlier 1 KiB results, all eighteen block-reuse
 cases now pass with exact physical reuse and accounting, idempotent
 recovery, and offline `e2fsck -fn` acceptance.
 
-The remaining exhaustion, wraparound, error injection, and Linux
-verification matrices remain Phase 6 work.
+The deterministic journal-boundary matrix is now integrated.  Its
+checksum-free fixtures use only published JBD2 superblock fields and
+must pass `e2fsck -fn` before use.  The exhaustion case sets
+`s_max_transaction` to admit 23 metadata credits, one fewer than
+`mkdir` reserves.  It requires an exact, non-mutating `ENOSPC`, then
+proves that smaller create and unlink transactions still commit.  A
+clean remount, unchanged free-block and free-inode accounting, and
+offline `e2fsck -fn` acceptance are mandatory.
+
+The wraparound fixture places clean `s_head` two blocks before
+`s_maxlen` and prebuilds both rename inputs so no setup transaction can
+move the head after mount.  The six durability cuts require the exact
+old-or-new namespace and data, the expected clean or recoverable
+`s_start`, the unchanged pre-commit head, and a clean post-commit head
+below the wrap boundary.  Recovery idempotence and offline
+`e2fsck -fn` remain mandatory.  The non-root helper self-test, build,
+fixture audit, shell validation, and 72-column checks pass.  The
+explicit `run-regress-ext4fs-crash-journal-vmm` target awaits its
+production-kernel run for 1 KiB, 2 KiB, and 4 KiB block sizes.
+
+The remaining error-injection and Linux-verification matrices remain
+Phase 6 work.
 
 Use filesystem images created by Linux tools and run IABSD in a VM.
 Inject an abrupt power loss after each commit phase and at journal

@@ -56,6 +56,8 @@
 #define TRUNCATE_FILE	"truncate-probe"
 #define REUSE_FILE	"reuse-probe"
 #define REUSE_SEED	0xb4U
+#define EXHAUST_DIR	"exhausted"
+#define EXHAUST_PROBE	"exhaustion-probe"
 
 #define JBD2_MAGIC		UINT32_C(0xc03b3998)
 #define JBD2_SUPERBLOCK_V2	4
@@ -75,6 +77,7 @@
 #define JBD2_OFF_SEQUENCE	0x18
 #define JBD2_OFF_START		0x1c
 #define JBD2_OFF_FEATURE_INCOMPAT	0x28
+#define JBD2_OFF_MAX_TRANSACTION	0x48
 #define JBD2_OFF_HEAD		0x58
 
 static void	make_path (char *, size_t, const char *, const char *);
@@ -109,7 +112,9 @@ static void	write_pattern (int, off_t, unsigned int);
 static void	check_pattern (const char *, off_t, unsigned int);
 static void	arm_cut (const char *);
 static void	arm_boundary (const char *);
+static void	make_pattern_file (const char *, off_t, unsigned int);
 static void	make_old_pattern (const char *);
+static void	make_new_pattern (const char *);
 static uint32_t	load_be32 (const unsigned char *, size_t);
 static void	store_be32 (unsigned char *, size_t, uint32_t);
 static void	classify_journal (const char *);
@@ -119,6 +124,8 @@ static void	run_rmdir_open (const char *, const char *, int);
 static void	run_extent_growth (const char *, const char *, int);
 static void	run_truncate_prune (const char *, const char *, int);
 static void	run_block_reuse (const char *, const char *, int);
+static void	run_rename_wrap (const char *, const char *, int);
+static void	run_journal_exhaustion (const char *);
 static void	run_workload (const char *, const char *, int);
 static void	verify_dir_growth (const char *);
 static void	verify_rmdir (const char *);
@@ -126,6 +133,7 @@ static void	verify_extent_promote (const char *);
 static void	verify_extent_split (const char *);
 static void	verify_truncate_prune (const char *);
 static void	verify_block_reuse (const char *);
+static void	verify_journal_exhaustion (const char *);
 static void	verify_workload (const char *);
 static void	verify_unlink (const char *);
 static void	selftest (void);
@@ -647,16 +655,28 @@ arm_boundary (const char *stage)
 }
 
 static void
-make_old_pattern (const char *path)
+make_pattern_file (const char *path, off_t bytes, unsigned int seed)
 {
 	int fd;
 
 	fd = open_output(path, 0);
-	write_pattern(fd, OLD_BYTES, OLD_SEED);
+	write_pattern(fd, bytes, seed);
 	if (fsync(fd) == -1)
 		err(1, "fsync %s", path);
 	if (close(fd) == -1)
 		err(1, "close %s", path);
+}
+
+static void
+make_old_pattern (const char *path)
+{
+	make_pattern_file(path, OLD_BYTES, OLD_SEED);
+}
+
+static void
+make_new_pattern (const char *path)
+{
+	make_pattern_file(path, NEW_BYTES, NEW_SEED);
 }
 
 static uint32_t
@@ -681,7 +701,8 @@ classify_journal (const char *path)
 	unsigned char buf[JBD2_SUPER_BYTES];
 	struct stat st;
 	uint64_t blocks;
-	uint32_t blocksize, first, head, maxlen, sequence, start;
+	uint32_t blocksize, first, head, max_transaction, maxlen;
+	uint32_t sequence, start;
 	ssize_t n;
 	int fd;
 
@@ -717,14 +738,17 @@ classify_journal (const char *path)
 	sequence = load_be32(buf, JBD2_OFF_SEQUENCE);
 	start = load_be32(buf, JBD2_OFF_START);
 	head = load_be32(buf, JBD2_OFF_HEAD);
+	max_transaction = load_be32(buf,
+	    JBD2_OFF_MAX_TRANSACTION);
 	if (first == 0 || first >= maxlen || maxlen > blocks ||
 	    (start != 0 && (start < first || start >= maxlen)) ||
 	    (head != 0 && (head < first || head >= maxlen)))
 		errx(1, "%s has invalid journal geometry", path);
 
 	printf("journal=%s sequence=%u start=%u head=%u "
-	    "first=%u maxlen=%u\n", start == 0 ? "clean" : "recover",
-	    sequence, start, head, first, maxlen);
+	    "first=%u maxlen=%u maxtrans=%u\n",
+	    start == 0 ? "clean" : "recover", sequence, start,
+	    head, first, maxlen, max_transaction);
 	if (fflush(stdout) == EOF)
 		err(1, "publish journal state");
 }
@@ -1004,6 +1028,58 @@ run_block_reuse (const char *stage, const char *root, int boundary)
 }
 
 static void
+run_rename_wrap (const char *stage, const char *root, int boundary)
+{
+	char current[PATH_MAX], next[PATH_MAX];
+
+	make_path(current, sizeof(current), root, "current");
+	make_path(next, sizeof(next), root, "next");
+	if (boundary)
+		arm_boundary(stage);
+	else
+		arm_cut(stage);
+	if (rename(next, current) == -1)
+		err(1, "rename %s", next);
+	if (printf("DONE %s\n", stage) < 0 ||
+	    fflush(stdout) == EOF)
+		err(1, "publish completion marker");
+	for (;;)
+		(void)pause();
+}
+
+static void
+run_journal_exhaustion (const char *root)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	int fd;
+
+	make_path(path, sizeof(path), root, EXHAUST_DIR);
+	if (mkdir(path, 0755) != -1)
+		errx(1, "journal-exhaustion mkdir succeeded");
+	if (errno != ENOSPC)
+		err(1, "mkdir %s", path);
+	if (lstat(path, &st) != -1)
+		errx(1, "%s exists after failed mkdir", path);
+	if (errno != ENOENT)
+		err(1, "lstat %s", path);
+
+	/* A smaller transaction must still be admitted afterward. */
+	make_path(path, sizeof(path), root, EXHAUST_PROBE);
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+	    0600);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	if (unlink(path) == -1)
+		err(1, "unlink %s", path);
+	printf("state=journal-exhausted\n");
+	if (fflush(stdout) == EOF)
+		err(1, "publish journal-exhaustion state");
+}
+
+static void
 run_workload (const char *stage, const char *root, int boundary)
 {
 	char current[PATH_MAX], next[PATH_MAX];
@@ -1011,6 +1087,10 @@ run_workload (const char *stage, const char *root, int boundary)
 
 	make_path(current, sizeof(current), root, "current");
 	make_path(next, sizeof(next), root, "next");
+	if (strcmp(stage, "rename-wrap") == 0) {
+		run_rename_wrap(stage, root, boundary);
+		return;
+	}
 	if (strcmp(stage, "block-reuse") == 0) {
 		run_block_reuse(stage, root, boundary);
 		return;
@@ -1212,6 +1292,34 @@ verify_block_reuse (const char *root)
 }
 
 static void
+verify_journal_exhaustion (const char *root)
+{
+	struct stat st;
+	char current[PATH_MAX], path[PATH_MAX];
+
+	make_path(current, sizeof(current), root, "current");
+	check_pattern(current, OLD_BYTES, OLD_SEED);
+	make_path(path, sizeof(path), root, "next");
+	if (lstat(path, &st) != -1)
+		errx(1, "%s unexpectedly exists", path);
+	if (errno != ENOENT)
+		err(1, "lstat %s", path);
+	make_path(path, sizeof(path), root, EXHAUST_DIR);
+	if (lstat(path, &st) != -1)
+		errx(1, "%s unexpectedly exists", path);
+	if (errno != ENOENT)
+		err(1, "lstat %s", path);
+	make_path(path, sizeof(path), root, EXHAUST_PROBE);
+	if (lstat(path, &st) != -1)
+		errx(1, "%s unexpectedly exists", path);
+	if (errno != ENOENT)
+		err(1, "lstat %s", path);
+	printf("state=journal-exhausted\n");
+	if (fflush(stdout) == EOF)
+		err(1, "publish journal-exhaustion state");
+}
+
+static void
 verify_workload (const char *root)
 {
 	struct stat current_st, next_st;
@@ -1303,6 +1411,7 @@ selftest (void)
 	make_path(next, sizeof(next), root, "next");
 	make_old_pattern(current);
 	verify_workload(root);
+	verify_journal_exhaustion(root);
 	verify_unlink(root);
 
 	make_path(grow, sizeof(grow), root, GROW_DIR);
@@ -1421,6 +1530,8 @@ main (int argc, char **argv)
 		selftest();
 	else if (argc == 3 && strcmp(argv[1], "pattern-old") == 0)
 		make_old_pattern(argv[2]);
+	else if (argc == 3 && strcmp(argv[1], "pattern-new") == 0)
+		make_new_pattern(argv[2]);
 	else if (argc == 3 && strcmp(argv[1], "journal-state") == 0)
 		classify_journal(argv[2]);
 	else if (argc == 3 && strcmp(argv[1], "journal-revokes") == 0)
@@ -1449,15 +1560,24 @@ main (int argc, char **argv)
 	else if (argc == 3 &&
 	    strcmp(argv[1], "verify-block-reuse") == 0)
 		verify_block_reuse(argv[2]);
+	else if (argc == 3 &&
+	    strcmp(argv[1], "journal-exhaustion") == 0)
+		run_journal_exhaustion(argv[2]);
+	else if (argc == 3 &&
+	    strcmp(argv[1], "verify-journal-exhaustion") == 0)
+		verify_journal_exhaustion(argv[2]);
 	else
 		errx(1, "usage: ext4fs_crash pattern-old path | "
+		    "pattern-new path | "
 		    "journal-state path | journal-revokes path | "
+		    "journal-exhaustion root | "
 		    "workload stage root | boundary stage root | "
 		    "verify root | verify-unlink root | "
 		    "verify-dir-growth root | verify-rmdir root | "
 		    "verify-extent-promote root | "
 		    "verify-extent-split root | "
 		    "verify-truncate-prune root | "
-		    "verify-block-reuse root");
+		    "verify-block-reuse root | "
+		    "verify-journal-exhaustion root");
 	return (0);
 }

@@ -31,6 +31,15 @@ EXT4FS_CRASH_MODE=${EXT4FS_CRASH_MODE:-timed}
 EXT4FS_CRASH_FLUSH_COUNTS=${EXT4FS_CRASH_FLUSH_COUNTS:-"1 2 3 4 5 6"}
 EXT4FS_CRASH_SSH_KEY=${EXT4FS_CRASH_SSH_KEY:-}
 
+JBD2_OFF_MAXLEN=16
+JBD2_OFF_FIRST=20
+JBD2_OFF_START=28
+JBD2_OFF_FEATURE_COMPAT=36
+JBD2_OFF_FEATURE_INCOMPAT=40
+JBD2_OFF_FEATURE_RO_COMPAT=44
+JBD2_OFF_MAX_TRANSACTION=72
+JBD2_OFF_HEAD=88
+
 test_name=ext4fs-crash-vmm
 fail()
 {
@@ -102,7 +111,7 @@ for stage in $EXT4FS_CRASH_STAGES; do
 	esac
 done
 case "$EXT4FS_CRASH_MODE" in
-timed|flush|orphan|directory|extent|truncate|reuse) ;;
+timed|flush|orphan|directory|extent|truncate|reuse|journal) ;;
 *)	fail "unsupported crash mode: $EXT4FS_CRASH_MODE" ;;
 esac
 if [ "$EXT4FS_CRASH_MODE" != timed ]; then
@@ -553,6 +562,22 @@ filesystem_free_blocks()
 	echo "$blocks"
 }
 
+filesystem_free_inodes()
+{
+	output=$1
+	inodes=$(awk -F: '
+	    $1 == "Free inodes" {
+		gsub(/[[:space:]]/, "", $2)
+		print $2
+		exit
+	    }
+	' "$output")
+	case "$inodes" in
+	''|*[!0-9]*) fail "filesystem free-inode count was not reported" ;;
+	esac
+	echo "$inodes"
+}
+
 filesystem_block_map()
 {
 	image=$1
@@ -573,6 +598,152 @@ filesystem_block_map()
 		;;
 	esac
 	echo "$mapped_block"
+}
+
+journal_value()
+{
+	journal_log=$1
+	journal_name=$2
+	value=$(awk -v name="$journal_name" '
+	    {
+		for (i = 1; i <= NF; i++) {
+			split($i, field, "=")
+			if (field[1] == name) {
+				print field[2]
+				exit
+			}
+		}
+	    }
+	' "$journal_log")
+	case "$value" in
+	''|*[!0-9]*)
+		fail "journal $journal_name was not reported"
+		;;
+	esac
+	echo "$value"
+}
+
+journal_superblock_offset()
+{
+	journal_image=$1
+	journal_block_size=$2
+	journal_output=$3
+	journal_block=$("$DEBUGFS" -R 'bmap <8> 0' \
+	    "$journal_image" 2>"$journal_output" |
+	    awk 'NF { value = $NF } END { print value }')
+	case "$journal_block" in
+	''|*[!0-9]*)
+		cat "$journal_output" >&2
+		fail "could not map journal superblock"
+		;;
+	esac
+	echo $((journal_block * journal_block_size))
+}
+
+read_be32()
+{
+	be_image=$1
+	be_offset=$2
+	be_value=$(dd if="$be_image" bs=1 skip="$be_offset" count=4 \
+	    status=none | od -An -tu1 | awk '
+	    NF == 4 {
+		value = $1 * 16777216 + $2 * 65536 + $3 * 256 + $4
+		printf "%.0f\n", value
+		exit
+	    }
+	')
+	case "$be_value" in
+	''|*[!0-9]*) fail "could not read journal field" ;;
+	esac
+	echo "$be_value"
+}
+
+write_be32()
+{
+	be_image=$1
+	be_offset=$2
+	be_value=$3
+	case "$be_value" in
+	''|*[!0-9]*) fail "invalid journal field value" ;;
+	esac
+	be_byte0=$(((be_value >> 24) & 255))
+	be_byte1=$(((be_value >> 16) & 255))
+	be_byte2=$(((be_value >> 8) & 255))
+	be_byte3=$((be_value & 255))
+	{
+		printf "\\$(printf '%03o' "$be_byte0")"
+		printf "\\$(printf '%03o' "$be_byte1")"
+		printf "\\$(printf '%03o' "$be_byte2")"
+		printf "\\$(printf '%03o' "$be_byte3")"
+	} | dd of="$be_image" bs=1 seek="$be_offset" count=4 \
+	    conv=notrunc status=none
+}
+
+tune_journal_fixture()
+{
+	tune_image=$1
+	tune_block_size=$2
+	tune_mode=$3
+	tune_output=$4
+	tune_offset=$(journal_superblock_offset "$tune_image" \
+	    "$tune_block_size" "$tune_output")
+	tune_start=$(read_be32 "$tune_image" \
+	    $((tune_offset + JBD2_OFF_START)))
+	tune_compat=$(read_be32 "$tune_image" \
+	    $((tune_offset + JBD2_OFF_FEATURE_COMPAT)))
+	tune_incompat=$(read_be32 "$tune_image" \
+	    $((tune_offset + JBD2_OFF_FEATURE_INCOMPAT)))
+	tune_ro_compat=$(read_be32 "$tune_image" \
+	    $((tune_offset + JBD2_OFF_FEATURE_RO_COMPAT)))
+	[ "$tune_start" -eq 0 ] ||
+	    fail "fixture journal is not clean"
+	[ "$tune_compat" -eq 0 ] &&
+	    [ "$tune_incompat" -eq 0 ] &&
+	    [ "$tune_ro_compat" -eq 0 ] ||
+	    fail "fixture journal has checksum features"
+	case "$tune_mode" in
+	exhaustion)
+		# Raw limit 47 admits 23 credits; mkdir reserves 24.
+		write_be32 "$tune_image" \
+		    $((tune_offset + JBD2_OFF_MAX_TRANSACTION)) 47
+		;;
+	wrap)
+		tune_maxlen=$(read_be32 "$tune_image" \
+		    $((tune_offset + JBD2_OFF_MAXLEN)))
+		tune_first=$(read_be32 "$tune_image" \
+		    $((tune_offset + JBD2_OFF_FIRST)))
+		[ "$tune_maxlen" -gt $((tune_first + 2)) ] ||
+		    fail "fixture journal is too short to wrap"
+		tune_head=$((tune_maxlen - 2))
+		write_be32 "$tune_image" \
+		    $((tune_offset + JBD2_OFF_HEAD)) \
+		    "$tune_head"
+		;;
+	*)	fail "unknown journal fixture mode: $tune_mode" ;;
+	esac
+	if ! "$E2FSCK" -fn "$tune_image" >"$tune_output" 2>&1; then
+		cat "$tune_output" >&2
+		fail "e2fsck rejected $tune_mode journal fixture"
+	fi
+	tune_journal=$tune_output.journal
+	tune_state=$tune_output.state
+	"$DEBUGFS" -R "dump <8> $tune_journal" "$tune_image" \
+	    >"$tune_output.dump" 2>&1 ||
+	    fail "could not extract $tune_mode journal fixture"
+	"$EXT4FS_CRASH" journal-state "$tune_journal" \
+	    >"$tune_state" 2>&1 ||
+	    fail "could not inspect $tune_mode journal fixture"
+	grep -q '^journal=clean ' "$tune_state" ||
+	    fail "$tune_mode journal fixture is not clean"
+	if [ "$tune_mode" = exhaustion ]; then
+		[ "$(journal_value "$tune_state" maxtrans)" -eq 47 ] ||
+		    fail "journal transaction limit was not installed"
+	else
+		tune_head=$(journal_value "$tune_state" head)
+		tune_maxlen=$(journal_value "$tune_state" maxlen)
+		[ "$tune_head" -eq $((tune_maxlen - 2)) ] ||
+		    fail "journal wrap head was not installed"
+	fi
 }
 
 run_flush_matrix()
@@ -640,6 +811,31 @@ run_flush_matrix()
 		    "$case_dir/workload.log" \
 		    "$case_dir/flush-stop.log"
 		preserve_durable "$image" "$case_dir"
+		if [ "$stage" = rename-wrap ]; then
+			wrap_start=$(journal_value \
+			    "$case_dir/durable-journal.log" start)
+			wrap_head=$(journal_value \
+			    "$case_dir/durable-journal.log" head)
+			wrap_first=$(journal_value \
+			    "$case_dir/durable-journal.log" first)
+			wrap_maxlen=$(journal_value \
+			    "$case_dir/durable-journal.log" maxlen)
+			wrap_boundary=$((wrap_maxlen - 2))
+			case "$flush_count" in
+			1|2|6) expected_start=0 ;;
+			3|4|5) expected_start=$wrap_boundary ;;
+			esac
+			[ "$wrap_start" -eq "$expected_start" ] ||
+			    fail "journal wrap start mismatch"
+			if [ "$flush_count" -lt 6 ]; then
+				[ "$wrap_head" -eq "$wrap_boundary" ] ||
+				    fail "journal moved before clean commit"
+			else
+				[ "$wrap_head" -ge "$wrap_first" ] &&
+				    [ "$wrap_head" -lt "$wrap_boundary" ] ||
+				    fail "journal head did not wrap"
+			fi
+		fi
 		if [ "$stage" = truncate-prune ]; then
 			durable_revokes=$(journal_revoke_records \
 			    "$case_dir/journal.bin" \
@@ -726,6 +922,78 @@ $durable_journal_state != $expected_journal"
 	done
 }
 
+run_journal_exhaustion_case()
+{
+	base=$1
+	block_size=$2
+	test_name="journal credit exhaustion, "
+	test_name="$test_name$block_size-byte blocks"
+	printf '%-64s' "vmm: $test_name"
+	case_dir=$work/journal-exhaustion-$block_size
+	mkdir "$case_dir"
+	image=$case_dir/ext4.img
+	cp "$base" "$image"
+	"$DUMPE2FS" -h "$base" >"$case_dir/base-super.log" 2>&1 ||
+	    fail "could not inspect journal-exhaustion baseline"
+	base_free_blocks=$(filesystem_free_blocks \
+	    "$case_dir/base-super.log")
+	base_free_inodes=$(filesystem_free_inodes \
+	    "$case_dir/base-super.log")
+
+	start_guest "$image"
+	trigger="set -e
+mkdir -p /mnt/ext4
+mount_ext4fs /dev/sd1c /mnt/ext4
+/tmp/ext4fs_crash journal-exhaustion /mnt/ext4/crash
+umount /mnt/ext4"
+	if ! ssh_step "root@$guest" "$trigger" \
+	    >"$case_dir/workload.log" 2>&1; then
+		cat "$case_dir/workload.log" >&2
+		fail "journal-exhaustion workload failed"
+	fi
+	grep -qx 'state=journal-exhausted' \
+	    "$case_dir/workload.log" ||
+	    fail "journal exhaustion did not report exact ENOSPC"
+	stop_guest
+	"$SYNC"
+
+	hash_before=$($SHA256 -q "$image")
+	validate_guest "$image" ro verify-journal-exhaustion \
+	    "$case_dir/verify.log"
+	hash_after=$($SHA256 -q "$image")
+	[ "$hash_before" = "$hash_after" ] ||
+	    fail "read-only exhaustion verification changed image"
+	"$E2FSCK" -fn "$image" >"$case_dir/e2fsck.log" 2>&1 ||
+	    fail "e2fsck rejected journal-exhaustion image"
+	"$DUMPE2FS" -h "$image" >"$case_dir/dumpe2fs.log" 2>&1 ||
+	    fail "dumpe2fs rejected journal-exhaustion image"
+	if grep -q '^Filesystem features:.*needs_recovery' \
+	    "$case_dir/dumpe2fs.log"; then
+		fail "journal exhaustion retained RECOVER"
+	fi
+	grep -q '^Filesystem state:.*clean' \
+	    "$case_dir/dumpe2fs.log" ||
+	    fail "journal-exhaustion image is not clean"
+	[ "$(filesystem_free_blocks "$case_dir/dumpe2fs.log")" \
+	    -eq "$base_free_blocks" ] ||
+	    fail "journal exhaustion changed free-block accounting"
+	[ "$(filesystem_free_inodes "$case_dir/dumpe2fs.log")" \
+	    -eq "$base_free_inodes" ] ||
+	    fail "journal exhaustion changed free-inode accounting"
+	journal=$case_dir/journal.bin
+	"$DEBUGFS" -R "dump <8> $journal" "$image" \
+	    >"$case_dir/journal-dump.log" 2>&1 ||
+	    fail "could not extract exhaustion journal"
+	"$EXT4FS_CRASH" journal-state "$journal" \
+	    >"$case_dir/journal.log" 2>&1 ||
+	    fail "could not inspect exhaustion journal"
+	grep -q '^journal=clean ' "$case_dir/journal.log" ||
+	    fail "journal exhaustion left a live transaction"
+	[ "$(journal_value "$case_dir/journal.log" maxtrans)" \
+	    -eq 47 ] || fail "journal transaction limit changed"
+	echo ' ok'
+}
+
 prepare_block_reuse_base()
 {
 	image=$1
@@ -802,7 +1070,8 @@ enable_journal_revoke()
 		fail "could not map journal superblock"
 		;;
 	esac
-	feature_offset=$((journal_block * block_size + 40))
+	feature_offset=$((journal_block * block_size + \
+	    JBD2_OFF_FEATURE_INCOMPAT))
 	set -- $(dd if="$image" bs=1 skip="$feature_offset" count=4 \
 	    status=none | od -An -tu1)
 	[ "$#" -eq 4 ] || fail "could not read journal features"
@@ -822,6 +1091,10 @@ enable_journal_revoke()
 "$SYSCTL" -n kern.version >"$work/host-version.log"
 old_data=$work/old.data
 "$EXT4FS_CRASH" pattern-old "$old_data"
+if [ "$EXT4FS_CRASH_MODE" = journal ]; then
+	new_data=$work/new.data
+	"$EXT4FS_CRASH" pattern-new "$new_data"
+fi
 
 for block_size in $EXT4FS_CRASH_BLOCK_SIZES; do
 	if [ "$EXT4FS_CRASH_MODE" = reuse ]; then
@@ -922,6 +1195,28 @@ for block_size in $EXT4FS_CRASH_BLOCK_SIZES; do
 		    'directory removal' verify-rmdir \
 		    'state=directory-linked' \
 		    'state=directory-absent'
+		;;
+	journal)
+		exhaustion_base=$work/base-exhaustion-$block_size.img
+		cp "$base" "$exhaustion_base"
+		tune_journal_fixture "$exhaustion_base" \
+		    "$block_size" exhaustion \
+		    "$work/exhaustion-fixture-$block_size.log"
+		run_journal_exhaustion_case "$exhaustion_base" \
+		    "$block_size"
+
+		wrap_base=$work/base-wrap-$block_size.img
+		cp "$base" "$wrap_base"
+		"$DEBUGFS" -w -R \
+		    "write $new_data /crash/next" "$wrap_base" \
+		    >"$work/debugfs-wrap-$block_size.log" 2>&1 ||
+		    fail "could not create journal-wrap source"
+		tune_journal_fixture "$wrap_base" "$block_size" wrap \
+		    "$work/wrap-fixture-$block_size.log"
+		run_flush_matrix "$wrap_base" "$block_size" \
+		    rename-wrap 'journal wraparound' verify \
+		    'state=old next=full' \
+		    'state=new next=absent'
 		;;
 	esac
 done

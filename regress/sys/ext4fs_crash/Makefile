@@ -123,4 +123,19 @@ run-regress-ext4fs-crash-reuse-vmm: ${PROG}
 	    EXT4FS_CRASH_MODE='reuse' \
 	    sh ${.CURDIR}/crash-vmm.sh
 
+# Explicit only: test journal admission and physical log wraparound.
+run-regress-ext4fs-crash-journal-vmm: ${PROG}
+	env EXT4FS_CRASH='${.OBJDIR}/${PROG}' \
+	    EXT4FS_CRASH_VMM_BASE='${EXT4FS_CRASH_VMM_BASE}' \
+	    EXT4FS_CRASH_VMM_KERNEL='${EXT4FS_CRASH_VMM_KERNEL}' \
+	    EXT4FS_CRASH_VMM_DIR='${EXT4FS_CRASH_VMM_DIR}' \
+	    EXT4FS_CRASH_BOOT_TIMEOUT='${EXT4FS_CRASH_BOOT_TIMEOUT}' \
+	    EXT4FS_CRASH_STEP_TIMEOUT='${EXT4FS_CRASH_STEP_TIMEOUT}' \
+	    EXT4FS_CRASH_IMAGE_MB='${EXT4FS_CRASH_IMAGE_MB}' \
+	    EXT4FS_CRASH_BLOCK_SIZES='${EXT4FS_CRASH_BLOCK_SIZES}' \
+	    EXT4FS_CRASH_FLUSH_COUNTS='${EXT4FS_CRASH_FLUSH_COUNTS}' \
+	    EXT4FS_CRASH_SSH_KEY='${EXT4FS_CRASH_SSH_KEY}' \
+	    EXT4FS_CRASH_MODE='journal' \
+	    sh ${.CURDIR}/crash-vmm.sh
+
 .include <bsd.regress.mk>
