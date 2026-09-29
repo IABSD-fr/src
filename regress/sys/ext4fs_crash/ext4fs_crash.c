@@ -125,6 +125,7 @@ static void	run_extent_growth (const char *, const char *, int);
 static void	run_truncate_prune (const char *, const char *, int);
 static void	run_block_reuse (const char *, const char *, int);
 static void	run_rename_wrap (const char *, const char *, int);
+static void	run_error_rename (const char *, const char *);
 static void	run_journal_exhaustion (const char *);
 static void	run_workload (const char *, const char *, int);
 static void	verify_dir_growth (const char *);
@@ -1048,6 +1049,44 @@ run_rename_wrap (const char *stage, const char *root, int boundary)
 }
 
 static void
+run_error_rename (const char *stage, const char *root)
+{
+	char current[PATH_MAX], next[PATH_MAX], probe[PATH_MAX];
+	int error, fd;
+
+	if (strcmp(stage, "error-rename") != 0)
+		errx(1, "unknown error stage: %s", stage);
+	make_path(current, sizeof(current), root, "current");
+	make_path(next, sizeof(next), root, "next");
+	make_path(probe, sizeof(probe), root, "error-probe");
+	fd = open_output(next, 1);
+	write_pattern(fd, NEW_BYTES, NEW_SEED);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", next);
+	if (close(fd) == -1)
+		err(1, "close %s", next);
+	arm_boundary(stage);
+	if (rename(next, current) != -1)
+		errx(1, "rename succeeded after injected I/O error");
+	error = errno;
+	if (error != EIO) {
+		errno = error;
+		err(1, "rename %s returned unexpected error", next);
+	}
+	fd = open(probe, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+	    0600);
+	if (fd != -1) {
+		(void)close(fd);
+		errx(1, "write succeeded after journal abort");
+	}
+	if (errno != EROFS)
+		err(1, "write after journal abort");
+	printf("state=journal-aborted\n");
+	if (fflush(stdout) == EOF)
+		err(1, "publish journal-abort state");
+}
+
+static void
 run_journal_exhaustion (const char *root)
 {
 	struct stat st;
@@ -1540,6 +1579,9 @@ main (int argc, char **argv)
 		run_workload(argv[2], argv[3], 0);
 	else if (argc == 4 && strcmp(argv[1], "boundary") == 0)
 		run_workload(argv[2], argv[3], 1);
+	else if (argc == 4 &&
+	    strcmp(argv[1], "error-boundary") == 0)
+		run_error_rename(argv[2], argv[3]);
 	else if (argc == 3 && strcmp(argv[1], "verify") == 0)
 		verify_workload(argv[2]);
 	else if (argc == 3 && strcmp(argv[1], "verify-unlink") == 0)
@@ -1572,6 +1614,7 @@ main (int argc, char **argv)
 		    "journal-state path | journal-revokes path | "
 		    "journal-exhaustion root | "
 		    "workload stage root | boundary stage root | "
+		    "error-boundary stage root | "
 		    "verify root | verify-unlink root | "
 		    "verify-dir-growth root | verify-rmdir root | "
 		    "verify-extent-promote root | "

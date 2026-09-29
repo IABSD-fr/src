@@ -1158,7 +1158,22 @@ wraparound cuts against the production kernel.  Every case also passed
 its exact state, journal geometry, accounting, recovery-idempotence,
 and offline `e2fsck -fn` checks.
 
-The remaining error-injection and Linux-verification matrices remain
+A one-shot vmd device-error control is now integrated without ext4fs
+instrumentation.  `vmctl disk-fail` can fail a selected read, write,
+or flush request on one disposable-VM disk, returns a normal virtio
+block I/O error to the production guest, and reports both arming and
+firing to the controller.  It is mutually exclusive with
+`flush-stop`.  The explicit
+`run-regress-ext4fs-crash-errors-vmm` target checks that a mount read
+failure is byte-for-byte non-mutating, that a journal write failure
+returns `EIO` and forces `errors=remount-ro`, and that all six
+flush-error positions do the same.  Each journal-abort case must retain
+`RECOVER`, recover to an exact old-or-new rename state, remain
+idempotent, and pass offline `e2fsck -fn`.  The production-warning
+builds, non-root helper self-test, shell validation, and 72-column
+checks pass.  The installed production-vmd run remains pending.
+
+The production error-injection run and Linux-verification matrix remain
 Phase 6 work.
 
 Use filesystem images created by Linux tools and run IABSD in a VM.

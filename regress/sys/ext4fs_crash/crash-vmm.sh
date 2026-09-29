@@ -111,7 +111,7 @@ for stage in $EXT4FS_CRASH_STAGES; do
 	esac
 done
 case "$EXT4FS_CRASH_MODE" in
-timed|flush|orphan|directory|extent|truncate|reuse|journal) ;;
+timed|flush|orphan|directory|extent|truncate|reuse|journal|errors) ;;
 *)	fail "unsupported crash mode: $EXT4FS_CRASH_MODE" ;;
 esac
 if [ "$EXT4FS_CRASH_MODE" != timed ]; then
@@ -229,6 +229,12 @@ flush_stop_control()
 {
 	exec "$TIMEOUT" -k 5 "$EXT4FS_CRASH_STEP_TIMEOUT" \
 	    "$VMCTL" flush-stop "$@"
+}
+
+disk_fail_control()
+{
+	exec "$TIMEOUT" -k 5 "$EXT4FS_CRASH_STEP_TIMEOUT" \
+	    "$VMCTL" disk-fail "$@"
 }
 
 copy_helper()
@@ -400,6 +406,92 @@ exec /tmp/ext4fs_crash boundary $stage /mnt/ext4/crash"
 	"$SYNC"
 }
 
+wait_disk_fail_armed()
+{
+	operation=$1
+	count=$2
+	log=$3
+	wait_ticks=0
+	max_ticks=$((EXT4FS_CRASH_STEP_TIMEOUT * 10))
+	while ! grep -q "armed vm .* disk 1 at $operation $count" \
+	    "$log" 2>/dev/null; do
+		if ! kill -0 "$control_pid" 2>/dev/null; then
+			wait "$control_pid" || status=$?
+			control_pid=
+			cat "$log" >&2
+			fail "disk-fail control exited before arming"
+		fi
+		[ "$wait_ticks" -lt "$max_ticks" ] ||
+		    fail "disk-fail arm timed out"
+		sleep 0.1
+		wait_ticks=$((wait_ticks + 1))
+	done
+}
+
+wait_disk_fail_fired()
+{
+	operation=$1
+	count=$2
+	log=$3
+	if ! wait "$control_pid"; then
+		control_pid=
+		cat "$log" >&2
+		fail "disk-fail control failed"
+	fi
+	control_pid=
+	grep -q "failed vm .* disk 1 at $operation $count" \
+	    "$log" || {
+		cat "$log" >&2
+		fail "disk-fail control did not report the error"
+	}
+}
+
+run_error_boundary()
+{
+	operation=$1
+	count=$2
+	log=$3
+	control_log=$4
+	trigger="set -e
+mkdir -p /mnt/ext4
+mount_ext4fs -o errors=remount-ro /dev/sd1c /mnt/ext4
+exec /tmp/ext4fs_crash error-boundary error-rename \
+/mnt/ext4/crash"
+	ssh_workload "root@$guest" "$trigger" >"$log" 2>&1 &
+	ssh_pid=$!
+	wait_ticks=0
+	max_ticks=$((EXT4FS_CRASH_STEP_TIMEOUT * 10))
+	while ! grep -q '^READY error-rename$' "$log" 2>/dev/null; do
+		if ! kill -0 "$ssh_pid" 2>/dev/null; then
+			wait "$ssh_pid" || status=$?
+			ssh_pid=
+			cat "$log" >&2
+			fail "error workload exited before its marker"
+		fi
+		[ "$wait_ticks" -lt "$max_ticks" ] ||
+		    fail "error workload marker timed out"
+		sleep 0.1
+		wait_ticks=$((wait_ticks + 1))
+	done
+	disk_fail_control "$vm_name" 1 "$operation" "$count" \
+	    >"$control_log" 2>&1 &
+	control_pid=$!
+	wait_disk_fail_armed "$operation" "$count" "$control_log"
+	ssh_step "root@$guest" touch /tmp/ext4fs_crash.go ||
+	    fail "could not release error workload"
+	wait_disk_fail_fired "$operation" "$count" "$control_log"
+	if ! wait "$ssh_pid"; then
+		ssh_pid=
+		cat "$log" >&2
+		fail "error workload rejected the journal abort"
+	fi
+	ssh_pid=
+	grep -qx 'state=journal-aborted' "$log" || {
+		cat "$log" >&2
+		fail "error workload did not observe journal abort"
+	}
+}
+
 validate_guest()
 {
 	image=$1
@@ -489,6 +581,86 @@ recover_case()
 	grep -q '^Filesystem state:.*clean' \
 	    "$case_dir/dumpe2fs.log" ||
 	    fail "recovered image is not clean"
+}
+
+check_error_recovery()
+{
+	log=$1
+	case "$(cat "$log")" in
+	'state=old next=full'|'state=new next=absent') ;;
+	*)
+		cat "$log" >&2
+		fail "injected error recovered a mixed rename state"
+		;;
+	esac
+}
+
+run_read_error_case()
+{
+	error_source=$1
+	error_block_size=$2
+	test_name="device read error, "
+	test_name="$test_name$error_block_size-byte blocks"
+	printf '%-64s' "vmm: $test_name"
+	case_dir=$work/error-read-$error_block_size
+	mkdir "$case_dir"
+	image=$case_dir/ext4.img
+	cp "$error_source" "$image"
+	hash_before=$($SHA256 -q "$image")
+	start_guest "$image"
+	disk_fail_control "$vm_name" 1 read 1 \
+	    >"$case_dir/disk-fail.log" 2>&1 &
+	control_pid=$!
+	wait_disk_fail_armed read 1 "$case_dir/disk-fail.log"
+	trigger="set -e
+mkdir -p /mnt/ext4
+mount_ext4fs /dev/sd1c /mnt/ext4"
+	if ssh_step "root@$guest" "$trigger" \
+	    >"$case_dir/mount.log" 2>&1; then
+		fail "mount succeeded after injected read error"
+	fi
+	wait_disk_fail_fired read 1 "$case_dir/disk-fail.log"
+	stop_guest
+	"$SYNC"
+	[ "$hash_before" = "$($SHA256 -q "$image")" ] ||
+	    fail "failed mount read modified the image"
+	validate_guest "$image" ro verify "$case_dir/verify.log"
+	grep -qx 'state=old next=absent' \
+	    "$case_dir/verify.log" ||
+	    fail "read-error fixture changed state"
+	[ "$hash_before" = "$($SHA256 -q "$image")" ] ||
+	    fail "read-error verification modified the image"
+	"$E2FSCK" -fn "$image" >"$case_dir/e2fsck.log" 2>&1 ||
+	    fail "e2fsck rejected read-error image"
+	echo ' ok'
+}
+
+run_journal_error_case()
+{
+	error_source=$1
+	error_block_size=$2
+	operation=$3
+	count=$4
+	if [ "$operation" = write ]; then
+		label="journal write error"
+	else
+		label="journal flush error $count"
+	fi
+	test_name="$label, $error_block_size-byte blocks"
+	printf '%-64s' "vmm: $test_name"
+	case_dir=$work/error-$operation-$count-$error_block_size
+	mkdir "$case_dir"
+	image=$case_dir/ext4.img
+	cp "$error_source" "$image"
+	start_guest "$image"
+	run_error_boundary "$operation" "$count" \
+	    "$case_dir/workload.log" "$case_dir/disk-fail.log"
+	stop_guest
+	"$SYNC"
+	preserve_durable "$image" "$case_dir"
+	recover_case "$image" "$case_dir" verify
+	check_error_recovery "$case_dir/recovery.log"
+	echo ' ok'
 }
 
 extent_leaf_count()
@@ -1160,6 +1332,16 @@ for block_size in $EXT4FS_CRASH_BLOCK_SIZES; do
 	"$E2FSCK" -fn "$base" \
 	    >"$work/e2fsck-base-$block_size.log" 2>&1 ||
 	    fail "e2fsck rejected baseline image"
+
+	if [ "$EXT4FS_CRASH_MODE" = errors ]; then
+		run_read_error_case "$base" "$block_size"
+		run_journal_error_case "$base" "$block_size" write 1
+		for flush_count in $EXT4FS_CRASH_FLUSH_COUNTS; do
+			run_journal_error_case "$base" "$block_size" \
+			    flush "$flush_count"
+		done
+		continue
+	fi
 
 	if [ "$EXT4FS_CRASH_MODE" = timed ]; then
 		for stage in $EXT4FS_CRASH_STAGES; do
