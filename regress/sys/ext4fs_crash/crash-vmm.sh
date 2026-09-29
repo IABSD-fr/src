@@ -741,8 +741,11 @@ tune_journal_fixture()
 	else
 		tune_head=$(journal_value "$tune_state" head)
 		tune_maxlen=$(journal_value "$tune_state" maxlen)
+		tune_maxtrans=$(journal_value "$tune_state" maxtrans)
 		[ "$tune_head" -eq $((tune_maxlen - 2)) ] ||
 		    fail "journal wrap head was not installed"
+		[ "$tune_maxtrans" -eq 0 ] ||
+		    fail "journal wrap fixture has a transaction limit"
 	fi
 }
 
@@ -924,16 +927,17 @@ $durable_journal_state != $expected_journal"
 
 run_journal_exhaustion_case()
 {
-	base=$1
-	block_size=$2
+	exhaustion_source=$1
+	exhaustion_block_size=$2
 	test_name="journal credit exhaustion, "
-	test_name="$test_name$block_size-byte blocks"
+	test_name="$test_name$exhaustion_block_size-byte blocks"
 	printf '%-64s' "vmm: $test_name"
-	case_dir=$work/journal-exhaustion-$block_size
+	case_dir=$work/journal-exhaustion-$exhaustion_block_size
 	mkdir "$case_dir"
 	image=$case_dir/ext4.img
-	cp "$base" "$image"
-	"$DUMPE2FS" -h "$base" >"$case_dir/base-super.log" 2>&1 ||
+	cp "$exhaustion_source" "$image"
+	"$DUMPE2FS" -h "$exhaustion_source" \
+	    >"$case_dir/base-super.log" 2>&1 ||
 	    fail "could not inspect journal-exhaustion baseline"
 	base_free_blocks=$(filesystem_free_blocks \
 	    "$case_dir/base-super.log")
@@ -1197,8 +1201,9 @@ for block_size in $EXT4FS_CRASH_BLOCK_SIZES; do
 		    'state=directory-absent'
 		;;
 	journal)
+		journal_base=$base
 		exhaustion_base=$work/base-exhaustion-$block_size.img
-		cp "$base" "$exhaustion_base"
+		cp "$journal_base" "$exhaustion_base"
 		tune_journal_fixture "$exhaustion_base" \
 		    "$block_size" exhaustion \
 		    "$work/exhaustion-fixture-$block_size.log"
@@ -1206,7 +1211,7 @@ for block_size in $EXT4FS_CRASH_BLOCK_SIZES; do
 		    "$block_size"
 
 		wrap_base=$work/base-wrap-$block_size.img
-		cp "$base" "$wrap_base"
+		cp "$journal_base" "$wrap_base"
 		"$DEBUGFS" -w -R \
 		    "write $new_data /crash/next" "$wrap_base" \
 		    >"$work/debugfs-wrap-$block_size.log" 2>&1 ||

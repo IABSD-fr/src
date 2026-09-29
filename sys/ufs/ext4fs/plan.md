@@ -1145,6 +1145,15 @@ fixture audit, shell validation, and 72-column checks pass.  The
 explicit `run-regress-ext4fs-crash-journal-vmm` target awaits its
 production-kernel run for 1 KiB, 2 KiB, and 4 KiB block sizes.
 
+The first production run passed the 1 KiB exhaustion case.  Before
+the first wraparound cut, a shell helper reused the global baseline
+variable, so the wrap fixture was copied from the deliberately limited
+exhaustion fixture and rename correctly returned `ENOSPC`.  The
+exhaustion helper now uses distinct state, the journal-mode branch
+preserves its original baseline explicitly, and every wrap fixture must
+report `s_max_transaction == 0` before a guest starts.  The all-size
+rerun is pending.
+
 The remaining error-injection and Linux-verification matrices remain
 Phase 6 work.
 
