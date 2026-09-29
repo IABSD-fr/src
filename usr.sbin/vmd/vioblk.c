@@ -429,13 +429,19 @@ vioblk_fail_request(struct virtio_dev *dev, uint32_t operation)
 	if (vioblk->disk_fail_target == 0 ||
 	    vioblk->disk_fail_operation != operation)
 		return (0);
-	vioblk->disk_fail_seen++;
-	if (vioblk->disk_fail_seen != vioblk->disk_fail_target)
-		return (0);
-	vioblk->disk_fail_target = 0;
-	if (imsg_compose_event(&dev->async_iev,
-	    IMSG_DEVOP_DISK_FAILED, 0, 0, -1, NULL, 0) == -1)
-		fatal("%s: fired response", __func__);
+	if (vioblk->disk_fail_seen < vioblk->disk_fail_target) {
+		vioblk->disk_fail_seen++;
+		if (vioblk->disk_fail_seen !=
+		    vioblk->disk_fail_target)
+			return (0);
+	}
+	if (! vioblk->disk_fail_fired) {
+		vioblk->disk_fail_fired = 1;
+		if (imsg_compose_event(&dev->async_iev,
+		    IMSG_DEVOP_DISK_FAILED, 0, 0, -1,
+		    NULL, 0) == -1)
+			fatal("%s: fired response", __func__);
+	}
 	return (1);
 }
 
@@ -532,6 +538,7 @@ dev_dispatch_vm(int fd, short event, void *arg)
 			    vdf.vdf_operation;
 			dev->vioblk.disk_fail_target = vdf.vdf_count;
 			dev->vioblk.disk_fail_seen = 0;
+			dev->vioblk.disk_fail_fired = 0;
 			if (imsg_compose_event(iev,
 			    IMSG_DEVOP_DISK_FAIL_ARMED, 0, 0, -1,
 			    NULL, 0) == -1)

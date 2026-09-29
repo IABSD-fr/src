@@ -278,6 +278,7 @@ struct vioblk_dev {
 	uint32_t disk_fail_target;
 	uint32_t disk_fail_seen;
 	uint32_t disk_fail_operation;
+	int disk_fail_fired;
 	int disk_fail_pending;
 };
 

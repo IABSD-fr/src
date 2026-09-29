@@ -2041,7 +2041,6 @@ virtio_dispatch_dev(int fd, short event, void *arg)
 			}
 			vioblk_disk_fail_response(dev,
 			    IMSG_VMDOP_DISK_FAILED, 0);
-			dev->vioblk.disk_fail_pending = 0;
 			break;
 		case IMSG_DEVOP_FLUSH_STOP_ARMED:
 			if (dev->dev_type != VMD_DEVTYPE_DISK ||

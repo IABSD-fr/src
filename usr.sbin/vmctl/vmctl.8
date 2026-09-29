@@ -124,9 +124,10 @@ The operation must be
 .Cm write ,
 or
 .Cm flush .
-The selected request returns a virtio block I/O error to the guest.
+The selected request and every later matching request return virtio
+block I/O errors until the VM stops.
 The command reports when the device is armed, then waits until the
-one-shot error has been delivered.
+first error has been delivered.
 This command is intended for storage error-handling tests.
 .It Cm flush-stop Ar id disk count
 Arm the zero-based virtual
