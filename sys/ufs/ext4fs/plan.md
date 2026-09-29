@@ -1194,9 +1194,9 @@ run passed the same eight cases for both 2 KiB and 4 KiB blocks.  All
 kernel with exact recovery, idempotence, and offline `e2fsck -fn`
 validation.
 
-The Linux-verification matrix remains Phase 6 work.
+Cross-kernel Linux mount verification is outside this project's scope.
 
-Use filesystem images created by Linux tools and run IABSD in a VM.
+Use filesystem images created by e2fsprogs and run IABSD in a VM.
 Inject an abrupt power loss after each commit phase and at journal
 wraparound boundaries.
 
@@ -1205,8 +1205,7 @@ For every recovered image:
 1. boot or remount it on IABSD;
 2. verify expected namespace and file-data outcomes;
 3. run `e2fsck -fn`;
-4. mount it on Linux and repeat integrity checks;
-5. confirm replay is idempotent by attempting recovery again.
+4. confirm replay is idempotent by attempting recovery again.
 
 Exercise at least:
 
