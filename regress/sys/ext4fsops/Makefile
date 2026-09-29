@@ -15,6 +15,8 @@ REGRESS_TARGETS=	run-regress-ext4fsops \
 			run-regress-ext4fsops-sync \
 			run-regress-ext4fsops-vfs-sync \
 			run-regress-ext4fsops-remount \
+			run-regress-ext4fsops-handoff \
+			run-regress-ext4fsops-allocation-run \
 			run-regress-ext4fsops-extents \
 			run-regress-ext4fsops-directory \
 			run-regress-ext4fsops-orphan \
@@ -97,12 +99,28 @@ run-regress-ext4fsops-remount: ${PROG}
 	    EXT4FSOPS_MODE='remount' \
 	    sh ${.CURDIR}/operations.sh
 
+run-regress-ext4fsops-handoff: ${PROG}
+	env EXT4FSOPS='${.OBJDIR}/${PROG}' \
+	    EXT4FS_TIMEOUT='${EXT4FS_TIMEOUT}' \
+	    EXT4FS_IMAGE_MB='${EXT4FS_IMAGE_MB}' \
+	    EXT4FS_BLOCK_SIZES='${EXT4FS_BLOCK_SIZES}' \
+	    EXT4FSOPS_MODE='handoff' \
+	    sh ${.CURDIR}/operations.sh
+
 run-regress-ext4fsops-extents: ${PROG}
 	env EXT4FSOPS='${.OBJDIR}/${PROG}' \
 	    EXT4FS_TIMEOUT='${EXT4FS_TIMEOUT}' \
 	    EXT4FS_IMAGE_MB='${EXT4FS_IMAGE_MB}' \
 	    EXT4FS_BLOCK_SIZES='${EXT4FS_BLOCK_SIZES}' \
 	    EXT4FSOPS_MODE='extents' \
+	    sh ${.CURDIR}/operations.sh
+
+run-regress-ext4fsops-allocation-run: ${PROG}
+	env EXT4FSOPS='${.OBJDIR}/${PROG}' \
+	    EXT4FS_TIMEOUT='${EXT4FS_TIMEOUT}' \
+	    EXT4FS_IMAGE_MB='${EXT4FS_IMAGE_MB}' \
+	    EXT4FS_BLOCK_SIZES='${EXT4FS_BLOCK_SIZES}' \
+	    EXT4FSOPS_MODE='allocation-run' \
 	    sh ${.CURDIR}/operations.sh
 
 run-regress-ext4fsops-directory: ${PROG}

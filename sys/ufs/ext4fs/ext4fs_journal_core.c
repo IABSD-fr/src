@@ -1162,25 +1162,27 @@ ext4fs_journal_begin (struct mount *mp, unsigned int credits,
 			msleep_nsec(&journal->j_active,
 			    &journal->j_lock, PRIBIO, "e4jbegin",
 			    INFSLP);
-		if (error == 0) {
-			tx = journal->j_running != NULL ?
-			    journal->j_running : candidate;
+		if (error == 0 && journal->j_running != NULL) {
+			/*
+			 * Dirty buffers stay busy after journal_end()
+			 * until checkpoint.  New handles cannot join.
+			 * A plain bread() could then wait on its own
+			 * transaction forever.
+			 */
+			checkpoint = 1;
+		} else if (error == 0) {
+			tx = candidate;
 			error = ext4fs_journal_state_reserve(
 			    journal->j_max_transaction_credits,
 			    tx->jt_credits_used,
 			    &tx->jt_credits_reserved, credits);
-			if (error == ENOSPC &&
-			    journal->j_running != NULL)
-				checkpoint = 1;
-			else if (error == 0) {
-				if (journal->j_running == NULL) {
-					/* Consume this sequence. */
-					tx->jt_sequence =
+			if (error == 0) {
+				/* Consume this sequence. */
+				tx->jt_sequence =
 				    ext4fs_journal_state_sequence(
 					    journal->j_next_sequence);
-					journal->j_running = tx;
-					candidate = NULL;
-				}
+				journal->j_running = tx;
+				candidate = NULL;
 				handle->jh_journal = journal;
 				handle->jh_transaction = tx;
 				handle->jh_credits = credits;

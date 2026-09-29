@@ -4522,14 +4522,14 @@ ext4fs_read (void *v)
 }
 
 /*
- * Allocate and expose one regular-file block in a single ordered
- * transaction.  Keeping the transaction open until the data buffer is
- * written prevents a newly mapped hole from exposing stale disk
- * contents.
+ * Allocate and expose a regular-file run in one ordered transaction.
+ * Keeping the transaction open until every data buffer is written
+ * prevents a newly mapped hole from exposing stale disk contents.
  */
 static int
-ext4fs_write_allocated_block (struct inode *ip, struct uio *uio,
-    u_int64_t lbn, int blkoffset, int xfersize, off_t *filesizep)
+ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
+    u_int64_t lbn, int blkoffset, int xfersize, u_int32_t count,
+    off_t *filesizep)
 {
 	struct vnode *vp = ITOV(ip);
 	struct m_ext4fs *fs = ip->i_e4fs;
@@ -4538,14 +4538,19 @@ ext4fs_write_allocated_block (struct inode *ip, struct uio *uio,
 	struct ext4fs_journal_handle *handle;
 	struct buf *bp;
 	off_t saved_filesize;
-	u_int64_t goal, i_blocks, pblk, previous, ncontig;
-	u_int32_t got;
+	u_int64_t goal, pblk, previous, ncontig;
+	u_int32_t got, i;
 	int changed, end_error, error, saved_flags;
+	int offset, size;
 
 	if (fs->m_journal == NULL)
 		return (EOPNOTSUPP);
-	if (lbn > UINT32_MAX)
+	if (lbn > UINT32_MAX || count == 0 ||
+	    count > UINT16_MAX || count > UINT32_MAX - lbn + 1)
 		return (EFBIG);
+	if (count > 1 && (blkoffset != 0 ||
+	    xfersize != fs->m_block_size))
+		return (EINVAL);
 	error = ext4fs_extent_insert_check(ip, (u_int32_t)lbn);
 	if (error)
 		return (error);
@@ -4567,55 +4572,53 @@ ext4fs_write_allocated_block (struct inode *ip, struct uio *uio,
 	if (error)
 		goto fail;
 
-	error = ext4fs_blkalloc_handle(ip, handle, goal, 1, &pblk,
+	error = ext4fs_blkalloc_handle(ip, handle, goal, count, &pblk,
 	    &got);
 	if (error)
 		goto fail;
 	changed = 1;
-	if (got != 1) {
+	if (got == 0 || got > count || got > UINT16_MAX) {
 		error = EIO;
 		goto fail;
 	}
 	error = ext4fs_extent_insert_handle(ip, handle, (u_int32_t)lbn,
-	    pblk, 1);
+	    pblk, (u_int16_t)got);
 	if (error)
 		goto fail;
 
-	i_blocks = letoh32(din->i_blocks_lo) |
-	    ((u_int64_t)letoh16(din->i_blocks_hi) << 32);
-	if (i_blocks > 0xffffffffffffULL -
-	    fs->m_block_size / DEV_BSIZE) {
-		error = EFBIG;
+	error = ext4fs_inode_blocks_add(ip, got);
+	if (error)
 		goto fail;
-	}
-	i_blocks += fs->m_block_size / DEV_BSIZE;
-	din->i_blocks_lo = htole32((u_int32_t)i_blocks);
-	din->i_blocks_hi = htole16((u_int16_t)(i_blocks >> 32));
 	din->i_flags |= htole32(EXTFS_INODE_FLAG_EXTENTS);
 	ip->i_flag |= IN_CHANGE | IN_UPDATE;
 
 	/*
-	 * Extent metadata remains busy until commit, so write the known
+	 * Extent metadata remains busy until commit.  Write each known
 	 * physical block through the device vnode without re-entering
-	 * bmap.  Discard a cached hole buffer first so a later read
-	 * cannot retain its old zero-filled view after the mapping
-	 * becomes visible.
+	 * bmap.  Discard cached hole buffers first so later reads cannot
+	 * retain their old zero-filled views after the mapping becomes
+	 * visible.
 	 */
-	bp = getblk(vp, (daddr_t)lbn, fs->m_block_size, 0, INFSLP);
-	SET(bp->b_flags, B_INVAL);
-	brelse(bp);
-	bp = getblk(ip->i_devvp,
-	    (daddr_t)EXT4FS_FSBTODB(fs, pblk), fs->m_block_size, 0,
-	    INFSLP);
-	clrbuf(bp);
-	error = uiomove((char *)bp->b_data + blkoffset, xfersize, uio);
-	if (error)
-		goto fail;
-	/* The journal flush makes this ordered write durable. */
-	error = bwrite(bp);
-	bp = NULL;
-	if (error)
-		goto fail;
+	for (i = 0; i < got; i++) {
+		offset = i == 0 ? blkoffset : 0;
+		size = i == 0 ? xfersize : fs->m_block_size;
+		bp = getblk(vp, (daddr_t)(lbn + i),
+		    fs->m_block_size, 0, INFSLP);
+		SET(bp->b_flags, B_INVAL);
+		brelse(bp);
+		bp = getblk(ip->i_devvp,
+		    (daddr_t)EXT4FS_FSBTODB(fs, pblk + i),
+		    fs->m_block_size, 0, INFSLP);
+		clrbuf(bp);
+		error = uiomove((char *)bp->b_data + offset, size, uio);
+		if (error)
+			goto fail;
+		/* The journal flush makes this ordered write durable. */
+		error = bwrite(bp);
+		bp = NULL;
+		if (error)
+			goto fail;
+	}
 	(void)uvm_vnp_uncache(vp);
 
 	if (uio->uio_offset > *filesizep) {
@@ -4676,11 +4679,13 @@ ext4fs_write (void *v)
 	off_t filesz;
 	u_int64_t lbn, pblk, ncontig, prealloc_start;
 	u_int32_t prealloc_count, prealloc_got, prealloc_i;
+	u_int32_t run_count;
 	u_int64_t i_blocks;
+	u_int64_t run_limit;
 	int ioflag = ap->a_ioflag;
 	int blkoffset, xfersize;
 	int error;
-	size_t resid;
+	size_t full_blocks, resid;
 	ssize_t overrun;
 
 	if (uio->uio_resid == 0)
@@ -4721,8 +4726,25 @@ ext4fs_write (void *v)
 		if (error)
 			break;
 		if (pblk == 0 && fs->m_journal != NULL) {
-			error = ext4fs_write_allocated_block(ip, uio,
-			    lbn, blkoffset, xfersize, &filesz);
+			run_count = 1;
+			if (blkoffset == 0 &&
+			    xfersize == fs->m_block_size &&
+			    uio->uio_offset == filesz) {
+				full_blocks = uio->uio_resid /
+				    fs->m_block_size;
+				if (full_blocks > MAXBSIZE /
+				    fs->m_block_size)
+					full_blocks = MAXBSIZE /
+					    fs->m_block_size;
+				run_limit = (u_int64_t)UINT32_MAX -
+				    lbn + 1;
+				if (full_blocks > run_limit)
+					full_blocks = run_limit;
+				run_count = (u_int32_t)full_blocks;
+			}
+			error = ext4fs_write_allocated_run(ip, uio,
+			    lbn, blkoffset, xfersize, run_count,
+			    &filesz);
 			if (error)
 				break;
 			continue;
@@ -4731,9 +4753,8 @@ ext4fs_write (void *v)
 		/*
 		 * For full-block writes past EOF, batch-allocate
 		 * contiguous blocks for the remaining write on
-		 * journal-less filesystems.  The serialized journal
-		 * path allocates one block per ordered transaction
-		 * above.
+		 * journal-less filesystems.  The serialized journal path
+		 * batches aligned append growth above.
 		 */
 		if (blkoffset == 0 && xfersize == fs->m_block_size &&
 		    uio->uio_offset >= filesz && pblk == 0) {

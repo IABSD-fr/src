@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 
 #include <dirent.h>
 #include <err.h>
@@ -45,6 +46,8 @@
 #define FAST_SYMLINK_BYTES	60
 #define ORPHAN_INODE_BYTES	256
 #define IO_CHUNK	4096
+#define HANDOFF_WORKERS	8
+#define HANDOFF_ITERATIONS	16
 
 #define DATA_SEED	0x31U
 #define APPEND_SEED	0x52U
@@ -52,6 +55,7 @@
 #define EXTENT_SEED	0xb4U
 #define EXTENT_SPLIT_SEED	0x68U
 #define EXTENT_APPEND_SEED	0x79U
+#define ALLOCATION_RUN_SEED	0x5eU
 #define BITMAP_SEED	0xc7U
 #define FSYNC_INITIAL_SEED	0x2dU
 #define FSYNC_UPDATE_SEED	0xe1U
@@ -103,6 +107,8 @@ static void	verify_final_tree (void);
 static void	verify_readonly_tree (void);
 static void	create_allocation_probe (void);
 static void	verify_allocation_probe (void);
+static void	write_allocation_run (void);
+static void	verify_allocation_run (void);
 static void	create_extent_file (const char *);
 static size_t	extent_leaf_capacity (void);
 static off_t	extent_lbn_offset (size_t);
@@ -146,6 +152,7 @@ static void	create_remount_fixture (void);
 static void	update_remount_fixture (unsigned int, int);
 static void	verify_remount_fixture (unsigned int, int);
 static void	hold_remount_orphan (void);
+static void	journal_handoff_stress (void);
 
 static void
 make_path (char *path, size_t pathlen, const char *suffix)
@@ -2355,6 +2362,61 @@ verify_allocation_probe (void)
 }
 
 static void
+write_allocation_run (void)
+{
+	struct stat st;
+	unsigned char *buffer;
+	char path[PATH_MAX];
+	ssize_t n;
+	int fd;
+
+	make_path(path, sizeof(path), "allocation-run");
+	fd = open(path, O_RDWR);
+	if (fd == -1)
+		err(1, "open %s", path);
+	buffer = malloc(MAXBSIZE);
+	if (buffer == NULL)
+		err(1, "malloc allocation run");
+	fill_pattern(buffer, MAXBSIZE, 0, ALLOCATION_RUN_SEED);
+	n = pwrite(fd, buffer, MAXBSIZE, 0);
+	if (n == -1)
+		err(1, "pwrite %s", path);
+	if (n != MAXBSIZE)
+		errx(1, "short allocation-run write: %zd", n);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (st.st_size != MAXBSIZE ||
+	    st.st_blocks != MAXBSIZE / DEV_BSIZE)
+		errx(1, "allocation run has wrong inode shape");
+	free(buffer);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+verify_allocation_run (void)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	int fd;
+
+	make_path(path, sizeof(path), "allocation-run");
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (! S_ISREG(st.st_mode) || st.st_size != MAXBSIZE ||
+	    st.st_blocks != MAXBSIZE / DEV_BSIZE)
+		errx(1, "allocation run has wrong inode shape");
+	check_pattern_fd(fd, 0, MAXBSIZE, ALLOCATION_RUN_SEED);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
 allocate_bitmap_probe (void)
 {
 	struct statfs before, after;
@@ -2919,6 +2981,93 @@ hold_remount_orphan (void)
 		err(1, "unlink %s", release);
 }
 
+static void
+journal_handoff_child (unsigned int worker, int startfd)
+{
+	char from[PATH_MAX], to[PATH_MAX];
+	unsigned char value;
+	ssize_t n;
+	int fd, i;
+
+	do {
+		n = read(startfd, &value, sizeof(value));
+	} while (n == -1 && errno == EINTR);
+	if (n == -1)
+		err(1, "read start gate");
+	if (n != 0)
+		errx(1, "unexpected start-gate data");
+	if (close(startfd) == -1)
+		err(1, "close start gate");
+
+	for (i = 0; i < HANDOFF_ITERATIONS; i++) {
+		if (snprintf(from, sizeof(from), "%s/worker-%u-a",
+		    root, worker) >= (int)sizeof(from) ||
+		    snprintf(to, sizeof(to), "%s/worker-%u-b",
+		    root, worker) >= (int)sizeof(to))
+			errx(1, "handoff path too long");
+		fd = open(from, O_RDWR | O_CREAT | O_EXCL, 0600);
+		if (fd == -1)
+			err(1, "open %s", from);
+		value = (unsigned char)(worker + i);
+		n = write(fd, &value, sizeof(value));
+		if (n == -1)
+			err(1, "write %s", from);
+		if (n != (ssize_t)sizeof(value))
+			errx(1, "short write %s", from);
+		if (fsync(fd) == -1)
+			err(1, "fsync %s", from);
+		if (fchmod(fd, 0640) == -1)
+			err(1, "fchmod %s", from);
+		if (rename(from, to) == -1)
+			err(1, "rename %s", from);
+		if (unlink(to) == -1)
+			err(1, "unlink %s", to);
+		if (close(fd) == -1)
+			err(1, "close %s", to);
+	}
+}
+
+static void
+journal_handoff_stress (void)
+{
+	pid_t children[HANDOFF_WORKERS], pid;
+	int gate[2], failed, i, status;
+
+	if (pipe(gate) == -1)
+		err(1, "pipe");
+	for (i = 0; i < HANDOFF_WORKERS; i++) {
+		pid = fork();
+		if (pid == -1)
+			err(1, "fork");
+		if (pid == 0) {
+			if (close(gate[1]) == -1)
+				err(1, "close start writer");
+			journal_handoff_child((unsigned int)i, gate[0]);
+			_exit(0);
+		}
+		children[i] = pid;
+	}
+	if (close(gate[0]) == -1)
+		err(1, "close start reader");
+	if (close(gate[1]) == -1)
+		err(1, "release start gate");
+
+	failed = 0;
+	for (i = 0; i < HANDOFF_WORKERS; i++) {
+		do {
+			pid = waitpid(children[i], &status, 0);
+		} while (pid == -1 && errno == EINTR);
+		if (pid == -1)
+			err(1, "waitpid");
+		if (! WIFEXITED(status) || WEXITSTATUS(status) != 0)
+			failed = 1;
+	}
+	if (failed)
+		errx(1, "journal handoff child failed");
+	if (rmdir(root) == -1)
+		err(1, "rmdir %s", root);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -2984,6 +3133,13 @@ main (int argc, char **argv)
 			err(1, "rmdir %s", root);
 		block_size = (size_t)sfs.f_bsize;
 		create_orphan_fixture();
+	} else if (strcmp(argv[1], "journal-handoff") == 0) {
+		if (mkdir(root, 0755) == -1)
+			err(1, "mkdir %s", root);
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs %s", root);
+		block_size = (size_t)sfs.f_bsize;
+		journal_handoff_stress();
 	} else {
 		if (statfs(root, &sfs) == -1)
 			err(1, "statfs %s", root);
@@ -3002,6 +3158,10 @@ main (int argc, char **argv)
 			create_allocation_probe();
 		else if (strcmp(argv[1], "verify-allocation-probe") == 0)
 			verify_allocation_probe();
+		else if (strcmp(argv[1], "allocation-run-write") == 0)
+			write_allocation_run();
+		else if (strcmp(argv[1], "allocation-run-verify") == 0)
+			verify_allocation_run();
 		else if (strcmp(argv[1], "bitmap-verify") == 0)
 			verify_bitmap_probe(1);
 		else if (strcmp(argv[1], "bitmap-free") == 0)

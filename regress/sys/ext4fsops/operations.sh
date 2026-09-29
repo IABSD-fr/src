@@ -347,6 +347,19 @@ journal_sequence()
 	journal_word 24
 }
 
+journal_sequence_next()
+{
+	sequence=$1
+	case "$sequence" in
+	????????) ;;
+	*) fail "invalid journal sequence length" ;;
+	esac
+	case "$sequence" in
+	*[!0-9a-fA-F]*) fail "invalid journal sequence" ;;
+	esac
+	printf '%08x\n' "$(((0x$sequence + 1) & 0xffffffff))"
+}
+
 journal_start()
 {
 	journal_word 28
@@ -1757,6 +1770,59 @@ run_extent_step()
 	sequence_before=$sequence_after
 }
 
+run_allocation_run_case()
+{
+	block_size=$1
+	case_dir=$work/allocation-run-$block_size
+	image=$case_dir/ext4.img
+	empty=$case_dir/empty
+	mkdir "$case_dir"
+	: >"$empty"
+	test_name="allocation run ($block_size byte blocks)"
+	print_test_name "$test_name"
+
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O 'metadata_csum,^orphan_file' "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs failed"
+	fi
+	if ! "$DEBUGFS" -w -R "write $empty /allocation-run" \
+	    "$image" >"$case_dir/debugfs.log" 2>&1; then
+		cat "$case_dir/debugfs.log" >&2
+		fail "could not create allocation-run fixture"
+	fi
+	check_image fixture
+	sequence_before=$(journal_sequence)
+	sequence_expected=$(journal_sequence_next "$sequence_before")
+
+	attach_image
+	mount_image noatime
+	run_step allocation-run-write "$mountpoint"
+	unmount_image allocation-run-write
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" = "$sequence_expected" ] || {
+		reason="allocation run used more than one transaction"
+		fail "$reason: $sequence_before to $sequence_after"
+	}
+	check_image allocation-run-write
+
+	before=$(sha256 -q "$image")
+	attach_image
+	mount_image ro
+	run_step allocation-run-verify "$mountpoint"
+	unmount_image allocation-run-verify
+	detach_image
+	after=$(sha256 -q "$image")
+	[ "$before" = "$after" ] ||
+	    fail "read-only verification changed the image"
+	check_image allocation-run-verify
+	echo " ok"
+}
+
 run_extent_case()
 {
 	block_size=$1
@@ -2118,6 +2184,44 @@ run_orphan_corrupt_case()
 	echo " ok"
 }
 
+run_handoff_case()
+{
+	block_size=$1
+	case_dir=$work/handoff-$block_size
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	test_name="transaction handoff ($block_size byte blocks)"
+	print_test_name "$test_name"
+
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O 'metadata_csum,orphan_file' "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs failed"
+	fi
+	sequence_before=$(journal_sequence)
+
+	attach_image
+	mount_image noatime
+	run_step journal-handoff "$mountpoint/handoff"
+	unmount_image journal-handoff
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "concurrent operations did not commit"
+	check_last_orphan_clear
+	"$DUMPE2FS" -h "$image" >"$case_dir/dumpe2fs-after.log" \
+	    2>&1 || fail "dumpe2fs rejected the handoff image"
+	if grep -q '^Filesystem features:.*orphan_present' \
+	    "$case_dir/dumpe2fs-after.log"; then
+		fail "concurrent close retained ORPHAN_PRESENT"
+	fi
+	check_image journal-handoff
+	echo " ok"
+}
+
 run_special_case()
 {
 	case_dir=$work/special-inodes
@@ -2153,6 +2257,19 @@ run_special_case()
 }
 
 case "$EXT4FSOPS_MODE" in
+handoff)
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		case "$block_size" in
+		1024|2048|4096) ;;
+		*)
+			echo "bad block size: $block_size" >&2
+			exit 1
+			;;
+		esac
+		run_handoff_case "$block_size"
+	done
+	exit 0
+	;;
 special)
 	run_special_case
 	exit 0
@@ -2296,6 +2413,19 @@ remount)
 		run_remount_case "$block_size" classic
 	done
 	run_remount_case 1024 orphan-file
+	exit 0
+	;;
+allocation-run)
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		case "$block_size" in
+		1024|2048|4096) ;;
+		*)
+			echo "bad block size: $block_size" >&2
+			exit 1
+			;;
+		esac
+		run_allocation_run_case "$block_size"
+	done
 	exit 0
 	;;
 extents)
