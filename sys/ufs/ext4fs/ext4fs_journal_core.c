@@ -1635,19 +1635,22 @@ ext4fs_journal_force_commit (struct mount *mp)
 		first = ext4fs_journal_abort_locked(journal, error,
 		    __func__, &info);
 	} else {
-		journal->j_committing = NULL;
 		journal->j_head = new_head;
 		journal->j_tail = new_head;
 		journal->j_free = journal->j_maxlen - journal->j_first;
 		journal->j_stage = EXT4FS_JOURNAL_STAGE_OUTSIDE;
 	}
+	journal->j_committing = NULL;
 	wakeup(&journal->j_committing);
 	mtx_leave(&journal->j_lock);
 	if (first)
 		ext4fs_journal_abort_policy(mp, error, &info);
 
-	if (error == 0)
-		ext4fs_journal_transaction_free(tx);
+	/*
+	 * A failed transaction cannot be retried after journal abort.
+	 * Discard its busy metadata buffers so callers can unwind.
+	 */
+	ext4fs_journal_transaction_free(tx);
 	return (error);
 }
 

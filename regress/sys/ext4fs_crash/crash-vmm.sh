@@ -408,17 +408,18 @@ exec /tmp/ext4fs_crash boundary $stage /mnt/ext4/crash"
 
 wait_disk_fail_armed()
 {
-	operation=$1
-	count=$2
-	log=$3
+	dfw_operation=$1
+	dfw_count=$2
+	dfw_log=$3
 	wait_ticks=0
 	max_ticks=$((EXT4FS_CRASH_STEP_TIMEOUT * 10))
-	while ! grep -q "armed vm .* disk 1 at $operation $count" \
-	    "$log" 2>/dev/null; do
+	while ! grep -q \
+	    "armed vm .* disk 1 at $dfw_operation $dfw_count" \
+	    "$dfw_log" 2>/dev/null; do
 		if ! kill -0 "$control_pid" 2>/dev/null; then
 			wait "$control_pid" || status=$?
 			control_pid=
-			cat "$log" >&2
+			cat "$dfw_log" >&2
 			fail "disk-fail control exited before arming"
 		fi
 		[ "$wait_ticks" -lt "$max_ticks" ] ||
@@ -430,18 +431,19 @@ wait_disk_fail_armed()
 
 wait_disk_fail_fired()
 {
-	operation=$1
-	count=$2
-	log=$3
+	dfw_operation=$1
+	dfw_count=$2
+	dfw_log=$3
 	if ! wait "$control_pid"; then
 		control_pid=
-		cat "$log" >&2
+		cat "$dfw_log" >&2
 		fail "disk-fail control failed"
 	fi
 	control_pid=
-	grep -q "failed vm .* disk 1 at $operation $count" \
-	    "$log" || {
-		cat "$log" >&2
+	grep -q \
+	    "failed vm .* disk 1 at $dfw_operation $dfw_count" \
+	    "$dfw_log" || {
+		cat "$dfw_log" >&2
 		fail "disk-fail control did not report the error"
 	}
 }
@@ -454,7 +456,7 @@ run_error_boundary()
 	control_log=$4
 	trigger="set -e
 mkdir -p /mnt/ext4
-mount_ext4fs -o errors=remount-ro /dev/sd1c /mnt/ext4
+mount_ext4fs /dev/sd1c /mnt/ext4
 exec /tmp/ext4fs_crash error-boundary error-rename \
 /mnt/ext4/crash"
 	ssh_workload "root@$guest" "$trigger" >"$log" 2>&1 &
@@ -480,12 +482,16 @@ exec /tmp/ext4fs_crash error-boundary error-rename \
 	ssh_step "root@$guest" touch /tmp/ext4fs_crash.go ||
 	    fail "could not release error workload"
 	wait_disk_fail_fired "$operation" "$count" "$control_log"
-	if ! wait "$ssh_pid"; then
-		ssh_pid=
+	status=0
+	wait "$ssh_pid" || status=$?
+	ssh_pid=
+	if [ "$status" -ne 0 ]; then
 		cat "$log" >&2
+		if [ "$status" -eq 124 ]; then
+			fail "journal abort did not wake error workload"
+		fi
 		fail "error workload rejected the journal abort"
 	fi
-	ssh_pid=
 	grep -qx 'state=journal-aborted' "$log" || {
 		cat "$log" >&2
 		fail "error workload did not observe journal abort"
@@ -614,10 +620,11 @@ run_read_error_case()
 	wait_disk_fail_armed read 1 "$case_dir/disk-fail.log"
 	trigger="set -e
 mkdir -p /mnt/ext4
-mount_ext4fs /dev/sd1c /mnt/ext4"
+mount_ext4fs -o ro /dev/sd1c /mnt/ext4
+/tmp/ext4fs_crash verify /mnt/ext4/crash"
 	if ssh_step "root@$guest" "$trigger" \
 	    >"$case_dir/mount.log" 2>&1; then
-		fail "mount succeeded after injected read error"
+		fail "mount and read succeeded after injected read error"
 	fi
 	wait_disk_fail_fired read 1 "$case_dir/disk-fail.log"
 	stop_guest
@@ -1321,8 +1328,12 @@ for block_size in $EXT4FS_CRASH_BLOCK_SIZES; do
 	base=$work/base-$block_size.img
 	dd if=/dev/zero of="$base" bs=1m count=0 \
 	    seek="$EXT4FS_CRASH_IMAGE_MB" status=none
+	mke2fs_errors=
+	if [ "$EXT4FS_CRASH_MODE" = errors ]; then
+		mke2fs_errors='-e remount-ro'
+	fi
 	"$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
-	    -O '^orphan_file,^uninit_bg' "$base"
+	    $mke2fs_errors -O '^orphan_file,^uninit_bg' "$base"
 	"$DEBUGFS" -w -R 'mkdir /crash' "$base" \
 	    >"$work/debugfs-dir-$block_size.log" 2>&1 ||
 	    fail "could not create baseline directory"
@@ -1334,6 +1345,12 @@ for block_size in $EXT4FS_CRASH_BLOCK_SIZES; do
 	    fail "e2fsck rejected baseline image"
 
 	if [ "$EXT4FS_CRASH_MODE" = errors ]; then
+		"$DUMPE2FS" -h "$base" \
+		    >"$work/error-policy-$block_size.log" 2>&1 ||
+		    fail "could not inspect error-policy fixture"
+		grep -q '^Errors behavior:.*Remount read-only' \
+		    "$work/error-policy-$block_size.log" ||
+		    fail "fixture does not use errors=remount-ro"
 		run_read_error_case "$base" "$block_size"
 		run_journal_error_case "$base" "$block_size" write 1
 		for flush_count in $EXT4FS_CRASH_FLUSH_COUNTS; do

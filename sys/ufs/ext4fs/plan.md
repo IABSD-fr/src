@@ -421,7 +421,7 @@ ext4 filesystems; ext2 and ext3 compatibility is outside this project.
 - [ ] After every injected resource failure, verify the expected errno,
       unmount cleanly, run `e2fsck -fn`, remount, validate surviving
       file data and names, and check free-space/free-inode accounting.
-- [ ] Cover real device I/O error handling when a production-kernel
+- [x] Cover real device I/O error handling when a production-kernel
       mechanism can provide deterministic failures without ext4fs
       instrumentation; keep these cases separate from ordinary ENOSPC
       tests.
@@ -1158,23 +1158,43 @@ wraparound cuts against the production kernel.  Every case also passed
 its exact state, journal geometry, accounting, recovery-idempotence,
 and offline `e2fsck -fn` checks.
 
-A one-shot vmd device-error control is now integrated without ext4fs
-instrumentation.  `vmctl disk-fail` can fail a selected read, write,
-or flush request on one disposable-VM disk, returns a normal virtio
-block I/O error to the production guest, and reports both arming and
-firing to the controller.  It is mutually exclusive with
-`flush-stop`.  The explicit
-`run-regress-ext4fs-crash-errors-vmm` target checks that a mount read
-failure is byte-for-byte non-mutating, that a journal write failure
-returns `EIO` and forces `errors=remount-ro`, and that all six
-flush-error positions do the same.  Each journal-abort case must retain
-`RECOVER`, recover to an exact old-or-new rename state, remain
+A persistent vmd device-error control is now integrated without
+ext4fs instrumentation.  Starting at a selected read, write, or flush
+request on one disposable-VM disk, `vmctl disk-fail` returns normal
+virtio block I/O errors for every matching request until the VM stops.
+The controller reports both arming and the first delivered error.  This
+also covers non-essential probes and any lower-layer retry without
+changing the kernel.  The control is mutually exclusive with
+`flush-stop`.  Error fixtures explicitly select the on-disk
+`errors=remount-ro` policy; it is not a `mount_ext4fs` option.  The
+explicit `run-regress-ext4fs-crash-errors-vmm` target checks that a
+read-only mount/read failure is byte-for-byte non-mutating.  Journal
+write failures must return `EIO` and force `errors=remount-ro`; all six
+flush-error positions must do the same.  Each journal-abort case must
+retain `RECOVER`, recover to an exact old-or-new rename state, remain
 idempotent, and pass offline `e2fsck -fn`.  The production-warning
 builds, non-root helper self-test, shell validation, and 72-column
 checks pass.  The installed production-vmd run remains pending.
 
-The production error-injection run and Linux-verification matrix remain
-Phase 6 work.
+The first focused production run passed the persistent read-error case.
+Its first journal write error then exposed an abort-lifetime bug:
+`ext4fs_journal_force_commit()` recorded the error but retained the
+failed transaction and its busy metadata buffers, so the rename caller
+could not unwind before the workload timeout.  Failed commits now
+detach and discard that transaction after publishing the sticky abort
+and waking waiters.  The first rebuilt-kernel rerun confirmed that the
+write caller now unwinds.  It also exposed a POSIX `sh` variable alias:
+the controller-wait helper replaced its caller's workload-log name, so
+the successful abort marker was sought in the controller log.  The
+helper variables are now isolated.  On 2026-09-29, the corrected
+production-kernel run passed the persistent read error, journal write
+error, and all six journal flush errors for 1 KiB blocks.  A second
+run passed the same eight cases for both 2 KiB and 4 KiB blocks.  All
+24 deterministic device-error cases now pass against the production
+kernel with exact recovery, idempotence, and offline `e2fsck -fn`
+validation.
+
+The Linux-verification matrix remains Phase 6 work.
 
 Use filesystem images created by Linux tools and run IABSD in a VM.
 Inject an abrupt power loss after each commit phase and at journal
