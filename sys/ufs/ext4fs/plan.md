@@ -1119,8 +1119,11 @@ count.  Clearing `RECOVER` then wrote that stale count over the
 recovered superblock.  Replay now flushes the home blocks and
 invalidates clean device buffers before rereading the fixed-offset
 superblock, preventing the block-zero and sector-two cache aliases
-used by 2 KiB and 4 KiB filesystems.  A focused production-kernel
-rerun is pending.
+used by 2 KiB and 4 KiB filesystems.  On 2026-09-29, all twelve
+2 KiB and 4 KiB cuts passed against the rebuilt production kernel.
+Together with the earlier 1 KiB results, all eighteen block-reuse
+cases now pass with exact physical reuse and accounting, idempotent
+recovery, and offline `e2fsck -fn` acceptance.
 
 The remaining exhaustion, wraparound, error injection, and Linux
 verification matrices remain Phase 6 work.
