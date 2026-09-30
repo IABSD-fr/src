@@ -288,7 +288,7 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 				break;
 			}
 			vdf.vdf_id = vm->vm_vmid;
-		} else if ((vm = vm_getbyid(vdf.vdf_id)) == NULL) {
+		} else if ((vm = vm_getbyvmid(vdf.vdf_id)) == NULL) {
 			res = ENOENT;
 			break;
 		}
@@ -318,7 +318,7 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 				break;
 			}
 			vfs.vfs_id = vm->vm_vmid;
-		} else if ((vm = vm_getbyid(vfs.vfs_id)) == NULL) {
+		} else if ((vm = vm_getbyvmid(vfs.vfs_id)) == NULL) {
 			res = ENOENT;
 			break;
 		}
