@@ -227,6 +227,7 @@ fi
 
 if ${DO_SIGN}; then
 	echo "=== Signing packages ==="
+	rm -rf ${PACKAGES}/signed/
 	run pkg_sign -C -s signify2 -s /root/signify/iabsd-01-pkg.sec \
 	    -o ${PACKAGES}/signed/ -S ${PACKAGES}/
 	echo "=== Packages signed ==="
