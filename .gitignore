@@ -1,4 +1,6 @@
 CVS
 .claude
+*.d
 obj
+regress/sys/ext4fs_crash/ext4fs_crash
 tags
