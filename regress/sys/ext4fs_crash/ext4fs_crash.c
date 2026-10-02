@@ -16,6 +16,7 @@
  * PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <sys/param.h>
 #include <sys/types.h>
 #include <sys/endian.h>
 #include <sys/mount.h>
@@ -58,6 +59,8 @@
 #define REUSE_SEED	0xb4U
 #define EXHAUST_DIR	"exhausted"
 #define EXHAUST_PROBE	"exhaustion-probe"
+#define ALLOCATION_ERROR_FILE	"allocation-error"
+#define ALLOCATION_ERROR_SEED	0x5eU
 
 #define JBD2_MAGIC		UINT32_C(0xc03b3998)
 #define JBD2_SUPERBLOCK_V2	4
@@ -126,6 +129,7 @@ static void	run_truncate_prune (const char *, const char *, int);
 static void	run_block_reuse (const char *, const char *, int);
 static void	run_rename_wrap (const char *, const char *, int);
 static void	run_error_rename (const char *, const char *);
+static void	run_allocation_error (const char *, const char *);
 static void	run_journal_exhaustion (const char *);
 static void	run_workload (const char *, const char *, int);
 static void	verify_dir_growth (const char *);
@@ -134,6 +138,7 @@ static void	verify_extent_promote (const char *);
 static void	verify_extent_split (const char *);
 static void	verify_truncate_prune (const char *);
 static void	verify_block_reuse (const char *);
+static void	verify_allocation_error (const char *);
 static void	verify_journal_exhaustion (const char *);
 static void	verify_workload (const char *);
 static void	verify_unlink (const char *);
@@ -1087,6 +1092,64 @@ run_error_rename (const char *stage, const char *root)
 }
 
 static void
+run_allocation_error (const char *stage, const char *root)
+{
+	unsigned char *buf;
+	struct stat st;
+	char path[PATH_MAX], probe[PATH_MAX];
+	off_t offset;
+	ssize_t written;
+	int error, fd, probe_fd;
+
+	if (strcmp(stage, "allocation-write") != 0)
+		errx(1, "unknown allocation-error stage: %s", stage);
+	make_path(path, sizeof(path), root, ALLOCATION_ERROR_FILE);
+	make_path(probe, sizeof(probe), root, "allocation-error-probe");
+	fd = open_output(path, 1);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	buf = malloc(MAXBSIZE);
+	if (buf == NULL)
+		err(1, "malloc allocation-error buffer");
+	fill_pattern(buf, MAXBSIZE, 0, ALLOCATION_ERROR_SEED);
+	arm_boundary(stage);
+	written = write(fd, buf, MAXBSIZE);
+	if (written != -1)
+		errx(1, "allocation write returned %zd after I/O error",
+		    written);
+	error = errno;
+	if (error != EIO) {
+		errno = error;
+		err(1, "allocation write returned unexpected error");
+	}
+	offset = lseek(fd, 0, SEEK_CUR);
+	if (offset == -1)
+		err(1, "lseek %s", path);
+	if (offset != 0)
+		errx(1, "failed allocation write advanced offset to %lld",
+		    (long long)offset);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (! S_ISREG(st.st_mode) || st.st_size != 0 ||
+	    st.st_blocks != 0)
+		errx(1, "failed allocation write changed inode shape");
+	free(buf);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	probe_fd = open(probe,
+	    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+	if (probe_fd != -1) {
+		(void)close(probe_fd);
+		errx(1, "write succeeded after allocation abort");
+	}
+	if (errno != EROFS)
+		err(1, "write after allocation abort");
+	printf("state=allocation-aborted\n");
+	if (fflush(stdout) == EOF)
+		err(1, "publish allocation-abort state");
+}
+
+static void
 run_journal_exhaustion (const char *root)
 {
 	struct stat st;
@@ -1328,6 +1391,23 @@ verify_block_reuse (const char *root)
 	printf("state=reuse-%s\n", state ? "allocated" : "free");
 	if (fflush(stdout) == EOF)
 		err(1, "publish block-reuse state");
+}
+
+static void
+verify_allocation_error (const char *root)
+{
+	struct stat st;
+	char path[PATH_MAX];
+
+	make_path(path, sizeof(path), root, ALLOCATION_ERROR_FILE);
+	if (stat(path, &st) == -1)
+		err(1, "stat %s", path);
+	if (! S_ISREG(st.st_mode) || st.st_nlink != 1 ||
+	    st.st_size != 0 || st.st_blocks != 0)
+		errx(1, "%s has invalid recovered shape", path);
+	printf("state=allocation-empty\n");
+	if (fflush(stdout) == EOF)
+		err(1, "publish allocation-error state");
 }
 
 static void
@@ -1582,6 +1662,9 @@ main (int argc, char **argv)
 	else if (argc == 4 &&
 	    strcmp(argv[1], "error-boundary") == 0)
 		run_error_rename(argv[2], argv[3]);
+	else if (argc == 4 &&
+	    strcmp(argv[1], "allocation-error-boundary") == 0)
+		run_allocation_error(argv[2], argv[3]);
 	else if (argc == 3 && strcmp(argv[1], "verify") == 0)
 		verify_workload(argv[2]);
 	else if (argc == 3 && strcmp(argv[1], "verify-unlink") == 0)
@@ -1603,6 +1686,9 @@ main (int argc, char **argv)
 	    strcmp(argv[1], "verify-block-reuse") == 0)
 		verify_block_reuse(argv[2]);
 	else if (argc == 3 &&
+	    strcmp(argv[1], "verify-allocation-error") == 0)
+		verify_allocation_error(argv[2]);
+	else if (argc == 3 &&
 	    strcmp(argv[1], "journal-exhaustion") == 0)
 		run_journal_exhaustion(argv[2]);
 	else if (argc == 3 &&
@@ -1615,12 +1701,14 @@ main (int argc, char **argv)
 		    "journal-exhaustion root | "
 		    "workload stage root | boundary stage root | "
 		    "error-boundary stage root | "
+		    "allocation-error-boundary stage root | "
 		    "verify root | verify-unlink root | "
 		    "verify-dir-growth root | verify-rmdir root | "
 		    "verify-extent-promote root | "
 		    "verify-extent-split root | "
 		    "verify-truncate-prune root | "
 		    "verify-block-reuse root | "
+		    "verify-allocation-error root | "
 		    "verify-journal-exhaustion root");
 	return (0);
 }

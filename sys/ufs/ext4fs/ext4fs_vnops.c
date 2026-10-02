@@ -4537,11 +4537,12 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 	struct ext4fs_dinode_256 saved_inode;
 	struct ext4fs_journal_handle *handle;
 	struct buf *bp;
-	off_t saved_filesize;
+	off_t saved_filesize, saved_offset;
 	u_int64_t goal, pblk, previous, ncontig;
 	u_int32_t got, i;
 	int changed, end_error, error, saved_flags;
 	int offset, size;
+	size_t saved_resid;
 
 	if (fs->m_journal == NULL)
 		return (EOPNOTSUPP);
@@ -4562,6 +4563,8 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 	memcpy(&saved_inode, ip->i_e4din, sizeof(saved_inode));
 	saved_flags = ip->i_flag;
 	saved_filesize = *filesizep;
+	saved_offset = uio->uio_offset;
+	saved_resid = uio->uio_resid;
 	handle = NULL;
 	bp = NULL;
 	changed = 0;
@@ -4657,6 +4660,13 @@ fail:
 		error = end_error;
 
 restore:
+	/*
+	 * The transaction did not complete.  Match the BSD atomic-write
+	 * convention: do not report bytes whose new mapping was restored
+	 * from the inode snapshot.
+	 */
+	uio->uio_offset = saved_offset;
+	uio->uio_resid = saved_resid;
 	memcpy(ip->i_e4din, &saved_inode, sizeof(saved_inode));
 	ip->i_flag = saved_flags;
 	*filesizep = saved_filesize;

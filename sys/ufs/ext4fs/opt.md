@@ -5,11 +5,11 @@
 This plan improves ext4fs write performance without weakening ordered
 journalling, recovery, or error handling.
 
-The first target is newly allocated sequential file data.  A current
-large-file copy commonly issues one filesystem block per transaction.
-On a 4096-byte filesystem this produces roughly 4 KiB transfers and a
-complete journal commit for every new data block.  This is consistent
-with the observed rsync throughput near 1 MiB/s.
+The first target is newly allocated sequential file data.  Before
+Phase 1, a large-file copy issued one filesystem block per transaction.
+On a 4096-byte filesystem this produced roughly 4 KiB transfers and a
+complete journal commit for every new data block.  This was consistent
+with observed rsync throughput near 1 MiB/s.
 
 The work must remain native BSD code.  It must not copy Linux source.
 It must support ext4 only, preserve 32-bit system compatibility, and
@@ -34,14 +34,14 @@ work with 1024, 2048, and 4096-byte filesystem blocks.
 - [ ] Retain the production kernel path.  Do not add a test-only kernel
       implementation or a separate optimization configuration.
 
-## Current Bottlenecks
+## Initial Bottleneck Audit
 
 The initial audit found these dominant costs:
 
-- Newly allocated file growth handles one filesystem block in each
+- Newly allocated file growth handled one filesystem block in each
   transaction.  Allocation, extent insertion, ordered data write, inode
-  update, commit, checkpoint, and journal clearing all occur for that
-  single block.
+  update, commit, checkpoint, and journal clearing all occurred for that
+  single block before Phase 1.
 - Most metadata operations call `ext4fs_journal_force_commit()` before
   returning, so independent operations cannot share a transaction.
 - A non-empty transaction currently reaches six device durability
@@ -58,6 +58,32 @@ The initial audit found these dominant costs:
 - Linear metadata and revoke searches and per-commit temporary
   allocations are secondary costs.  They should be addressed only
   after the I/O path is no longer the dominant limit.
+
+## Status on 2026-10-02
+
+Phase 1 now batches aligned append allocation into a bounded physical
+run.  The production kernel caps a run at `MAXBSIZE`, keeps the run
+within one block group, inserts it as one extent, writes every ordered
+data block, and commits the metadata once.  Partial and sparse writes
+remain on the single-block path.
+
+The `allocation-run` regression performs one `MAXBSIZE` `pwrite`,
+requires exactly one journal sequence advance, checks inode allocation,
+unmounts, runs the offline checker, remounts read-only, and verifies all
+data.  The booted production kernel passed this regression with 1024,
+2048, and 4096-byte filesystem blocks.
+
+The normal allocation-error VMM target injects failures at the first,
+middle, and final data writes.  A separately named `-all-vmm` target
+retains exhaustive failure injection at every write position.
+
+The live whole-filesystem rsync initially transferred approximately
+1--1.7 MiB/s.  With the Phase 1 kernel, rsync reached approximately
+11 MiB/s while `systat` reported approximately 20 MiB/s of physical
+write traffic on softraid RAID1.  These are field observations, not a
+controlled benchmark.  The reported raw-device ceiling is 1200 Mbit/s,
+or approximately 150 MB/s, so durability latency remains the likely
+limit rather than media bandwidth.
 
 ## Phase 0: Establish a Reproducible Baseline
 
@@ -104,36 +130,37 @@ After every benchmark image:
 This is the highest-priority optimization.  It directly removes the
 one-transaction-per-block behavior seen during rsync.
 
-- [ ] Replace the single-block journaled allocation path with a bounded
+- [x] Replace the single-block journaled allocation path with a bounded
       contiguous-run path for aligned full-block writes.
-- [ ] Determine the requested run from the `uio`, the filesystem block
-      size, the current block group, the extent limit, available journal
-      credits, and all 32-bit overflow limits.
-- [ ] Begin with a conservative maximum run.  Raise it only from
+- [x] Determine the requested run from the `uio`, filesystem block
+      size, `MAXBSIZE`, and the 32-bit logical-block limit.
+- [ ] Derive future larger run limits from extent capacity and available
+      journal credits rather than a fixed conservative bound.
+- [x] Begin with a conservative maximum run.  Raise it only from
       measurements and crash-test results.
 - [ ] Reserve enough credits before changing anything for every bitmap,
       group descriptor, extent node, inode, and superblock that the run
       may dirty.
-- [ ] Stop or split a run at a block-group boundary unless all affected
+- [x] Stop or split a run at a block-group boundary unless all affected
       group metadata has been credited and validated.
-- [ ] Allocate a contiguous physical run where possible and insert one
+- [x] Allocate a contiguous physical run where possible and insert one
       extent, or a bounded number of extents when fragmentation requires
       it.
-- [ ] Write and complete all ordered data for the run before exposing
+- [x] Write and complete all ordered data for the run before exposing
       its metadata transaction as committed.
-- [ ] Keep partial first and last blocks on the existing safe path until
+- [x] Keep partial first and last blocks on the existing safe path until
       their read-modify-write behavior is covered explicitly.
-- [ ] On a short write or data-write failure, expose only the fully
+- [x] On a short write or data-write failure, expose only the fully
       initialized prefix or roll back the complete allocation.
-- [ ] Never expose an allocated block containing stale device data.
-- [ ] Preserve file size, `i_blocks`, timestamps, and extent checks when
+- [x] Never expose an allocated block containing stale device data.
+- [x] Preserve file size, `i_blocks`, timestamps, and extent checks when
       only part of the requested run succeeds.
-- [ ] Leave overwrites of already allocated blocks out of the allocation
+- [x] Leave overwrites of already allocated blocks out of the allocation
       transaction unless they also change metadata.
 
 Regression coverage must include:
 
-- [ ] Runs of one block and of the configured maximum length.
+- [x] Runs of one block and of the configured maximum length.
 - [ ] Writes immediately below, at, and above the run boundary.
 - [ ] Extent merging on the left, right, and both sides.
 - [ ] Extent-root promotion and leaf splitting during a run.

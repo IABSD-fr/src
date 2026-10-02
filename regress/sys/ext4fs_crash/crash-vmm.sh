@@ -29,6 +29,7 @@ EXT4FS_CRASH_STAGES=${EXT4FS_CRASH_STAGES:-"write fsync rename"}
 EXT4FS_CRASH_CUT_DELAY=${EXT4FS_CRASH_CUT_DELAY:-2.01}
 EXT4FS_CRASH_MODE=${EXT4FS_CRASH_MODE:-timed}
 EXT4FS_CRASH_FLUSH_COUNTS=${EXT4FS_CRASH_FLUSH_COUNTS:-"1 2 3 4 5 6"}
+EXT4FS_CRASH_WRITE_COUNTS=${EXT4FS_CRASH_WRITE_COUNTS:-edges}
 EXT4FS_CRASH_SSH_KEY=${EXT4FS_CRASH_SSH_KEY:-}
 
 JBD2_OFF_MAXLEN=16
@@ -39,6 +40,7 @@ JBD2_OFF_FEATURE_INCOMPAT=40
 JBD2_OFF_FEATURE_RO_COMPAT=44
 JBD2_OFF_MAX_TRANSACTION=72
 JBD2_OFF_HEAD=88
+ALLOCATION_RUN_BYTES=65536
 
 test_name=ext4fs-crash-vmm
 fail()
@@ -111,7 +113,8 @@ for stage in $EXT4FS_CRASH_STAGES; do
 	esac
 done
 case "$EXT4FS_CRASH_MODE" in
-timed|flush|orphan|directory|extent|truncate|reuse|journal|errors) ;;
+timed|flush|orphan|directory|extent|truncate|reuse|journal|errors|\
+allocation-error) ;;
 *)	fail "unsupported crash mode: $EXT4FS_CRASH_MODE" ;;
 esac
 if [ "$EXT4FS_CRASH_MODE" != timed ]; then
@@ -124,6 +127,23 @@ if [ "$EXT4FS_CRASH_MODE" != timed ]; then
 		[ "$flush_count" -le 6 ] ||
 		    fail "flush count exceeds transaction"
 	done
+fi
+if [ "$EXT4FS_CRASH_MODE" = allocation-error ]; then
+	[ -n "$EXT4FS_CRASH_WRITE_COUNTS" ] ||
+	    fail "write-count list must not be empty"
+	case "$EXT4FS_CRASH_WRITE_COUNTS" in
+	all|edges)
+		;;
+	*)
+		for write_count in $EXT4FS_CRASH_WRITE_COUNTS; do
+			case "$write_count" in
+			''|*[!0-9]*|0)
+				fail "invalid write count: $write_count"
+				;;
+				esac
+		done
+		;;
+	esac
 fi
 
 work=$(mktemp -d "$EXT4FS_CRASH_VMM_DIR/\
@@ -452,18 +472,34 @@ run_error_boundary()
 {
 	operation=$1
 	count=$2
-	log=$3
-	control_log=$4
+	workload=$3
+	log=$4
+	control_log=$5
+	case "$workload" in
+	rename)
+		helper=error-boundary
+		marker=error-rename
+		expected_state=journal-aborted
+		;;
+	allocation)
+		helper=allocation-error-boundary
+		marker=allocation-write
+		expected_state=allocation-aborted
+		;;
+	*)
+		fail "unknown error workload: $workload"
+		;;
+	esac
 	trigger="set -e
 mkdir -p /mnt/ext4
 mount_ext4fs /dev/sd1c /mnt/ext4
-exec /tmp/ext4fs_crash error-boundary error-rename \
+exec /tmp/ext4fs_crash $helper $marker \
 /mnt/ext4/crash"
 	ssh_workload "root@$guest" "$trigger" >"$log" 2>&1 &
 	ssh_pid=$!
 	wait_ticks=0
 	max_ticks=$((EXT4FS_CRASH_STEP_TIMEOUT * 10))
-	while ! grep -q '^READY error-rename$' "$log" 2>/dev/null; do
+	while ! grep -q "^READY $marker\$" "$log" 2>/dev/null; do
 		if ! kill -0 "$ssh_pid" 2>/dev/null; then
 			wait "$ssh_pid" || status=$?
 			ssh_pid=
@@ -492,7 +528,7 @@ exec /tmp/ext4fs_crash error-boundary error-rename \
 		fi
 		fail "error workload rejected the journal abort"
 	fi
-	grep -qx 'state=journal-aborted' "$log" || {
+	grep -qx "state=$expected_state" "$log" || {
 		cat "$log" >&2
 		fail "error workload did not observe journal abort"
 	}
@@ -660,13 +696,41 @@ run_journal_error_case()
 	image=$case_dir/ext4.img
 	cp "$error_source" "$image"
 	start_guest "$image"
-	run_error_boundary "$operation" "$count" \
+	run_error_boundary "$operation" "$count" rename \
 	    "$case_dir/workload.log" "$case_dir/disk-fail.log"
 	stop_guest
 	"$SYNC"
 	preserve_durable "$image" "$case_dir"
 	recover_case "$image" "$case_dir" verify
 	check_error_recovery "$case_dir/recovery.log"
+	echo ' ok'
+}
+
+run_allocation_error_case()
+{
+	error_source=$1
+	error_block_size=$2
+	count=$3
+	test_name="allocation data write $count, "
+	test_name="$test_name$error_block_size-byte blocks"
+	printf '%-64s' "vmm: $test_name"
+	case_dir=$work/allocation-error-$count-$error_block_size
+	mkdir "$case_dir"
+	image=$case_dir/ext4.img
+	cp "$error_source" "$image"
+	start_guest "$image"
+	run_error_boundary write "$count" allocation \
+	    "$case_dir/workload.log" "$case_dir/disk-fail.log"
+	stop_guest
+	"$SYNC"
+	preserve_durable "$image" "$case_dir"
+	recover_case "$image" "$case_dir" \
+	    verify-allocation-error
+	grep -qx 'state=allocation-empty' \
+	    "$case_dir/recovery.log" || {
+		cat "$case_dir/recovery.log" >&2
+		fail "failed allocation recovered non-empty data"
+	}
 	echo ' ok'
 }
 
@@ -1343,6 +1407,40 @@ for block_size in $EXT4FS_CRASH_BLOCK_SIZES; do
 	"$E2FSCK" -fn "$base" \
 	    >"$work/e2fsck-base-$block_size.log" 2>&1 ||
 	    fail "e2fsck rejected baseline image"
+
+	if [ "$EXT4FS_CRASH_MODE" = allocation-error ]; then
+		max_write_count=$((ALLOCATION_RUN_BYTES / block_size))
+		case "$EXT4FS_CRASH_WRITE_COUNTS" in
+		all)
+			write_count=1
+			while [ "$write_count" -le \
+			    "$max_write_count" ]; do
+				run_allocation_error_case "$base" \
+				    "$block_size" "$write_count"
+				write_count=$((write_count + 1))
+			done
+			;;
+		edges)
+			middle_write_count=$((max_write_count / 2))
+			for write_count in 1 "$middle_write_count" \
+			    "$max_write_count"; do
+				run_allocation_error_case "$base" \
+				    "$block_size" "$write_count"
+			done
+			;;
+		*)
+			for write_count in \
+			    $EXT4FS_CRASH_WRITE_COUNTS; do
+				[ "$write_count" -le \
+				    "$max_write_count" ] ||
+				    fail "write count exceeds allocation run"
+				run_allocation_error_case "$base" \
+				    "$block_size" "$write_count"
+			done
+			;;
+		esac
+		continue
+	fi
 
 	if [ "$EXT4FS_CRASH_MODE" = errors ]; then
 		"$DUMPE2FS" -h "$base" \
