@@ -112,9 +112,9 @@ buffer until its result is collected, so the code neither loses buffer
 ownership through `bawrite()` nor waits for unrelated device-vnode I/O.
 All completions are checked before the inode or journal metadata is
 logged.  The existing ordered-data durability flush is unchanged.  This
-change builds in the production kernel.  A reboot and production
-regression run are still required before its checklist item can be
-marked complete.
+change builds in the production kernel.  After reboot, the focused
+allocation-run regression passed with 1024, 2048, and 4096-byte
+filesystem blocks.  The checklist item is complete.
 
 ## Phase 0: Establish a Reproducible Baseline
 
@@ -216,7 +216,7 @@ live rsync child waited indefinitely in `getblk` with no device
 activity.  A replacement must own each queued buffer and completion
 explicitly; vnode-wide waiting is unsafe for this transaction path.
 
-- [ ] Queue newly allocated ordered-data buffers and wait for all of
+- [x] Queue newly allocated ordered-data buffers and wait for all of
       them before beginning metadata logging.
 - [ ] Queue descriptor, metadata payload, and revoke writes instead of
       waiting for every journal block separately.
