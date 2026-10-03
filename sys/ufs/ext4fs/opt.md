@@ -116,6 +116,14 @@ change builds in the production kernel.  After reboot, the focused
 allocation-run regression passed with 1024, 2048, and 4096-byte
 filesystem blocks.  The checklist item is complete.
 
+The subsequent live rsync run showed no obvious performance gain from
+ordered-data queuing alone.  This means serial data-buffer completion
+was not the dominant remaining cost for that workload.  Transaction
+flush latency and the still-synchronous journal and checkpoint writes
+remain the leading candidates.  The result is retained even though the
+change improves I/O concurrency and gives every queued buffer explicit
+completion and error ownership.
+
 ## Phase 0: Establish a Reproducible Baseline
 
 - [ ] Use disposable ext4 images for every benchmark.  Do not benchmark
