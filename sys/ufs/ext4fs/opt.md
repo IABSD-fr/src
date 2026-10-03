@@ -33,6 +33,10 @@ work with 1024, 2048, and 4096-byte filesystem blocks.
       32-bit systems.
 - [ ] Retain the production kernel path.  Do not add a test-only kernel
       implementation or a separate optimization configuration.
+- [ ] Pass the active journal handle through every in-transaction
+      metadata lookup.  If the transaction already owns a block, use
+      its tracked buffer instead of calling `bread()` or `getblk()` a
+      second time and blocking on the same `B_BUSY` buffer.
 
 ## Initial Bottleneck Audit
 
@@ -84,6 +88,23 @@ write traffic on softraid RAID1.  These are field observations, not a
 controlled benchmark.  The reported raw-device ceiling is 1200 Mbit/s,
 or approximately 150 MB/s, so durability latency remains the likely
 limit rather than media bandwidth.
+
+On 2026-10-03, rsync reproduced a `getblk` wait after the queued-write
+experiment had been reverted.  The follow-up audit found a separate
+journal buffer ownership bug: a same-directory rename can grow a
+depth-1 directory, dirty its external extent leaf, and then map the
+source entry through a plain `bread()` of that same busy leaf.  The
+pending fix establishes one rule for all such access: once a handle
+has cached a metadata block, later access must ask that handle for the
+tracked buffer and must not enter the buffer cache for the block again.
+The handle is now passed through extent lookup and insertion preflight,
+initialized block-bitmap construction, inode loading, and
+extended-attribute allocation checks.  Orphan retirement performs its
+complete file scan before opening the transaction and revalidates only
+the selected blocks through the handle.  A focused rename-growth
+regression forces this extent-leaf reuse on every supported filesystem
+block size.  Kernel build, reboot, and production regression results
+are still required.
 
 ## Phase 0: Establish a Reproducible Baseline
 

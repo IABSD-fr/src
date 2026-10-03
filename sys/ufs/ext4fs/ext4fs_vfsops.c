@@ -66,6 +66,8 @@ static int	ext4fs_mark_writable (struct mount *, int);
 static int	ext4fs_remount_readonly (struct mount *, struct proc *);
 static int	ext4fs_remount_writable (struct mount *, struct proc *);
 static int	ext4fs_mount_update (struct mount *, struct proc *);
+static int	ext4fs_vget_handle (struct mount *, ino_t,
+    struct ext4fs_journal_handle *, struct vnode **);
 
 #define PRINTF_FEATURES(mask, features)				\
 	for (i = 0; i < nitems(features); i++)			\
@@ -1768,10 +1770,11 @@ ext4fs_inode_alloc_handle (struct inode *pip, mode_t mode,
 
 		/*
 		 * Load the vnode while the unused-table boundary makes
-		 * VFS_VGET return a zeroed inode.  It must not write
-		 * unused inode-table slot outside this transaction.
+		 * the inode reader return a zeroed inode.  Pass the
+		 * handle in case its table block is already busy here.
 		 */
-		error = VFS_VGET(pvp->v_mount, ino, vpp);
+		error = ext4fs_vget_handle(pvp->v_mount, ino, handle,
+		    vpp);
 		if (error) {
 			memcpy(bp->b_data, saved_bitmap,
 			    fs->m_block_size);
@@ -2291,6 +2294,13 @@ ext4fs_vinit (struct mount *mp, struct vnode **vpp)
 int
 ext4fs_vget (struct mount *mp, ino_t ino, struct vnode **vpp)
 {
+	return (ext4fs_vget_handle(mp, ino, NULL, vpp));
+}
+
+static int
+ext4fs_vget_handle (struct mount *mp, ino_t ino,
+    struct ext4fs_journal_handle *handle, struct vnode **vpp)
+{
 	struct m_ext4fs *fs;
 	struct inode *ip;
 	struct ufsmount *ump;
@@ -2299,8 +2309,7 @@ ext4fs_vget (struct mount *mp, ino_t ino, struct vnode **vpp)
 	struct ext4fs_block_group_descriptor *gd;
 	struct ext4fs_dinode *dp;
 	dev_t dev;
-	daddr_t disk_block;
-	u_int64_t inode_table_block;
+	u_int64_t fsblock, inode_table_block;
 	u_int32_t inode_group, inode_index, block_in_table;
 	u_int32_t offset_in_block;
 	u_int32_t itable_unused;
@@ -2384,12 +2393,19 @@ retry:
 		    letoh32(gd->bgd_inode_table_block_hi) << 32;
 
 	/* Read the block containing this inode */
-	disk_block = (inode_table_block + block_in_table) <<
-	    fs->m_fs_block_to_disk_block;
-	error = bread(ump->um_devvp, disk_block, fs->m_block_size, &bp);
+	fsblock = inode_table_block + block_in_table;
+	bp = NULL;
+	if (handle != NULL)
+		error = ext4fs_journal_get_metadata(handle,
+		    ump->um_devvp, fsblock, &bp);
+	else
+		error = bread(ump->um_devvp,
+		    (daddr_t)EXT4FS_FSBTODB(fs, fsblock),
+		    fs->m_block_size, &bp);
 	if (error) {
 		vput(vp);
-		brelse(bp);
+		if (bp != NULL && handle == NULL)
+			brelse(bp);
 		*vpp = NULL;
 		return (error);
 	}
@@ -2412,10 +2428,12 @@ retry:
 		    letoh16(gd->bgd_inode_table_unused_hi) << 16;
 	if ((bgd_flags & EXT4FS_BGD_FLAG_INODE_UNINIT) ||
 	    inode_index >= fs->m_inodes_per_group - itable_unused) {
-		brelse(bp);
+		if (handle == NULL)
+			brelse(bp);
 	} else {
 		memcpy(ip->i_e4din, dp, fs->m_inode_size);
-		brelse(bp);
+		if (handle == NULL)
+			brelse(bp);
 
 		/* Verify inode checksum for initialized slots */
 		if (letoh16(ip->i_e4din->dinode.i_mode) != 0 ||

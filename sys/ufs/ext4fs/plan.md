@@ -217,6 +217,11 @@ test-only entry points and configuration out of the production kernel.
       busy buffer to the handle; dirtying transfers it to the
       transaction; ending releases unused access, while abort teardown
       invalidates uncheckpointed contents.
+- [ ] Require every metadata reader reached by an active transaction to
+      receive that transaction's handle.  It must retrieve an already
+      tracked buffer through `ext4fs_journal_get_metadata()` rather than
+      issue a second `bread()` or `getblk()` for the same block and wait
+      on its own `B_BUSY` buffer.
 - [x] Add transaction-owned ordered-data dependencies.  Dependencies are
       deduplicated regular-file vnodes held by reference until commit or
       teardown; the initial ordered mode will conservatively flush the
@@ -784,6 +789,18 @@ second `bread()`.  The regression deliberately places the parent and
 first orphan in one inode-table block.  On 2026-09-27, the complete
 orphan target passed against the rebuilt and booted production kernel,
 including this shared-buffer case, so the checklist item is complete.
+
+The same rule applies to every metadata lookup, not only orphan scans.
+Once a handle has cached a block, another buffer-cache lookup for that
+block can wait forever on the transaction's own busy buffer.  The
+2026-10-03 audit therefore propagates the active handle through extent
+mapping and insertion checks, initialized bitmap construction, inode
+loading, and extended-attribute allocation checks.  Full orphan-file
+scans remain preflight work; selected blocks are revalidated through
+the handle.  The new rename-growth regression forces a transaction to
+map the same external extent leaf both before and after dirtying it.
+This audit remains unchecked until the rebuilt production kernel and
+the focused regression pass.
 
 The allocation and free-counter writer audit is complete.  Shared
 helpers now decode and encode free-block, free-inode, and used-directory

@@ -236,10 +236,13 @@ ext4fs_extent_leaf_check (struct m_ext4fs *fs,
  * Look up the physical block number for a given logical block number
  * using the extent tree in the inode.
  * Returns 0 on success with the physical block stored in *pblk.
+ * Transaction callers must pass their handle because extent nodes
+ * already enlisted by that transaction remain busy until journal_end.
  */
 static int
-ext4fs_extent_pblk (struct inode *ip, u_int64_t lbn, u_int64_t *pblk,
-    u_int64_t *ncontig)
+ext4fs_extent_pblk (struct inode *ip,
+    struct ext4fs_journal_handle *handle, u_int64_t lbn,
+    u_int64_t *pblk, u_int64_t *ncontig)
 {
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
 	struct ext4fs_extent_header *eh;
@@ -286,16 +289,20 @@ ext4fs_extent_pblk (struct inode *ip, u_int64_t lbn, u_int64_t *pblk,
 		child_blk |= (u_int64_t)
 		    letoh16(idx[found].ei_leaf_hi) << 32;
 
-		if (bp != NULL) {
+		if (bp != NULL && handle == NULL) {
 			brelse(bp);
-			bp = NULL;
 		}
+		bp = NULL;
 
-		error = bread(ip->i_devvp,
-		    (daddr_t)EXT4FS_FSBTODB(fs, child_blk),
-		    fs->m_block_size, &bp);
+		if (handle != NULL)
+			error = ext4fs_journal_get_metadata(handle,
+			    ip->i_devvp, child_blk, &bp);
+		else
+			error = bread(ip->i_devvp,
+			    (daddr_t)EXT4FS_FSBTODB(fs, child_blk),
+			    fs->m_block_size, &bp);
 		if (error) {
-			if (bp != NULL)
+			if (bp != NULL && handle == NULL)
 				brelse(bp);
 			return (error);
 		}
@@ -354,7 +361,7 @@ hole:
 	if (ncontig != NULL)
 		*ncontig = 1;
 out:
-	if (bp != NULL)
+	if (bp != NULL && handle == NULL)
 		brelse(bp);
 	return (error);
 }
@@ -382,7 +389,8 @@ ext4fs_dir_validate (struct inode *ip)
 	for (offset = 0; offset < filesz;
 	    offset += fs->m_block_size) {
 		lbn = EXT4FS_LBLKNO(fs, offset);
-		error = ext4fs_extent_pblk(ip, lbn, &pblk, NULL);
+		error = ext4fs_extent_pblk(ip, NULL, lbn, &pblk,
+		    NULL);
 		if (error || pblk == 0)
 			return (error ? error : EIO);
 		bp = NULL;
@@ -594,10 +602,12 @@ ext4fs_block_bitmap_mark (struct m_ext4fs *fs, u_int32_t group,
  * Construct the initialized form of a block bitmap.  FLEX_BG permits
  * the bitmaps and inode tables described by one group to reside in
  * another, so reserve metadata by physical location rather than
- * descriptor ownership.
+ * descriptor ownership.  Transaction callers pass their handle so a
+ * resize-inode block already owned by the journal is not reacquired.
  */
 static int
-ext4fs_block_bitmap_init (struct inode *ip, u_int32_t group,
+ext4fs_block_bitmap_init (struct inode *ip,
+    struct ext4fs_journal_handle *handle, u_int32_t group,
     u_int8_t *bitmap)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
@@ -665,11 +675,15 @@ ext4fs_block_bitmap_init (struct inode *ip, u_int32_t group,
 		    block >= fs->m_blocks_count)
 			return (EIO);
 		ext4fs_block_bitmap_mark(fs, group, bitmap, block);
-		error = bread(ip->i_devvp,
-		    (daddr_t)EXT4FS_FSBTODB(fs, block),
-		    fs->m_block_size, &bp);
+		if (handle != NULL)
+			error = ext4fs_journal_get_metadata(handle,
+			    ip->i_devvp, block, &bp);
+		else
+			error = bread(ip->i_devvp,
+			    (daddr_t)EXT4FS_FSBTODB(fs, block),
+			    fs->m_block_size, &bp);
 		if (error) {
-			if (bp != NULL)
+			if (bp != NULL && handle == NULL)
 				brelse(bp);
 			return (error);
 		}
@@ -681,13 +695,15 @@ ext4fs_block_bitmap_init (struct inode *ip, u_int32_t group,
 				continue;
 			if (block < fs->m_first_data_block ||
 			    block >= fs->m_blocks_count) {
-				brelse(bp);
+				if (handle == NULL)
+					brelse(bp);
 				return (EIO);
 			}
 			ext4fs_block_bitmap_mark(fs, group, bitmap,
 			    block);
 		}
-		brelse(bp);
+		if (handle == NULL)
+			brelse(bp);
 	}
 	return (0);
 }
@@ -797,7 +813,7 @@ ext4fs_blkalloc_direct (struct inode *ip, u_int64_t goal,
 		uninit = letoh16(gd->bgd_flags) &
 		    EXT4FS_BGD_FLAG_BLOCK_UNINIT;
 		if (uninit) {
-			error = ext4fs_block_bitmap_init(ip, g,
+			error = ext4fs_block_bitmap_init(ip, NULL, g,
 			    (u_int8_t *)bbp);
 			if (error) {
 				brelse(bp);
@@ -966,7 +982,8 @@ ext4fs_blkalloc_handle (struct inode *ip,
 		uninit = letoh16(gd->bgd_flags) &
 		    EXT4FS_BGD_FLAG_BLOCK_UNINIT;
 		if (uninit) {
-			error = ext4fs_block_bitmap_init(ip, g, bitmap);
+			error = ext4fs_block_bitmap_init(ip, handle, g,
+			    bitmap);
 			if (error)
 				goto out;
 			scan = bitmap;
@@ -1443,7 +1460,8 @@ ext4fs_extent_metadata_release (struct ext4fs_journal_handle *handle,
  * index block before allocation changes enter a transaction.
  */
 static int
-ext4fs_extent_insert_check (struct inode *ip, u_int32_t lbn)
+ext4fs_extent_insert_check (struct inode *ip,
+    struct ext4fs_journal_handle *handle, u_int32_t lbn)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
@@ -1483,11 +1501,15 @@ ext4fs_extent_insert_check (struct inode *ip, u_int32_t lbn)
 	}
 	leaf_block = letoh32(idx[found].ei_leaf_lo) |
 	    ((u_int64_t)letoh16(idx[found].ei_leaf_hi) << 32);
-	error = bread(ip->i_devvp,
-	    (daddr_t)EXT4FS_FSBTODB(fs, leaf_block),
-	    fs->m_block_size, &bp);
+	if (handle != NULL)
+		error = ext4fs_journal_get_metadata(handle,
+		    ip->i_devvp, leaf_block, &bp);
+	else
+		error = bread(ip->i_devvp,
+		    (daddr_t)EXT4FS_FSBTODB(fs, leaf_block),
+		    fs->m_block_size, &bp);
 	if (error) {
-		if (bp != NULL)
+		if (bp != NULL && handle == NULL)
 			brelse(bp);
 		return (error);
 	}
@@ -1509,7 +1531,8 @@ ext4fs_extent_insert_check (struct inode *ip, u_int32_t lbn)
 	error = EOPNOTSUPP;
 
 out:
-	brelse(bp);
+	if (handle == NULL)
+		brelse(bp);
 	return (error);
 }
 
@@ -1954,7 +1977,7 @@ ext4fs_extent_insert_direct (struct inode *ip, u_int32_t lbn,
 
 	if (ip->i_e4fs->m_journal != NULL)
 		return (EIO);
-	error = ext4fs_extent_insert_check(ip, lbn);
+	error = ext4fs_extent_insert_check(ip, NULL, lbn);
 	if (error)
 		return (error);
 	return (ext4fs_extent_insert_handle(ip, NULL, lbn, pblk, len));
@@ -2010,7 +2033,7 @@ ext4fs_buf_alloc_direct (struct inode *ip, u_int64_t lbn, int size,
 	if (lbn > UINT32_MAX)
 		return (EFBIG);
 	/* Check if already mapped */
-	error = ext4fs_extent_pblk(ip, lbn, &pblk, &ncontig);
+	error = ext4fs_extent_pblk(ip, NULL, lbn, &pblk, &ncontig);
 	if (error)
 		return (error);
 	if (pblk != 0) {
@@ -2024,7 +2047,7 @@ ext4fs_buf_alloc_direct (struct inode *ip, u_int64_t lbn, int size,
 			brelse(*bpp);
 		return (error);
 	}
-	error = ext4fs_extent_insert_check(ip, (u_int32_t)lbn);
+	error = ext4fs_extent_insert_check(ip, NULL, (u_int32_t)lbn);
 	if (error)
 		return (error);
 	/* Not mapped - allocate a new block */
@@ -2105,19 +2128,22 @@ ext4fs_buf_alloc_handle (struct inode *ip,
 	    lbn > UINT32_MAX)
 		return (EINVAL);
 	*bpp = NULL;
-	error = ext4fs_extent_pblk(ip, lbn, &pblk, NULL);
+	error = ext4fs_extent_pblk(ip, handle, lbn, &pblk,
+	    NULL);
 	if (error)
 		return (error);
 	if (pblk != 0)
 		return (ext4fs_journal_get_metadata(handle, ip->i_devvp,
 		    pblk, bpp));
-	error = ext4fs_extent_insert_check(ip, (u_int32_t)lbn);
+	error = ext4fs_extent_insert_check(ip, handle,
+	    (u_int32_t)lbn);
 	if (error)
 		return (error);
 
 	goal = 0;
 	if (lbn > 0) {
-		error = ext4fs_extent_pblk(ip, lbn - 1, &pblk, NULL);
+		error = ext4fs_extent_pblk(ip, handle, lbn - 1,
+		    &pblk, NULL);
 		if (error)
 			return (error);
 		if (pblk != 0)
@@ -3284,8 +3310,9 @@ ext4fs_truncate (struct inode *ip, off_t length, int flags,
 			u_int32_t offset = length % fs->m_block_size;
 			u_int64_t pblk;
 
-			if (ext4fs_extent_pblk(ip, new_nblocks - 1,
-			    &pblk, NULL) == 0 && pblk != 0) {
+			if (ext4fs_extent_pblk(ip, NULL,
+			    new_nblocks - 1, &pblk, NULL) == 0 &&
+			    pblk != 0) {
 				struct buf *bp;
 				int error;
 
@@ -3620,7 +3647,8 @@ ext4fs_lookup (void *v)
 	for (off = 0; off < filesz; ) {
 		lbn = EXT4FS_LBLKNO(fs, off);
 
-		error = ext4fs_extent_pblk(dp, lbn, &pblk, NULL);
+		error = ext4fs_extent_pblk(dp, NULL, lbn, &pblk,
+		    NULL);
 		if (error || pblk == 0) {
 			return (error ? error : EIO);
 		}
@@ -4552,12 +4580,13 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 	if (count > 1 && (blkoffset != 0 ||
 	    xfersize != fs->m_block_size))
 		return (EINVAL);
-	error = ext4fs_extent_insert_check(ip, (u_int32_t)lbn);
+	error = ext4fs_extent_insert_check(ip, NULL,
+	    (u_int32_t)lbn);
 	if (error)
 		return (error);
 	goal = 0;
-	if (lbn > 0 && ext4fs_extent_pblk(ip, lbn - 1, &previous,
-	    &ncontig) == 0 && previous != 0)
+	if (lbn > 0 && ext4fs_extent_pblk(ip, NULL, lbn - 1,
+	    &previous, &ncontig) == 0 && previous != 0)
 		goal = previous + 1;
 
 	memcpy(&saved_inode, ip->i_e4din, sizeof(saved_inode));
@@ -4571,7 +4600,8 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 	error = ext4fs_journal_begin(vp->v_mount, 9, &handle);
 	if (error)
 		return (error);
-	error = ext4fs_extent_insert_check(ip, (u_int32_t)lbn);
+	error = ext4fs_extent_insert_check(ip, handle,
+	    (u_int32_t)lbn);
 	if (error)
 		goto fail;
 
@@ -4732,7 +4762,8 @@ ext4fs_write (void *v)
 		xfersize = fs->m_block_size - blkoffset;
 		if (uio->uio_resid < xfersize)
 			xfersize = uio->uio_resid;
-		error = ext4fs_extent_pblk(ip, lbn, &pblk, &ncontig);
+		error = ext4fs_extent_pblk(ip, NULL, lbn, &pblk,
+		    &ncontig);
 		if (error)
 			break;
 		if (pblk == 0 && fs->m_journal != NULL) {
@@ -4783,7 +4814,7 @@ ext4fs_write (void *v)
 				u_int64_t nc;
 				/* Find the last block from lbn - 1. */
 				if (lbn > 0 && ext4fs_extent_pblk(ip,
-				    lbn - 1, &dummy, &nc) == 0 &&
+				    NULL, lbn - 1, &dummy, &nc) == 0 &&
 				    dummy != 0)
 					pblk = dummy + 1;
 			}
@@ -5423,7 +5454,8 @@ ext4fs_checkpath (struct inode *source, struct inode *target,
 		}
 
 		bp = NULL;
-		error = ext4fs_extent_pblk(ip, 0, &pblk, NULL);
+		error = ext4fs_extent_pblk(ip, NULL, 0, &pblk,
+		    NULL);
 		if (error || pblk == 0) {
 			if (error == 0)
 				error = EIO;
@@ -6184,7 +6216,8 @@ abortit:
 			dp->i_effnlink--;
 			dp->i_flag |= IN_CHANGE;
 
-			error = ext4fs_extent_pblk(ip, 0, &dpblk, NULL);
+			error = ext4fs_extent_pblk(ip, NULL, 0,
+			    &dpblk, NULL);
 			if (error == 0 && dpblk != 0) {
 				error = bread(ip->i_devvp,
 				    (daddr_t)EXT4FS_FSBTODB(ip->i_e4fs,
@@ -6844,7 +6877,8 @@ ext4fs_readdir (void *v)
 	while (off < filesz && uio->uio_resid > 0) {
 		lbn = EXT4FS_LBLKNO(fs, off);
 
-		error = ext4fs_extent_pblk(ip, lbn, &pblk, NULL);
+		error = ext4fs_extent_pblk(ip, NULL, lbn, &pblk,
+		    NULL);
 		if (error || pblk == 0) {
 			if (! error) error = EIO;
 			break;
@@ -7000,7 +7034,8 @@ ext4fs_dir_find (struct inode *dp, struct componentname *cnp,
 	for (blockoff = 0; blockoff < filesz;
 	    blockoff += fs->m_block_size) {
 		lbn = EXT4FS_LBLKNO(fs, blockoff);
-		error = ext4fs_extent_pblk(dp, lbn, &pblk, NULL);
+		error = ext4fs_extent_pblk(dp, NULL, lbn, &pblk,
+		    NULL);
 		if (error || pblk == 0)
 			return (error ? error : EIO);
 		bp = NULL;
@@ -7110,7 +7145,8 @@ ext4fs_direnter_handle (struct inode *ip, struct vnode *dvp,
 		if (dp->i_offset < 0 || dp->i_offset >= filesz)
 			return (EIO);
 		lbn = EXT4FS_LBLKNO(fs, dp->i_offset);
-		error = ext4fs_extent_pblk(dp, lbn, &pblk, NULL);
+		error = ext4fs_extent_pblk(dp, handle, lbn,
+		    &pblk, NULL);
 		if (error || pblk == 0)
 			return (error ? error : EIO);
 		error = ext4fs_journal_get_metadata(handle, dp->i_devvp,
@@ -7197,7 +7233,8 @@ ext4fs_dirremove_at_handle (struct inode *ip, struct vnode *dvp,
 	    diroff < 0 || diroff >= filesz)
 		return (EIO);
 	lbn = EXT4FS_LBLKNO(fs, diroff);
-	error = ext4fs_extent_pblk(dp, lbn, &pblk, NULL);
+	error = ext4fs_extent_pblk(dp, handle, lbn, &pblk,
+	    NULL);
 	if (error || pblk == 0)
 		return (error ? error : EIO);
 	error = ext4fs_journal_get_metadata(handle, dp->i_devvp,
@@ -7294,7 +7331,8 @@ ext4fs_dirrewrite_handle (struct inode *dp, struct inode *oip,
 	    diroff >= filesz)
 		return (EIO);
 	lbn = EXT4FS_LBLKNO(fs, diroff);
-	error = ext4fs_extent_pblk(dp, lbn, &pblk, NULL);
+	error = ext4fs_extent_pblk(dp, handle, lbn, &pblk,
+	    NULL);
 	if (error || pblk == 0)
 		return (error ? error : EIO);
 	error = ext4fs_journal_get_metadata(handle, dp->i_devvp,
@@ -7361,7 +7399,8 @@ ext4fs_dotdot_rewrite_handle (struct inode *ip, ufsino_t oldparent,
 	    newparent == 0 || oldparent > fs->m_inodes_count ||
 	    newparent > fs->m_inodes_count)
 		return (EINVAL);
-	error = ext4fs_extent_pblk(ip, 0, &pblk, NULL);
+	error = ext4fs_extent_pblk(ip, handle, 0, &pblk,
+	    NULL);
 	if (error || pblk == 0)
 		return (error ? error : EIO);
 	error = ext4fs_journal_get_metadata(handle, ip->i_devvp,
@@ -7445,7 +7484,7 @@ ext4fs_direnter_direct (struct inode *ip, struct vnode *dvp,
 			if (error)
 				return (error);
 		} else {
-			error = ext4fs_extent_pblk(dp, lbn, &pblk,
+			error = ext4fs_extent_pblk(dp, NULL, lbn, &pblk,
 			    NULL);
 			if (error || pblk == 0)
 				return (error ? error : EIO);
@@ -7505,7 +7544,8 @@ ext4fs_direnter_direct (struct inode *ip, struct vnode *dvp,
 	{
 		u_int64_t lbn = EXT4FS_LBLKNO(fs, dp->i_offset);
 
-		error = ext4fs_extent_pblk(dp, lbn, &pblk, NULL);
+		error = ext4fs_extent_pblk(dp, NULL, lbn, &pblk,
+		    NULL);
 		if (error || pblk == 0)
 			return (error ? error : EIO);
 
@@ -7578,7 +7618,7 @@ ext4fs_dirremove_direct (struct vnode *dvp,
 		return (EOPNOTSUPP);
 	lbn = EXT4FS_LBLKNO(fs, dp->i_offset);
 
-	error = ext4fs_extent_pblk(dp, lbn, &pblk, NULL);
+	error = ext4fs_extent_pblk(dp, NULL, lbn, &pblk, NULL);
 	if (error || pblk == 0)
 		return (error ? error : EIO);
 
@@ -7652,7 +7692,8 @@ ext4fs_dirempty (struct inode *ip, ufsino_t parentino,
 	for (off = 0; off < filesz; off += fs->m_block_size) {
 		lbn = EXT4FS_LBLKNO(fs, off);
 
-		error = ext4fs_extent_pblk(ip, lbn, &pblk, NULL);
+		error = ext4fs_extent_pblk(ip, NULL, lbn, &pblk,
+		    NULL);
 		if (error || pblk == 0)
 			return (0);
 
@@ -7729,7 +7770,7 @@ ext4fs_dirrewrite_direct (struct inode *dp, struct inode *ip,
 		return (EOPNOTSUPP);
 	lbn = EXT4FS_LBLKNO(fs, dp->i_offset);
 
-	error = ext4fs_extent_pblk(dp, lbn, &pblk, NULL);
+	error = ext4fs_extent_pblk(dp, NULL, lbn, &pblk, NULL);
 	if (error || pblk == 0)
 		return (error ? error : EIO);
 
@@ -7885,8 +7926,8 @@ ext4fs_bmap (void *v)
 	if (ap->a_bnp == NULL)
 		return (0);
 
-	error = ext4fs_extent_pblk(ip, (u_int64_t)ap->a_bn,
-	    &pblk, &ncontig);
+	error = ext4fs_extent_pblk(ip, NULL,
+	    (u_int64_t)ap->a_bn, &pblk, &ncontig);
 	if (error) {
 		*ap->a_bnp = -1;
 		return (error);

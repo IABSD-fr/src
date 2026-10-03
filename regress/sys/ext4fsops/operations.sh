@@ -2222,6 +2222,48 @@ run_handoff_case()
 	echo " ok"
 }
 
+run_rename_growth_case()
+{
+	block_size=$1
+	case_dir=$work/rename-growth-$block_size
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	test_name="same-dir extent rename ($block_size byte blocks)"
+	print_test_name "$test_name"
+
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O 'metadata_csum,^orphan_file' "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs failed"
+	fi
+	sequence_before=$(journal_sequence)
+
+	attach_image
+	mount_image noatime
+	run_step rename-growth "$mountpoint/rename-growth"
+	unmount_image rename-growth
+	detach_image
+	sequence_after=$(journal_sequence)
+	[ "$sequence_after" != "$sequence_before" ] ||
+	    fail "rename growth did not advance the journal"
+	check_image rename-growth
+
+	before=$(sha256 -q "$image")
+	attach_image
+	mount_image ro
+	run_step rename-growth-verify "$mountpoint/rename-growth"
+	unmount_image rename-growth-verify
+	detach_image
+	after=$(sha256 -q "$image")
+	[ "$before" = "$after" ] ||
+	    fail "read-only rename verification changed the image"
+	check_image rename-growth-verify
+	echo " ok"
+}
+
 run_special_case()
 {
 	case_dir=$work/special-inodes
@@ -2257,6 +2299,19 @@ run_special_case()
 }
 
 case "$EXT4FSOPS_MODE" in
+rename-growth)
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		case "$block_size" in
+		1024|2048|4096) ;;
+		*)
+			echo "bad block size: $block_size" >&2
+			exit 1
+			;;
+		esac
+		run_rename_growth_case "$block_size"
+	done
+	exit 0
+	;;
 handoff)
 	for block_size in $EXT4FS_BLOCK_SIZES; do
 		case "$block_size" in

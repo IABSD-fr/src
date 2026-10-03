@@ -48,6 +48,8 @@
 #define IO_CHUNK	4096
 #define HANDOFF_WORKERS	8
 #define HANDOFF_ITERATIONS	16
+#define RENAME_EXTENTS	5
+#define EXT4_DIRENT_HEADER	8
 
 #define DATA_SEED	0x31U
 #define APPEND_SEED	0x52U
@@ -73,6 +75,8 @@ static size_t block_size;
 
 static void	make_path (char *, size_t, const char *);
 static void	make_indexed_path (char *, size_t, const char *, int);
+static void	make_rename_growth_path (char *, size_t, char,
+		    unsigned int);
 static unsigned char pattern_byte (off_t, unsigned int);
 static void	fill_pattern (unsigned char *, size_t, off_t, unsigned int);
 static void	write_pattern_fd (int, off_t, size_t, unsigned int);
@@ -153,6 +157,9 @@ static void	update_remount_fixture (unsigned int, int);
 static void	verify_remount_fixture (unsigned int, int);
 static void	hold_remount_orphan (void);
 static void	journal_handoff_stress (void);
+static size_t	rename_growth_entries (void);
+static void	rename_growth_fixture (void);
+static void	verify_rename_growth_fixture (void);
 
 static void
 make_path (char *path, size_t pathlen, const char *suffix)
@@ -176,6 +183,24 @@ make_indexed_path (char *path, size_t pathlen, const char *directory,
 	if (n < 0 || (size_t)n >= sizeof(suffix))
 		errx(1, "indexed suffix too long");
 	make_path(path, pathlen, suffix);
+}
+
+static void
+make_rename_growth_path (char *path, size_t pathlen, char prefix,
+    unsigned int index)
+{
+	char name[NAME_MAX + 1];
+	int n;
+
+	n = snprintf(name, sizeof(name), "%c%03u-", prefix, index);
+	if (n < 0 || (size_t)n >= sizeof(name))
+		errx(1, "rename-growth name prefix is too long");
+	memset(name + n, 'a' + index % 26,
+	    NAME_MAX - (size_t)n);
+	name[NAME_MAX] = '\0';
+	n = snprintf(path, pathlen, "%s/%s", root, name);
+	if (n < 0 || (size_t)n >= pathlen)
+		errx(1, "rename-growth path is too long");
 }
 
 static unsigned char
@@ -3068,6 +3093,78 @@ journal_handoff_stress (void)
 		err(1, "rmdir %s", root);
 }
 
+static size_t
+rename_growth_entries (void)
+{
+	size_t entry_size, first, later, usable;
+
+	entry_size = roundup(EXT4_DIRENT_HEADER + NAME_MAX, 4);
+	usable = block_size - DIR_TAIL_BYTES;
+	if (usable <= 24 || entry_size > usable)
+		errx(1, "block is too small for rename-growth fixture");
+	first = (usable - 24) / entry_size;
+	later = usable / entry_size;
+	if (first == 0 || later == 0)
+		errx(1, "rename-growth directory capacity is zero");
+	return (first + (RENAME_EXTENTS - 1) * later);
+}
+
+static void
+verify_rename_growth_fixture (void)
+{
+	struct stat st;
+	char path[PATH_MAX];
+	size_t entries, i;
+
+	entries = rename_growth_entries();
+	if (stat(root, &st) == -1)
+		err(1, "stat %s", root);
+	if (! S_ISDIR(st.st_mode) ||
+	    st.st_size != (off_t)((RENAME_EXTENTS + 1) * block_size))
+		errx(1, "rename-growth directory has wrong size");
+	if ((uint64_t)st.st_blocks * DEV_BSIZE <=
+	    (uint64_t)st.st_size)
+		errx(1, "rename-growth directory has no extent node");
+
+	make_rename_growth_path(path, sizeof(path), 's', 0);
+	check_absent(path);
+	make_rename_growth_path(path, sizeof(path), 't', 0);
+	check_text_file(path, "x");
+	for (i = 1; i < entries; i++) {
+		make_rename_growth_path(path, sizeof(path), 's', i);
+		check_text_file(path, "x");
+	}
+}
+
+static void
+rename_growth_fixture (void)
+{
+	struct stat st;
+	char from[PATH_MAX], path[PATH_MAX], to[PATH_MAX];
+	size_t entries, i;
+
+	entries = rename_growth_entries();
+	for (i = 0; i < entries; i++) {
+		make_rename_growth_path(path, sizeof(path), 's', i);
+		write_text_file(path, "x");
+	}
+	if (stat(root, &st) == -1)
+		err(1, "stat %s", root);
+	if (! S_ISDIR(st.st_mode) ||
+	    st.st_size != (off_t)(RENAME_EXTENTS * block_size))
+		errx(1, "rename-growth fixture has wrong initial size");
+	if ((uint64_t)st.st_blocks * DEV_BSIZE <=
+	    (uint64_t)st.st_size)
+		errx(1, "rename-growth fixture has no extent node");
+
+	make_rename_growth_path(from, sizeof(from), 's', 0);
+	make_rename_growth_path(to, sizeof(to), 't', 0);
+	if (rename(from, to) == -1)
+		err(1, "rename extent-backed directory entry");
+	fsync_path(root);
+	verify_rename_growth_fixture();
+}
+
 int
 main (int argc, char **argv)
 {
@@ -3140,6 +3237,13 @@ main (int argc, char **argv)
 			err(1, "statfs %s", root);
 		block_size = (size_t)sfs.f_bsize;
 		journal_handoff_stress();
+	} else if (strcmp(argv[1], "rename-growth") == 0) {
+		if (mkdir(root, 0755) == -1)
+			err(1, "mkdir %s", root);
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs %s", root);
+		block_size = (size_t)sfs.f_bsize;
+		rename_growth_fixture();
 	} else {
 		if (statfs(root, &sfs) == -1)
 			err(1, "statfs %s", root);
@@ -3265,6 +3369,9 @@ main (int argc, char **argv)
 			verify_remount_fixture(REMOUNT_FINAL_SEED, 1);
 		else if (strcmp(argv[1], "remount-hold-orphan") == 0)
 			hold_remount_orphan();
+		else if (strcmp(argv[1],
+		    "rename-growth-verify") == 0)
+			verify_rename_growth_fixture();
 		else
 			errx(1, "unknown mode: %s", argv[1]);
 	}
