@@ -106,6 +106,16 @@ regression forces this extent-leaf reuse on every supported filesystem
 block size.  Kernel build, reboot, and production regression results
 are still required.
 
+The next Phase 2 change queues every physical data buffer in a bounded
+allocation run before waiting.  A completion callback retains each
+buffer until its result is collected, so the code neither loses buffer
+ownership through `bawrite()` nor waits for unrelated device-vnode I/O.
+All completions are checked before the inode or journal metadata is
+logged.  The existing ordered-data durability flush is unchanged.  This
+change builds in the production kernel.  A reboot and production
+regression run are still required before its checklist item can be
+marked complete.
+
 ## Phase 0: Establish a Reproducible Baseline
 
 - [ ] Use disposable ext4 images for every benchmark.  Do not benchmark

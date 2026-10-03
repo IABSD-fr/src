@@ -267,6 +267,7 @@ int	ext4fs_journal_dirty_metadata (struct ext4fs_journal_handle *,
 int	ext4fs_journal_end (struct ext4fs_journal_handle *);
 int	ext4fs_journal_force_commit (struct mount *);
 int	ext4fs_journal_mark_clean (struct mount *);
+int	ext4fs_journal_write_buffers (struct buf **, u_int32_t);
 int	ext4fs_journal_get_metadata (struct ext4fs_journal_handle *,
     struct vnode *, u_int64_t, struct buf **);
 int	ext4fs_journal_get_write_access (struct ext4fs_journal_handle *,

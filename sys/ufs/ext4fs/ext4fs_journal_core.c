@@ -122,6 +122,12 @@ struct ext4fs_journal_abort_info {
 	u_int32_t	 jai_free;
 };
 
+struct ext4fs_journal_io_batch {
+	struct mutex	 jib_lock;
+	u_int32_t	 jib_pending;
+	int		 jib_error;
+};
+
 static void	ext4fs_journal_transaction_free (
 		    struct ext4fs_journal_transaction *);
 static int	ext4fs_journal_block_member (struct ext4fs_journal *,
@@ -135,6 +141,7 @@ static void	ext4fs_journal_abort_policy (struct mount *, int,
 		    const struct ext4fs_journal_abort_info *);
 static void	ext4fs_journal_set_stage (struct ext4fs_journal *,
 		    enum ext4fs_journal_stage);
+static void	ext4fs_journal_write_iodone (struct buf *);
 static void	ext4fs_journal_checksum_ctx (struct ext4fs_journal *,
 		    struct jbd2_replay_ctx *);
 static u_int32_t	ext4fs_journal_next_block (
@@ -307,6 +314,76 @@ ext4fs_journal_set_stage (struct ext4fs_journal *journal,
 	mtx_enter(&journal->j_lock);
 	journal->j_stage = stage;
 	mtx_leave(&journal->j_lock);
+}
+
+static void
+ext4fs_journal_write_iodone (struct buf *bp)
+{
+	struct ext4fs_journal_io_batch *batch;
+	int error;
+
+	batch = bp->b_saveaddr;
+	KASSERT(batch != NULL);
+	if (ISSET(bp->b_flags, B_EINTR))
+		error = EINTR;
+	else if (ISSET(bp->b_flags, B_ERROR))
+		error = bp->b_error != 0 ? bp->b_error : EIO;
+	else
+		error = 0;
+	bp->b_saveaddr = NULL;
+	bp->b_iodone = NULL;
+	brelse(bp);
+
+	mtx_enter(&batch->jib_lock);
+	if (batch->jib_error == 0 && error != 0)
+		batch->jib_error = error;
+	KASSERT(batch->jib_pending != 0);
+	batch->jib_pending--;
+	if (batch->jib_pending == 0)
+		wakeup(batch);
+	mtx_leave(&batch->jib_lock);
+}
+
+/*
+ * Submit a bounded set of independent busy buffers and retain each one
+ * until its completion callback has collected the result.  This avoids
+ * both one-write-at-a-time latency and vnode-wide completion waits.
+ */
+int
+ext4fs_journal_write_buffers (struct buf **buffers, u_int32_t count)
+{
+	struct ext4fs_journal_io_batch batch;
+	struct buf *bp;
+	u_int32_t i;
+	int error;
+
+	if (count == 0)
+		return (0);
+	for (i = 0; i < count; i++) {
+		bp = buffers[i];
+		KASSERT(bp != NULL);
+		KASSERT(ISSET(bp->b_flags, B_BUSY));
+		KASSERT(bp->b_iodone == NULL);
+	}
+
+	mtx_init(&batch.jib_lock, IPL_BIO);
+	batch.jib_pending = count;
+	batch.jib_error = 0;
+	for (i = 0; i < count; i++) {
+		bp = buffers[i];
+		SET(bp->b_flags, B_NOCACHE | B_ASYNC | B_CALL);
+		bp->b_saveaddr = &batch;
+		bp->b_iodone = ext4fs_journal_write_iodone;
+		bawrite(bp);
+	}
+
+	mtx_enter(&batch.jib_lock);
+	while (batch.jib_pending != 0)
+		msleep_nsec(&batch, &batch.jib_lock, PRIBIO,
+		    "e4jwrite", INFSLP);
+	error = batch.jib_error;
+	mtx_leave(&batch.jib_lock);
+	return (error);
 }
 
 static void

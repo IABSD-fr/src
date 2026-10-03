@@ -4564,10 +4564,11 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
 	struct ext4fs_dinode_256 saved_inode;
 	struct ext4fs_journal_handle *handle;
+	struct buf **buffers;
 	struct buf *bp;
 	off_t saved_filesize, saved_offset;
 	u_int64_t goal, pblk, previous, ncontig;
-	u_int32_t got, i;
+	u_int32_t buffers_used, got, i;
 	int changed, end_error, error, saved_flags;
 	int offset, size;
 	size_t saved_resid;
@@ -4595,6 +4596,8 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 	saved_offset = uio->uio_offset;
 	saved_resid = uio->uio_resid;
 	handle = NULL;
+	buffers = NULL;
+	buffers_used = 0;
 	bp = NULL;
 	changed = 0;
 	error = ext4fs_journal_begin(vp->v_mount, 9, &handle);
@@ -4614,6 +4617,8 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 		error = EIO;
 		goto fail;
 	}
+	buffers = mallocarray(got, sizeof(*buffers), M_UFSMNT,
+	    M_WAITOK);
 	error = ext4fs_extent_insert_handle(ip, handle, (u_int32_t)lbn,
 	    pblk, (u_int16_t)got);
 	if (error)
@@ -4646,12 +4651,16 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 		error = uiomove((char *)bp->b_data + offset, size, uio);
 		if (error)
 			goto fail;
-		/* The journal flush makes this ordered write durable. */
-		error = bwrite(bp);
+		buffers[buffers_used++] = bp;
 		bp = NULL;
-		if (error)
-			goto fail;
 	}
+	/* The following journal flush makes these writes durable. */
+	error = ext4fs_journal_write_buffers(buffers, buffers_used);
+	free(buffers, M_UFSMNT, got * sizeof(*buffers));
+	buffers = NULL;
+	buffers_used = 0;
+	if (error)
+		goto fail;
 	(void)uvm_vnp_uncache(vp);
 
 	if (uio->uio_offset > *filesizep) {
@@ -4681,6 +4690,14 @@ fail:
 		SET(bp->b_flags, B_INVAL);
 		brelse(bp);
 		bp = NULL;
+	}
+	if (buffers != NULL) {
+		for (i = 0; i < buffers_used; i++) {
+			SET(buffers[i]->b_flags, B_INVAL);
+			brelse(buffers[i]);
+		}
+		free(buffers, M_UFSMNT, got * sizeof(*buffers));
+		buffers = NULL;
 	}
 	if (changed)
 		ext4fs_journal_abort(vp->v_mount, error);
