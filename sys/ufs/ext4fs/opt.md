@@ -180,6 +180,13 @@ throughput rise without a correctness regression.
 
 This phase changes I/O submission, not the durability graph.
 
+An initial file-vnode `bawrite` implementation was reverted after a
+live rsync child waited indefinitely in `getblk` with no device
+activity.  A replacement must own each queued buffer and completion
+explicitly; vnode-wide waiting is unsafe for this transaction path.
+
+- [ ] Queue newly allocated ordered-data buffers and wait for all of
+      them before beginning metadata logging.
 - [ ] Queue descriptor, metadata payload, and revoke writes instead of
       waiting for every journal block separately.
 - [ ] Wait for all queued precommit I/O at the existing precommit
