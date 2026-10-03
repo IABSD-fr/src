@@ -124,6 +124,17 @@ remain the leading candidates.  The result is retained even though the
 change improves I/O concurrency and gives every queued buffer explicit
 completion and error ownership.
 
+The follow-up Phase 2 implementation queues journal descriptors,
+metadata payloads, revoke records, and the cleared future commit slot
+as one completion batch.  It drains that batch before the unchanged
+precommit durability flush.  Checkpoint home-block writes use a second
+batch and drain before their unchanged durability flush.  Each journal
+buffer receives its own copied contents before submission, delayed
+errors are collected before journal state advances, and the device
+`bufq` bounds outstanding writes.  Journal-superblock and commit-block
+writes remain separately ordered and synchronous.  Production kernel
+build, reboot, error injection, and regression results are pending.
+
 ## Phase 0: Establish a Reproducible Baseline
 
 - [ ] Use disposable ext4 images for every benchmark.  Do not benchmark

@@ -142,12 +142,23 @@ static void	ext4fs_journal_abort_policy (struct mount *, int,
 static void	ext4fs_journal_set_stage (struct ext4fs_journal *,
 		    enum ext4fs_journal_stage);
 static void	ext4fs_journal_write_iodone (struct buf *);
+static void	ext4fs_journal_io_init (
+		    struct ext4fs_journal_io_batch *);
+static void	ext4fs_journal_io_submit (
+		    struct ext4fs_journal_io_batch *, struct buf *);
+static int	ext4fs_journal_io_wait (
+		    struct ext4fs_journal_io_batch *);
 static void	ext4fs_journal_checksum_ctx (struct ext4fs_journal *,
 		    struct jbd2_replay_ctx *);
 static u_int32_t	ext4fs_journal_next_block (
 		    struct ext4fs_journal *, u_int32_t);
+static int	ext4fs_journal_prepare_block (struct ext4fs_journal *,
+		    u_int32_t, const void *, struct buf **);
 static int	ext4fs_journal_write_block (struct ext4fs_journal *,
 		    u_int32_t, const void *);
+static int	ext4fs_journal_queue_block (struct ext4fs_journal *,
+		    u_int32_t, const void *,
+		    struct ext4fs_journal_io_batch *);
 static int	ext4fs_journal_write_super (struct ext4fs_journal *,
 		    u_int32_t, u_int32_t, u_int32_t);
 static int	ext4fs_journal_set_recover (struct ext4fs_journal *);
@@ -160,10 +171,10 @@ static int	ext4fs_journal_log_blocks (struct ext4fs_journal *,
 		    struct ext4fs_journal_transaction *, u_int32_t *);
 static int	ext4fs_journal_write_metadata (struct ext4fs_journal *,
 		    struct ext4fs_journal_transaction *, u_int32_t *,
-		    void *, void *);
+		    void *, void *, struct ext4fs_journal_io_batch *);
 static int	ext4fs_journal_write_revokes (struct ext4fs_journal *,
 		    struct ext4fs_journal_transaction *, u_int32_t *,
-		    void *);
+		    void *, struct ext4fs_journal_io_batch *);
 static int	ext4fs_journal_write_commit (struct ext4fs_journal *,
 		    struct ext4fs_journal_transaction *, u_int32_t *,
 		    void *);
@@ -344,6 +355,47 @@ ext4fs_journal_write_iodone (struct buf *bp)
 	mtx_leave(&batch->jib_lock);
 }
 
+static void
+ext4fs_journal_io_init (struct ext4fs_journal_io_batch *batch)
+{
+	mtx_init(&batch->jib_lock, IPL_BIO);
+	batch->jib_pending = 0;
+	batch->jib_error = 0;
+}
+
+static void
+ext4fs_journal_io_submit (struct ext4fs_journal_io_batch *batch,
+    struct buf *bp)
+{
+	KASSERT(bp != NULL);
+	KASSERT(ISSET(bp->b_flags, B_BUSY));
+	KASSERT(bp->b_iodone == NULL);
+
+	SET(bp->b_flags, B_NOCACHE | B_ASYNC | B_CALL);
+	bp->b_saveaddr = batch;
+	bp->b_iodone = ext4fs_journal_write_iodone;
+	mtx_enter(&batch->jib_lock);
+	KASSERT(batch->jib_pending != UINT32_MAX);
+	batch->jib_pending++;
+	mtx_leave(&batch->jib_lock);
+	/* The device bufq bounds writes at its high-water mark. */
+	bawrite(bp);
+}
+
+static int
+ext4fs_journal_io_wait (struct ext4fs_journal_io_batch *batch)
+{
+	int error;
+
+	mtx_enter(&batch->jib_lock);
+	while (batch->jib_pending != 0)
+		msleep_nsec(batch, &batch->jib_lock, PRIBIO,
+		    "e4jwrite", INFSLP);
+	error = batch->jib_error;
+	mtx_leave(&batch->jib_lock);
+	return (error);
+}
+
 /*
  * Submit a bounded set of independent busy buffers and retain each one
  * until its completion callback has collected the result.  This avoids
@@ -355,7 +407,6 @@ ext4fs_journal_write_buffers (struct buf **buffers, u_int32_t count)
 	struct ext4fs_journal_io_batch batch;
 	struct buf *bp;
 	u_int32_t i;
-	int error;
 
 	if (count == 0)
 		return (0);
@@ -366,24 +417,12 @@ ext4fs_journal_write_buffers (struct buf **buffers, u_int32_t count)
 		KASSERT(bp->b_iodone == NULL);
 	}
 
-	mtx_init(&batch.jib_lock, IPL_BIO);
-	batch.jib_pending = count;
-	batch.jib_error = 0;
+	ext4fs_journal_io_init(&batch);
 	for (i = 0; i < count; i++) {
 		bp = buffers[i];
-		SET(bp->b_flags, B_NOCACHE | B_ASYNC | B_CALL);
-		bp->b_saveaddr = &batch;
-		bp->b_iodone = ext4fs_journal_write_iodone;
-		bawrite(bp);
+		ext4fs_journal_io_submit(&batch, bp);
 	}
-
-	mtx_enter(&batch.jib_lock);
-	while (batch.jib_pending != 0)
-		msleep_nsec(&batch, &batch.jib_lock, PRIBIO,
-		    "e4jwrite", INFSLP);
-	error = batch.jib_error;
-	mtx_leave(&batch.jib_lock);
-	return (error);
+	return (ext4fs_journal_io_wait(&batch));
 }
 
 static void
@@ -412,8 +451,8 @@ ext4fs_journal_next_block (struct ext4fs_journal *journal,
 }
 
 static int
-ext4fs_journal_write_block (struct ext4fs_journal *journal,
-    u_int32_t jblock, const void *data)
+ext4fs_journal_prepare_block (struct ext4fs_journal *journal,
+    u_int32_t jblock, const void *data, struct buf **bpp)
 {
 	struct m_ext4fs *fs;
 	struct ufsmount *ump;
@@ -432,9 +471,40 @@ ext4fs_journal_write_block (struct ext4fs_journal *journal,
 	    (daddr_t)EXT4FS_FSBTODB(fs, fsblock), journal->j_blocksize,
 	    0, INFSLP);
 	memcpy(bp->b_data, data, journal->j_blocksize);
+	*bpp = bp;
+	return (0);
+}
+
+static int
+ext4fs_journal_write_block (struct ext4fs_journal *journal,
+    u_int32_t jblock, const void *data)
+{
+	struct buf *bp;
+	int error;
+
+	error = ext4fs_journal_prepare_block(journal, jblock, data,
+	    &bp);
+	if (error)
+		return (error);
 	/* Do not weaken journal ordering on an asynchronous mount. */
 	SET(bp->b_flags, B_NOCACHE);
 	return (bwrite(bp));
+}
+
+static int
+ext4fs_journal_queue_block (struct ext4fs_journal *journal,
+    u_int32_t jblock, const void *data,
+    struct ext4fs_journal_io_batch *batch)
+{
+	struct buf *bp;
+	int error;
+
+	error = ext4fs_journal_prepare_block(journal, jblock, data,
+	    &bp);
+	if (error)
+		return (error);
+	ext4fs_journal_io_submit(batch, bp);
+	return (0);
 }
 
 static int
@@ -639,7 +709,8 @@ ext4fs_journal_log_blocks (struct ext4fs_journal *journal,
 static int
 ext4fs_journal_write_metadata (struct ext4fs_journal *journal,
     struct ext4fs_journal_transaction *tx, u_int32_t *jblockp,
-    void *descriptor, void *data)
+    void *descriptor, void *data,
+    struct ext4fs_journal_io_batch *batch)
 {
 	struct ext4fs_journal_metadata *first, *metadata, *next;
 	struct jbd2_block_tail *tail;
@@ -735,8 +806,8 @@ ext4fs_journal_write_metadata (struct ext4fs_journal *journal,
 			    jbd2_block_checksum(&ctx, descriptor,
 			    journal->j_blocksize));
 		}
-		error = ext4fs_journal_write_block(journal, *jblockp,
-		    descriptor);
+		error = ext4fs_journal_queue_block(journal, *jblockp,
+		    descriptor, batch);
 		if (error)
 			return (error);
 		*jblockp = ext4fs_journal_next_block(journal, *jblockp);
@@ -749,8 +820,8 @@ ext4fs_journal_write_metadata (struct ext4fs_journal *journal,
 			memcpy(&word, data, sizeof(word));
 			if (word == htobe32(JBD2_MAGIC))
 				memset(data, 0, sizeof(word));
-			error = ext4fs_journal_write_block(journal,
-			    *jblockp, data);
+			error = ext4fs_journal_queue_block(journal,
+			    *jblockp, data, batch);
 			if (error)
 				return (error);
 			*jblockp = ext4fs_journal_next_block(journal,
@@ -765,7 +836,7 @@ ext4fs_journal_write_metadata (struct ext4fs_journal *journal,
 static int
 ext4fs_journal_write_revokes (struct ext4fs_journal *journal,
     struct ext4fs_journal_transaction *tx, u_int32_t *jblockp,
-    void *block)
+    void *block, struct ext4fs_journal_io_batch *batch)
 {
 	struct ext4fs_journal_revoke *revoke;
 	struct jbd2_block_tail *tail;
@@ -817,8 +888,8 @@ ext4fs_journal_write_revokes (struct ext4fs_journal *journal,
 			    jbd2_block_checksum(&ctx, block,
 			    journal->j_blocksize));
 		}
-		error = ext4fs_journal_write_block(journal,
-		    *jblockp, block);
+		error = ext4fs_journal_queue_block(journal,
+		    *jblockp, block, batch);
 		if (error)
 			return (error);
 		*jblockp = ext4fs_journal_next_block(journal, *jblockp);
@@ -885,10 +956,11 @@ ext4fs_journal_flush_ordered (struct ext4fs_journal_transaction *tx)
 static int
 ext4fs_journal_checkpoint (struct ext4fs_journal_transaction *tx)
 {
+	struct ext4fs_journal_io_batch batch;
 	struct ext4fs_journal_metadata *metadata;
 	struct buf *bp;
-	int error;
 
+	ext4fs_journal_io_init(&batch);
 	while ((metadata = TAILQ_FIRST(&tx->jt_metadata)) != NULL) {
 		TAILQ_REMOVE(&tx->jt_metadata, metadata, jm_entry);
 		bp = metadata->jm_buf;
@@ -896,24 +968,22 @@ ext4fs_journal_checkpoint (struct ext4fs_journal_transaction *tx)
 		KASSERT(metadata->jm_dirty);
 		KASSERT(metadata->jm_owner == NULL);
 		KASSERT(ISSET(bp->b_flags, B_BUSY));
-		SET(bp->b_flags, B_NOCACHE);
-		error = bwrite(bp);
+		ext4fs_journal_io_submit(&batch, bp);
 		free(metadata, M_UFSMNT, sizeof(*metadata));
-		if (error)
-			return (error);
 	}
-	return (0);
+	return (ext4fs_journal_io_wait(&batch));
 }
 
 static int
 ext4fs_journal_commit_transaction (struct ext4fs_journal *journal,
     struct ext4fs_journal_transaction *tx, u_int32_t *new_headp)
 {
+	struct ext4fs_journal_io_batch batch;
 	struct ufsmount *ump;
 	void *block, *data;
 	u_int32_t commit_block, expected_head, jblock, required;
 	u_int32_t start, usable;
-	int error;
+	int error, wait_error;
 
 	ump = VFSTOUFS(journal->j_mp);
 	ext4fs_journal_set_stage(journal,
@@ -930,6 +1000,7 @@ ext4fs_journal_commit_transaction (struct ext4fs_journal *journal,
 	    commit_block);
 	block = malloc(journal->j_blocksize, M_UFSMNT, M_WAITOK);
 	data = malloc(journal->j_blocksize, M_UFSMNT, M_WAITOK);
+	ext4fs_journal_io_init(&batch);
 
 	/* Make earlier ordered-data writes durable before metadata. */
 	ext4fs_journal_set_stage(journal,
@@ -946,28 +1017,36 @@ ext4fs_journal_commit_transaction (struct ext4fs_journal *journal,
 	ext4fs_journal_set_stage(journal,
 	    EXT4FS_JOURNAL_STAGE_METADATA);
 	error = ext4fs_journal_write_metadata(journal, tx, &jblock,
-	    block, data);
+	    block, data, &batch);
 	if (error)
-		goto out;
+		goto precommit_wait;
 	ext4fs_journal_set_stage(journal,
 	    EXT4FS_JOURNAL_STAGE_REVOKES);
 	error = ext4fs_journal_write_revokes(journal, tx, &jblock,
-	    block);
+	    block, &batch);
 	if (error)
-		goto out;
+		goto precommit_wait;
 	if (jblock != commit_block) {
 		error = EINVAL;
-		goto out;
+		goto precommit_wait;
 	}
 	/* Remove an old commit header before exposure. */
 	memset(block, 0, journal->j_blocksize);
 	ext4fs_journal_set_stage(journal,
 	    EXT4FS_JOURNAL_STAGE_COMMIT_CLEAR);
-	error = ext4fs_journal_write_block(journal, jblock, block);
+	error = ext4fs_journal_queue_block(journal, jblock, block,
+	    &batch);
 	if (error)
-		goto out;
+		goto precommit_wait;
+
+precommit_wait:
 	ext4fs_journal_set_stage(journal,
 	    EXT4FS_JOURNAL_STAGE_PRECOMMIT_FLUSH);
+	wait_error = ext4fs_journal_io_wait(&batch);
+	if (error == 0)
+		error = wait_error;
+	if (error)
+		goto out;
 	error = jbd2_flush_device(ump->um_devvp, curproc);
 	if (error)
 		goto out;
