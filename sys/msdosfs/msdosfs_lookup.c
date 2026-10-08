@@ -1,3 +1,4 @@
+/* Copyright (C) 2025,2026 kmx.io <contact@kmx.io> */
 /*	$OpenBSD: msdosfs_lookup.c,v 1.35 2022/08/23 20:37:16 cheloha Exp $	*/
 /*	$NetBSD: msdosfs_lookup.c,v 1.34 1997/10/18 22:12:27 ws Exp $	*/
 
@@ -651,6 +652,8 @@ createde(struct denode *dep, struct denode *ddep, struct denode **depp,
 	ndep = bptoep(pmp, bp, ddep->de_fndoffset);
 
 	DE_EXTERNALIZE(ndep, dep);
+	/* The old occupant of this directory slot can no longer be named. */
+	(void)msdosfs_fh_remove(pmp, dirclust, diroffset);
 
 	/*
 	 * Now write the Win95 long name
@@ -799,6 +802,9 @@ doscheckpath(struct denode *source, struct denode *target)
 	struct direntry *ep;
 	struct denode *dep;
 	struct buf *bp = NULL;
+	uint32_t cyclecn;
+	uint64_t cyclelen, cyclepower;
+	uint32_t walked = 0;
 	int error = 0;
 
 	dep = target;
@@ -820,6 +826,9 @@ doscheckpath(struct denode *source, struct denode *target)
 #endif
 	if (FAT32(pmp) && dep->de_StartCluster == pmp->pm_rootdirblk)
 		goto out;
+	cyclecn = dep->de_StartCluster;
+	cyclelen = 0;
+	cyclepower = 1;
 
 	for (;;) {
 		if ((dep->de_Attributes & ATTR_DIRECTORY) == 0) {
@@ -827,10 +836,19 @@ doscheckpath(struct denode *source, struct denode *target)
 			break;
 		}
 		scn = dep->de_StartCluster;
+		if (!MSDOSFS_VALID_CLUSTER(pmp, scn) ||
+		    walked++ >= pmp->pm_nmbrofclusters) {
+			error = EIO;
+			break;
+		}
 		error = bread(pmp->pm_devvp, cntobn(pmp, scn),
 			      pmp->pm_bpcluster, &bp);
 		if (error)
 			break;
+		if (bp->b_bcount < 2 * sizeof(struct direntry)) {
+			error = EIO;
+			break;
+		}
 
 		ep = (struct direntry *) bp->b_data + 1;
 		if ((ep->deAttributes & ATTR_DIRECTORY) == 0 ||
@@ -855,6 +873,20 @@ doscheckpath(struct denode *source, struct denode *target)
 			 */
 			break;
 		}
+		if (!MSDOSFS_VALID_CLUSTER(pmp, scn)) {
+			error = EIO;
+			break;
+		}
+		if (scn == cyclecn) {
+			error = EIO;
+			break;
+		}
+		cyclelen++;
+		if (cyclelen == cyclepower) {
+			cyclecn = scn;
+			cyclelen = 0;
+			cyclepower <<= 1;
+		}
 
 		vput(DETOV(dep));
 		brelse(bp);
@@ -874,6 +906,38 @@ out:;
 }
 
 /*
+ * Validate the on-disk location of a real directory entry.  The synthetic
+ * root directory entry at MSDOSFSROOT_OFS is handled by deget() and must not
+ * reach this function.
+ */
+int
+msdosfs_validate_direntry(struct msdosfsmount *pmp, uint32_t dirclust,
+    uint32_t diroffset)
+{
+	uint64_t rootdirbytes;
+
+	if ((diroffset & (sizeof(struct direntry) - 1)) != 0)
+		return (EINVAL);
+
+	if (dirclust == MSDOSFSROOT) {
+		if (FAT32(pmp))
+			return (EINVAL);
+		rootdirbytes = (uint64_t)pmp->pm_rootdirsize * DEV_BSIZE;
+		if (rootdirbytes < sizeof(struct direntry) ||
+		    diroffset > rootdirbytes - sizeof(struct direntry))
+			return (EINVAL);
+	} else {
+		if (dirclust < CLUST_FIRST || dirclust > pmp->pm_maxcluster)
+			return (EINVAL);
+		if (pmp->pm_bpcluster < sizeof(struct direntry) ||
+		    diroffset > pmp->pm_bpcluster - sizeof(struct direntry))
+			return (EINVAL);
+	}
+
+	return (0);
+}
+
+/*
  * Read in the disk block containing the directory entry (dirclu, dirofs)
  * and return the address of the buf header, and the address of the
  * directory entry within the block.
@@ -882,21 +946,40 @@ int
 readep(struct msdosfsmount *pmp, uint32_t dirclust, uint32_t diroffset,
     struct buf **bpp, struct direntry **epp)
 {
+	uint64_t rootdirbytes;
+	uint32_t blockoff;
 	int error;
 	daddr_t bn;
 	int blsize;
 
+	*bpp = NULL;
+	if (epp != NULL)
+		*epp = NULL;
+	if ((error = msdosfs_validate_direntry(pmp, dirclust,
+	    diroffset)) != 0)
+		return (error);
+
 	blsize = pmp->pm_bpcluster;
-	if (dirclust == MSDOSFSROOT
-	    && de_blk(pmp, diroffset + blsize) > pmp->pm_rootdirsize)
-		blsize = de_bn2off(pmp, pmp->pm_rootdirsize) & pmp->pm_crbomask;
+	blockoff = diroffset & pmp->pm_crbomask;
+	if (dirclust == MSDOSFSROOT) {
+		rootdirbytes = (uint64_t)pmp->pm_rootdirsize * DEV_BSIZE;
+		blsize = MIN((uint64_t)blsize,
+		    rootdirbytes - (diroffset - blockoff));
+	}
 	bn = detobn(pmp, dirclust, diroffset);
 	if ((error = bread(pmp->pm_devvp, bn, blsize, bpp)) != 0) {
-		brelse(*bpp);
+		if (*bpp != NULL)
+			brelse(*bpp);
 		*bpp = NULL;
 		return (error);
 	}
-	if (epp)
+	if ((*bpp)->b_bcount < sizeof(struct direntry) ||
+	    blockoff > (*bpp)->b_bcount - sizeof(struct direntry)) {
+		brelse(*bpp);
+		*bpp = NULL;
+		return (EIO);
+	}
+	if (epp != NULL)
 		*epp = bptoep(pmp, *bpp, diroffset);
 	return (0);
 }
@@ -942,6 +1025,8 @@ removede(struct denode *pdep, struct denode *dep)
 #endif
 
 	dep->de_refcnt--;
+	/* Invalidate the handle even if persisting the deletion later fails. */
+	(void)msdosfs_fh_remove(pmp, dep->de_dirclust, dep->de_diroffset);
 	offset += sizeof(struct direntry);
 	do {
 		offset -= sizeof(struct direntry);

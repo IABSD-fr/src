@@ -1,5 +1,7 @@
 .\"	$OpenBSD: newfs_msdos.8,v 1.25 2014/07/10 19:31:07 tobias Exp $
 .\"
+.\" Copyright (c) 2025,2026 kmx.io <contact@kmx.io>
+.\"
 .\" Copyright (c) 1998 Robert Nordier
 .\" All rights reserved.
 .\"
@@ -27,7 +29,7 @@
 .\"
 .\" $FreeBSD: src/sbin/newfs_msdos/newfs_msdos.8,v 1.6 1999/08/28 00:13:52 peter Exp $
 .\"
-.Dd $Mdocdate: July 10 2014 $
+.Dd $Mdocdate: October 6 2026 $
 .Dt NEWFS_MSDOS 8
 .Os
 .Sh NAME
@@ -36,7 +38,7 @@
 .Sh SYNOPSIS
 .Nm newfs_msdos
 .Bk -words
-.Op Fl N
+.Op Fl Nq
 .Op Fl a Ar FAT-size
 .Op Fl B Ar boot
 .Op Fl b Ar block-size
@@ -81,6 +83,9 @@ if a relative path like
 is specified,
 the corresponding raw device is used.
 .Pp
+While the file system metadata is being initialized,
+a progress bar is displayed on standard error if it is a terminal.
+.Pp
 The options are as follows:
 .Bl -tag -width Ds
 .It Fl a Ar FAT-size
@@ -93,6 +98,9 @@ This should resolve to an acceptable number of sectors per cluster (see below).
 .It Fl c Ar cluster-size
 Sectors per cluster.
 Acceptable values are powers of 2 in the range 1 through 128.
+If neither the block nor cluster size is specified, Microsoft-compatible
+defaults between 512 bytes and 32 KB are selected according to the volume
+size and FAT type.
 .It Fl e Ar dirents
 Number of root directory entries (FAT12 and FAT16 only).
 .It Fl F Ar FAT-type
@@ -109,9 +117,11 @@ Volume ID.
 .It Fl i Ar info
 Location of the file system info sector (FAT32 only).
 A value of 0xffff signifies no info sector.
+The default is 1.
 .It Fl k Ar backup
 Location of the backup boot sector (FAT32 only).
 A value of 0xffff signifies no backup sector.
+The default is 6 when it does not overlap a multi-sector bootstrap.
 .It Fl L Ar label
 Volume label (up to 11 characters).
 The label should consist of
@@ -130,8 +140,11 @@ The default is
 "BSD  4.4".
 .It Fl o Ar hidden
 Number of hidden sectors.
+.It Fl q
+Do not display formatting progress.
 .It Fl r Ar reserved
 Number of reserved sectors.
+The FAT32 default is 32.
 .It Fl S Ar sector-size
 Number of bytes per sector.
 Acceptable values are powers of 2 in the range 512 through 32768.
@@ -192,3 +205,4 @@ command first appeared in
 .Ox 2.1 .
 .Sh AUTHORS
 .An Robert Nordier Aq Mt rnordier@FreeBSD.org .
+.An Thomas de Grivel Aq Mt thodg@kmx.io .
