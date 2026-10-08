@@ -1,3 +1,4 @@
+/* Copyright (C) 2025,2026 kmx.io <contact@kmx.io> */
 /*	$OpenBSD: msdosfsmount.h,v 1.23 2024/05/13 01:15:53 jsg Exp $	*/
 /*	$NetBSD: msdosfsmount.h,v 1.16 1997/10/17 11:24:24 ws Exp $	*/
 
@@ -104,6 +105,7 @@ struct msdosfsmount {
 #define	MSDOSFSMNT_RONLY	0x80000000	/* mounted read-only	*/
 #define	MSDOSFSMNT_WAITONFAT	0x40000000	/* mounted synchronous	*/
 #define	MSDOSFS_FATMIRROR	0x20000000	/* FAT is mirrored */
+#define	MSDOSFS_FAT_CORRUPT	0x10000000	/* allocator needs repair */
 
 #define	VFSTOMSDOSFS(mp)	((struct msdosfsmount *)mp->mnt_data)
 
@@ -195,7 +197,7 @@ struct msdosfsmount {
 
 /* Calculate size of fsinfo block */
 #define fsi_size(pmp) \
-	(1024 << ((pmp)->pm_BlkPerSec >> 2))
+	((pmp)->pm_BytesPerSec)
 
 /*
  * Prototypes for MSDOSFS virtual filesystem operations

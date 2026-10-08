@@ -20,5 +20,7 @@ obj
 regress/sys/ext4fs/journal_core_test
 regress/sys/ext4fs_crash/ext4fs_crash
 regress/sys/ext4fsops/ext4fsops
+regress/sys/msdosfs/msdosfs_test
 sbin/fsck_ext4fs/fsck_ext4fs
+sbin/newfs_msdos/newfs_msdos
 tags

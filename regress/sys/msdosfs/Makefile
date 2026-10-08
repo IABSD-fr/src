@@ -14,32 +14,32 @@
 ## TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
 ## PERFORMANCE OF THIS SOFTWARE.
 
-#	$OpenBSD: Makefile,v 1.33 2022/09/17 09:30:18 kn Exp $
+# Regression tests for malformed MS-DOS filesystems.
 
-SUBDIR += acme-client
-SUBDIR += arp
-SUBDIR += bgpd
-SUBDIR += btrace
-SUBDIR += httpd
-SUBDIR += ifstated
-SUBDIR += installboot
-SUBDIR += ldapd
-SUBDIR += makefs
-SUBDIR += mtree
-SUBDIR += ocspcheck
-SUBDIR += ospfd
-SUBDIR += ospf6d
-SUBDIR += relayd
-SUBDIR += rpki-client
-SUBDIR += snmpd
-SUBDIR += syslogd
+PROG=	msdosfs_test
+NOMAN=
 
-.if ${MACHINE} == "amd64"
-SUBDIR += vmd
-.endif
+CFLAGS+=	-Wall -Werror -Wextra
 
-.if defined(REGRESS_FULL) || make(clean) || make(cleandir) || make(obj)
-SUBDIR += pkg_add
-.endif
+REGRESS_TARGETS=	run-regress-msdosfs-fixtures \
+		run-regress-msdosfs
+REGRESS_ROOT_TARGETS=	run-regress-msdosfs
 
-.include <bsd.subdir.mk>
+MSDOSFS_TIMEOUT?=	20
+NEWFS_MSDOS?=		/sbin/newfs_msdos
+
+run-regress-msdosfs-fixtures: ${PROG}
+	env MSDOSFS_TEST='${.OBJDIR}/${PROG}' \
+	    MSDOSFS_MODE=fixtures \
+	    MSDOSFS_TIMEOUT='${MSDOSFS_TIMEOUT}' \
+	    NEWFS_MSDOS='${NEWFS_MSDOS}' \
+	    sh ${.CURDIR}/msdosfs.sh
+
+run-regress-msdosfs: ${PROG}
+	env MSDOSFS_TEST='${.OBJDIR}/${PROG}' \
+	    MSDOSFS_MODE=kernel \
+	    MSDOSFS_TIMEOUT='${MSDOSFS_TIMEOUT}' \
+	    NEWFS_MSDOS='${NEWFS_MSDOS}' \
+	    sh ${.CURDIR}/msdosfs.sh
+
+.include <bsd.regress.mk>

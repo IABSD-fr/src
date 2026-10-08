@@ -1,3 +1,4 @@
+/* Copyright (C) 2025,2026 kmx.io <contact@kmx.io> */
 /*	$OpenBSD: msdosfs_denode.c,v 1.69 2026/06/30 14:04:04 kirill Exp $	*/
 /*	$NetBSD: msdosfs_denode.c,v 1.23 1997/10/17 11:23:58 ws Exp $	*/
 
@@ -58,6 +59,7 @@
 #include <sys/kernel.h>		/* defines "time" */
 #include <sys/dirent.h>
 #include <sys/namei.h>
+#include <sys/tree.h>
 
 #include <crypto/siphash.h>
 
@@ -78,12 +80,157 @@ static struct denode *msdosfs_hashget(dev_t, uint32_t, uint32_t);
 static int msdosfs_hashins(struct denode *);
 static void msdosfs_hashrem(struct denode *);
 
+struct msdosfs_fh {
+	RB_ENTRY(msdosfs_fh) fh_entry;
+	struct msdosfsmount *fh_pmp;
+	uint32_t fh_dirclust;
+	uint32_t fh_diroffset;
+	uint32_t fh_generation;
+};
+
+static int msdosfs_fh_compare(struct msdosfs_fh *, struct msdosfs_fh *);
+
+RB_HEAD(msdosfs_fh_tree, msdosfs_fh);
+RB_PROTOTYPE_STATIC(msdosfs_fh_tree, msdosfs_fh, fh_entry,
+    msdosfs_fh_compare);
+RB_GENERATE_STATIC(msdosfs_fh_tree, msdosfs_fh, fh_entry,
+    msdosfs_fh_compare);
+
+static struct msdosfs_fh_tree msdosfs_fhs = RB_INITIALIZER(&msdosfs_fhs);
+static struct rwlock msdosfs_fh_lock = RWLOCK_INITIALIZER("msdosfhlk");
+static uint32_t msdosfs_fh_generation;
+
 int
 msdosfs_init(struct vfsconf *vfsp)
 {
 	dehashtbl = hashinit(initialvnodes / 2, M_MSDOSFSMNT, M_WAITOK, &dehash);
 	arc4random_buf(&dehashkey, sizeof(dehashkey));
+	msdosfs_fh_generation = arc4random();
 	return (0);
+}
+
+static int
+msdosfs_fh_compare(struct msdosfs_fh *a, struct msdosfs_fh *b)
+{
+	if ((uintptr_t)a->fh_pmp < (uintptr_t)b->fh_pmp)
+		return (-1);
+	if ((uintptr_t)a->fh_pmp > (uintptr_t)b->fh_pmp)
+		return (1);
+	if (a->fh_dirclust < b->fh_dirclust)
+		return (-1);
+	if (a->fh_dirclust > b->fh_dirclust)
+		return (1);
+	if (a->fh_diroffset < b->fh_diroffset)
+		return (-1);
+	if (a->fh_diroffset > b->fh_diroffset)
+		return (1);
+	return (0);
+}
+
+int
+msdosfs_fh_enter(struct msdosfsmount *pmp, uint32_t dirclust,
+    uint32_t diroffset, uint32_t *generationp)
+{
+	struct msdosfs_fh key, *fh, *newfh = NULL;
+
+	bzero(&key, sizeof(key));
+	key.fh_pmp = pmp;
+	key.fh_dirclust = dirclust;
+	key.fh_diroffset = diroffset;
+
+	for (;;) {
+		rw_enter_write(&msdosfs_fh_lock);
+		fh = RB_FIND(msdosfs_fh_tree, &msdosfs_fhs, &key);
+		if (fh != NULL) {
+			*generationp = fh->fh_generation;
+			rw_exit_write(&msdosfs_fh_lock);
+			if (newfh != NULL)
+				free(newfh, M_MSDOSFSNODE, sizeof(*newfh));
+			return (0);
+		}
+		if (newfh != NULL) {
+			newfh->fh_generation = ++msdosfs_fh_generation;
+			if (newfh->fh_generation == 0)
+				newfh->fh_generation = ++msdosfs_fh_generation;
+			fh = RB_INSERT(msdosfs_fh_tree, &msdosfs_fhs, newfh);
+			KASSERT(fh == NULL);
+			*generationp = newfh->fh_generation;
+			rw_exit_write(&msdosfs_fh_lock);
+			return (0);
+		}
+		rw_exit_write(&msdosfs_fh_lock);
+
+		newfh = malloc(sizeof(*newfh), M_MSDOSFSNODE,
+		    M_WAITOK | M_ZERO);
+		newfh->fh_pmp = pmp;
+		newfh->fh_dirclust = dirclust;
+		newfh->fh_diroffset = diroffset;
+	}
+}
+
+int
+msdosfs_fh_lookup(struct msdosfsmount *pmp, uint32_t dirclust,
+    uint32_t diroffset, uint32_t *generationp)
+{
+	struct msdosfs_fh key, *fh;
+	int error;
+
+	bzero(&key, sizeof(key));
+	key.fh_pmp = pmp;
+	key.fh_dirclust = dirclust;
+	key.fh_diroffset = diroffset;
+
+	rw_enter_read(&msdosfs_fh_lock);
+	fh = RB_FIND(msdosfs_fh_tree, &msdosfs_fhs, &key);
+	if (fh != NULL) {
+		*generationp = fh->fh_generation;
+		error = 0;
+	} else
+		error = ESTALE;
+	rw_exit_read(&msdosfs_fh_lock);
+
+	return (error);
+}
+
+int
+msdosfs_fh_remove(struct msdosfsmount *pmp, uint32_t dirclust,
+    uint32_t diroffset)
+{
+	struct msdosfs_fh key, *fh;
+	int error;
+
+	bzero(&key, sizeof(key));
+	key.fh_pmp = pmp;
+	key.fh_dirclust = dirclust;
+	key.fh_diroffset = diroffset;
+
+	rw_enter_write(&msdosfs_fh_lock);
+	fh = RB_FIND(msdosfs_fh_tree, &msdosfs_fhs, &key);
+	if (fh != NULL) {
+		RB_REMOVE(msdosfs_fh_tree, &msdosfs_fhs, fh);
+		error = 0;
+	} else
+		error = ENOENT;
+	rw_exit_write(&msdosfs_fh_lock);
+	if (fh != NULL)
+		free(fh, M_MSDOSFSNODE, sizeof(*fh));
+
+	return (error);
+}
+
+void
+msdosfs_fh_destroy(struct msdosfsmount *pmp)
+{
+	struct msdosfs_fh *fh, *next;
+
+	rw_enter_write(&msdosfs_fh_lock);
+	RB_FOREACH_SAFE(fh, msdosfs_fh_tree, &msdosfs_fhs, next) {
+		if (fh->fh_pmp != pmp)
+			continue;
+		RB_REMOVE(msdosfs_fh_tree, &msdosfs_fhs, fh);
+		free(fh, M_MSDOSFSNODE, sizeof(*fh));
+	}
+	rw_exit_write(&msdosfs_fh_lock);
 }
 
 u_int
@@ -181,7 +328,7 @@ msdosfs_hashrem(struct denode *dep)
  *	       diroffset is relative to the beginning of the root directory,
  *	       otherwise it is cluster relative.
  * diroffset - offset past begin of cluster of denode we want
- * depp	     - returns the address of the gotten denode.
+ * depp	     - returns the address of the gotten denode, or NULL on failure.
  */
 int
 deget(struct msdosfsmount *pmp, uint32_t dirclust, uint32_t diroffset,
@@ -192,7 +339,9 @@ deget(struct msdosfsmount *pmp, uint32_t dirclust, uint32_t diroffset,
 	struct direntry *direntptr;
 	struct denode *ldep;
 	struct vnode *nvp;
-	struct buf *bp;
+	struct buf *bp = NULL;
+
+	*depp = NULL;
 
 #ifdef MSDOSFS_DEBUG
 	printf("deget(pmp %p, dirclust %d, diroffset %x, depp %p)\n",
@@ -203,8 +352,17 @@ deget(struct msdosfsmount *pmp, uint32_t dirclust, uint32_t diroffset,
 	 * On FAT32 filesystems, root is a (more or less) normal
 	 * directory
 	 */
-	if (FAT32(pmp) && dirclust == MSDOSFSROOT)
+	if (FAT32(pmp) && dirclust == MSDOSFSROOT) {
+		if (diroffset != MSDOSFSROOT_OFS)
+			return (EINVAL);
 		dirclust = pmp->pm_rootdirblk;
+	}
+	if (!((dirclust == MSDOSFSROOT ||
+	    (FAT32(pmp) && dirclust == pmp->pm_rootdirblk)) &&
+	    diroffset == MSDOSFSROOT_OFS) &&
+	    (error = msdosfs_validate_direntry(pmp, dirclust,
+	    diroffset)) != 0)
+		return (error);
 
 	/*
 	 * See if the denode is in the denode cache. Use the location of
@@ -231,10 +389,8 @@ retry:
 	 */
 	/* getnewvnode() does a vref() on the vnode */
 	error = getnewvnode(VT_MSDOSFS, pmp->pm_mountp, &msdosfs_vops, &nvp);
-	if (error) {
-		*depp = 0;
+	if (error)
 		return (error);
-	}
 	ldep = malloc(sizeof(*ldep), M_MSDOSFSNODE, M_WAITOK | M_ZERO);
 	rrw_init_flags(&ldep->de_lock, "denode", RWL_DUPOK | RWL_IS_VNODE);
 	nvp->v_data = ldep;
@@ -256,7 +412,8 @@ retry:
 	error = msdosfs_hashins(ldep);
 
 	if (error) {
-		vput (nvp);
+		ldep->de_Name[0] = SLOT_DELETED;
+		vput(nvp);
 
 		if (error == EEXIST)
 			goto retry;
@@ -266,6 +423,7 @@ retry:
 
 	ldep->de_pmp = pmp;
 	ldep->de_devvp = pmp->pm_devvp;
+	vref(ldep->de_devvp);
 	ldep->de_refcnt = 1;
 	/*
 	 * Copy the directory entry into the denode area of the vnode.
@@ -288,7 +446,7 @@ retry:
 		        /* de_FileSize will be filled in further down */
 		else {
 		        ldep->de_StartCluster = MSDOSFSROOT;
-		        ldep->de_FileSize = pmp->pm_rootdirsize * pmp->pm_BytesPerSec;
+		        ldep->de_FileSize = pmp->pm_rootdirsize * DEV_BSIZE;
 		}
 		/*
 		 * fill in time and date so that dos2unixtime() doesn't
@@ -307,9 +465,10 @@ retry:
 	} else {
 		error = readep(pmp, dirclust, diroffset, &bp, &direntptr);
 		if (error)
-			return (error);
+			goto fail;
 		DE_INTERNALIZE(ldep, direntptr);
 		brelse(bp);
+		bp = NULL;
 	}
 
 	/*
@@ -331,16 +490,21 @@ retry:
 			if (error == E2BIG) {
 				ldep->de_FileSize = de_cn2off(pmp, size);
 				error = 0;
-			} else if (error) {
-				printf("deget(): pcbmap returned %d\n", error);
-				return (error);
-			}
+			} else if (error)
+				goto fail;
 		}
 	} else
 		nvp->v_type = VREG;
-	vref(ldep->de_devvp);
 	*depp = ldep;
 	return (0);
+
+fail:
+	if (bp != NULL)
+		brelse(bp);
+	msdosfs_hashrem(ldep);
+	ldep->de_Name[0] = SLOT_DELETED;
+	vput(nvp);
+	return (error);
 }
 
 int
@@ -510,7 +674,9 @@ detrunc(struct denode *dep, uint32_t length, int flags, struct ucred *cred,
 	 * truncation.
 	 */
 	if (chaintofree != 0 && !MSDOSFSEOF(pmp, chaintofree))
-		freeclusterchain(pmp, chaintofree);
+		if ((error = freeclusterchain(pmp, chaintofree)) != 0 &&
+		    allerror == 0)
+			allerror = error;
 
 	return (allerror);
 }

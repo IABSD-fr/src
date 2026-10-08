@@ -14,32 +14,31 @@
 ## TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
 ## PERFORMANCE OF THIS SOFTWARE.
 
-#	$OpenBSD: Makefile,v 1.33 2022/09/17 09:30:18 kn Exp $
+# Regression tests for newfs_msdos(8).
 
-SUBDIR += acme-client
-SUBDIR += arp
-SUBDIR += bgpd
-SUBDIR += btrace
-SUBDIR += httpd
-SUBDIR += ifstated
-SUBDIR += installboot
-SUBDIR += ldapd
-SUBDIR += makefs
-SUBDIR += mtree
-SUBDIR += ocspcheck
-SUBDIR += ospfd
-SUBDIR += ospf6d
-SUBDIR += relayd
-SUBDIR += rpki-client
-SUBDIR += snmpd
-SUBDIR += syslogd
+PROG=		newfs_msdos_test
+LDADD=		-lutil
+DPADD=		${LIBUTIL}
 
-.if ${MACHINE} == "amd64"
-SUBDIR += vmd
-.endif
+NEWFS_MSDOS?=	/sbin/newfs_msdos
 
-.if defined(REGRESS_FULL) || make(clean) || make(cleandir) || make(obj)
-SUBDIR += pkg_add
-.endif
+TESTS=		mount-alias \
+		disklabel-units \
+		disklabel-range \
+		fat-capacity \
+		fsinfo-overlap \
+		bootstrap-reservation \
+		sector-count-overflow \
+		cluster-size \
+		ms-defaults \
+		progress \
+		disktab-fallback
 
-.include <bsd.subdir.mk>
+REGRESS_TARGETS=	${TESTS:S/^/run-/}
+
+.for test in ${TESTS}
+run-${test}: ${PROG}
+	env NEWFS_MSDOS='${NEWFS_MSDOS}' ./${PROG} ${test}
+.endfor
+
+.include <bsd.regress.mk>

@@ -14,32 +14,24 @@
 ## TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
 ## PERFORMANCE OF THIS SOFTWARE.
 
-#	$OpenBSD: Makefile,v 1.33 2022/09/17 09:30:18 kn Exp $
+# Regression tests for makefs(8) MSDOS images.
 
-SUBDIR += acme-client
-SUBDIR += arp
-SUBDIR += bgpd
-SUBDIR += btrace
-SUBDIR += httpd
-SUBDIR += ifstated
-SUBDIR += installboot
-SUBDIR += ldapd
-SUBDIR += makefs
-SUBDIR += mtree
-SUBDIR += ocspcheck
-SUBDIR += ospfd
-SUBDIR += ospf6d
-SUBDIR += relayd
-SUBDIR += rpki-client
-SUBDIR += snmpd
-SUBDIR += syslogd
+PROG=		mkfs_msdos_test
 
-.if ${MACHINE} == "amd64"
-SUBDIR += vmd
-.endif
+MAKEFS?=	/usr/sbin/makefs
 
-.if defined(REGRESS_FULL) || make(clean) || make(cleandir) || make(obj)
-SUBDIR += pkg_add
-.endif
+TESTS=		sector-size \
+		offset-size \
+		failure-status \
+		fsinfo-overlap \
+		bootstrap-offset \
+		timestamp
 
-.include <bsd.subdir.mk>
+REGRESS_TARGETS=	${TESTS:S/^/run-/}
+
+.for test in ${TESTS}
+run-${test}: ${PROG}
+	env MAKEFS='${MAKEFS}' ./${PROG} ${test}
+.endfor
+
+.include <bsd.regress.mk>

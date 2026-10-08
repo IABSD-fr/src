@@ -1,3 +1,4 @@
+/* Copyright (C) 2025,2026 kmx.io <contact@kmx.io> */
 /*	$OpenBSD: fat.h,v 1.13 2021/07/11 04:34:13 jsg Exp $	*/
 /*	$NetBSD: fat.h,v 1.11 1997/10/17 11:23:49 ws Exp $	*/
 
@@ -78,6 +79,8 @@
 #define	FAT32(pmp)	(pmp->pm_fatmask == FAT32_MASK)
 
 #define	MSDOSFSEOF(pmp, cn)	((((cn) | ~(pmp)->pm_fatmask) & CLUST_EOFS) == CLUST_EOFS)
+#define	MSDOSFS_VALID_CLUSTER(pmp, cn) \
+	((cn) >= CLUST_FIRST && (cn) <= (pmp)->pm_maxcluster)
 
 #ifdef _KERNEL
 /*
