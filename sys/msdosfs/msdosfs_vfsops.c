@@ -1,3 +1,4 @@
+/* Copyright (C) 2025,2026 kmx.io <contact@kmx.io> */
 /*	$OpenBSD: msdosfs_vfsops.c,v 1.99 2025/09/20 13:53:36 mpi Exp $	*/
 /*	$NetBSD: msdosfs_vfsops.c,v 1.48 1997/10/18 02:54:57 briggs Exp $	*/
 
@@ -50,6 +51,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/conf.h>
 #include <sys/namei.h>
 #include <sys/proc.h>
 #include <sys/kernel.h>
@@ -234,6 +236,7 @@ int
 msdosfs_mountfs(struct vnode *devvp, struct mount *mp, struct proc *p,
     struct msdosfs_args *argp)
 {
+	struct denode rootde;
 	struct msdosfsmount *pmp;
 	struct buf *bp;
 	dev_t dev = devvp->v_rdev;
@@ -241,10 +244,18 @@ msdosfs_mountfs(struct vnode *devvp, struct mount *mp, struct proc *p,
 	struct byte_bpb33 *b33;
 	struct byte_bpb50 *b50;
 	struct byte_bpb710 *b710;
+	struct partinfo dpart;
+	struct bdevsw *bsw;
 	extern struct vnode *rootvp;
 	u_int8_t SecPerClust;
+	u_int16_t extflags;
 	int	ronly, error, bmapsiz;
-	uint32_t fat_max_clusters;
+	uint32_t fsinfo_sector, root_clusters;
+	uint64_t cluster_blocks, fat_blocks, fat_end, fat_max_clusters;
+	uint64_t fat_sectors, firstcluster, hidden_blocks;
+	uint64_t nmbrofclusters, partition_blocks, partition_bytes;
+	uint64_t reserved_blocks, rootdir_blocks, rootdir_bytes, rootdir_sectors;
+	uint64_t total_blocks, total_sectors;
 
 	/*
 	 * Disallow multiple mounts of the same device.
@@ -276,7 +287,16 @@ msdosfs_mountfs(struct vnode *devvp, struct mount *mp, struct proc *p,
 	 */
 	if ((error = bread(devvp, 0, 4096, &bp)) != 0)
 		goto error_exit;
+	if (bp->b_bcount < sizeof(*bsp)) {
+		error = EINVAL;
+		goto error_exit;
+	}
 	bsp = (union bootsector *)bp->b_data;
+	if (bsp->bs50.bsBootSectSig0 != BOOTSIG0 ||
+	    bsp->bs50.bsBootSectSig1 != BOOTSIG1) {
+		error = EINVAL;
+		goto error_exit;
+	}
 	b33 = (struct byte_bpb33 *)bsp->bs33.bsBPB;
 	b50 = (struct byte_bpb50 *)bsp->bs50.bsBPB;
 	b710 = (struct byte_bpb710 *)bsp->bs710.bsBPB;
@@ -300,13 +320,16 @@ msdosfs_mountfs(struct vnode *devvp, struct mount *mp, struct proc *p,
 	pmp->pm_Heads = getushort(b50->bpbHeads);
 	pmp->pm_Media = b50->bpbMedia;
 
-	/* Determine the number of DEV_BSIZE blocks in a MSDOSFS sector */
-	pmp->pm_BlkPerSec = pmp->pm_BytesPerSec / DEV_BSIZE;
-
-	if (!pmp->pm_BytesPerSec || !SecPerClust) {
+	if (pmp->pm_BytesPerSec < DEV_BSIZE ||
+	    (pmp->pm_BytesPerSec & (pmp->pm_BytesPerSec - 1)) != 0 ||
+	    SecPerClust == 0 || (SecPerClust & (SecPerClust - 1)) != 0 ||
+	    pmp->pm_ResSectors == 0 || pmp->pm_FATs == 0) {
 		error = EINVAL;
 		goto error_exit;
 	}
+
+	/* Determine the number of DEV_BSIZE blocks in an MSDOSFS sector. */
+	pmp->pm_BlkPerSec = pmp->pm_BytesPerSec / DEV_BSIZE;
 
 	if (pmp->pm_Sectors == 0) {
 		pmp->pm_HiddenSects = getulong(b50->bpbHiddenSecs);
@@ -316,6 +339,8 @@ msdosfs_mountfs(struct vnode *devvp, struct mount *mp, struct proc *p,
 		pmp->pm_HugeSectors = pmp->pm_Sectors;
 	}
 
+	extflags = 0;
+	fsinfo_sector = 0;
 	if (pmp->pm_RootDirEnts == 0) {
 		if (pmp->pm_Sectors || pmp->pm_FATsecs ||
 		    getushort(b710->bpbFSVers)) {
@@ -326,52 +351,108 @@ msdosfs_mountfs(struct vnode *devvp, struct mount *mp, struct proc *p,
 		pmp->pm_fatmult = 4;
 		pmp->pm_fatdiv = 1;
 		pmp->pm_FATsecs = getulong(b710->bpbBigFATsecs);
-		if (getushort(b710->bpbExtFlags) & FATMIRROR)
-		        pmp->pm_curfat = getushort(b710->bpbExtFlags) & FATNUM;
+		extflags = getushort(b710->bpbExtFlags);
+		fsinfo_sector = getushort(b710->bpbFSInfo);
+		if (extflags & FATMIRROR)
+		        pmp->pm_curfat = extflags & FATNUM;
 		else
 		        pmp->pm_flags |= MSDOSFS_FATMIRROR;
 	} else
 	        pmp->pm_flags |= MSDOSFS_FATMIRROR;
 
 	/*
-	 * More sanity checks:
-	 *	MSDOSFS sectors per cluster: >0 && power of 2
-	 *	MSDOSFS sector size: >= DEV_BSIZE && power of 2
-	 *	HUGE sector count: >0
-	 *	FAT sectors: >0
+	 * Compute the complete on-disk layout with wide intermediates.  All
+	 * block-number fields in msdosfsmount are uint32_t, so reject a volume
+	 * that cannot be represented instead of truncating it.
 	 */
-	if ((SecPerClust == 0) || (SecPerClust & (SecPerClust - 1)) ||
-	    (pmp->pm_BytesPerSec < DEV_BSIZE) ||
-	    (pmp->pm_BytesPerSec & (pmp->pm_BytesPerSec - 1)) ||
-	    (pmp->pm_HugeSectors == 0) || (pmp->pm_FATsecs == 0) ||
-	    (SecPerClust * pmp->pm_BlkPerSec > MAXBSIZE / DEV_BSIZE)) {
+	total_sectors = pmp->pm_HugeSectors;
+	fat_sectors = pmp->pm_FATsecs;
+	cluster_blocks = (uint64_t)SecPerClust * pmp->pm_BlkPerSec;
+	reserved_blocks = (uint64_t)pmp->pm_ResSectors * pmp->pm_BlkPerSec;
+	fat_blocks = fat_sectors * pmp->pm_BlkPerSec;
+	total_blocks = total_sectors * pmp->pm_BlkPerSec;
+	hidden_blocks = (uint64_t)pmp->pm_HiddenSects * pmp->pm_BlkPerSec;
+	if (total_sectors == 0 || fat_sectors == 0 || cluster_blocks == 0 ||
+	    cluster_blocks > MAXBSIZE / DEV_BSIZE ||
+	    reserved_blocks > UINT32_MAX || fat_blocks > UINT32_MAX ||
+	    total_blocks > UINT32_MAX || hidden_blocks > UINT32_MAX ||
+	    fat_blocks > UINT32_MAX / DEV_BSIZE) {
+		error = EINVAL;
+		goto error_exit;
+	}
+	fat_end = reserved_blocks + (uint64_t)pmp->pm_FATs * fat_blocks;
+	if (fat_end < reserved_blocks || fat_end > total_blocks) {
+		error = EINVAL;
+		goto error_exit;
+	}
+	rootdir_blocks = 0;
+	if (!FAT32(pmp)) {
+		rootdir_bytes = (uint64_t)pmp->pm_RootDirEnts *
+		    sizeof(struct direntry);
+		if (rootdir_bytes == 0 ||
+		    rootdir_bytes % pmp->pm_BytesPerSec != 0) {
+			error = EINVAL;
+			goto error_exit;
+		}
+		rootdir_sectors = rootdir_bytes / pmp->pm_BytesPerSec;
+		rootdir_blocks = rootdir_sectors * pmp->pm_BlkPerSec;
+	}
+	firstcluster = fat_end + rootdir_blocks;
+	if (firstcluster < fat_end || firstcluster >= total_blocks) {
+		error = EINVAL;
+		goto error_exit;
+	}
+	nmbrofclusters = (total_blocks - firstcluster) / cluster_blocks;
+	if (nmbrofclusters == 0 || nmbrofclusters >= UINT32_MAX) {
 		error = EINVAL;
 		goto error_exit;
 	}
 
-	pmp->pm_HugeSectors *= pmp->pm_BlkPerSec;
-	pmp->pm_HiddenSects *= pmp->pm_BlkPerSec;
-	pmp->pm_FATsecs *= pmp->pm_BlkPerSec;
-	pmp->pm_fatblk = pmp->pm_ResSectors * pmp->pm_BlkPerSec;
-	SecPerClust *= pmp->pm_BlkPerSec;
-
-	if (FAT32(pmp)) {
-	        pmp->pm_rootdirblk = getulong(b710->bpbRootClust);
-		pmp->pm_firstcluster = pmp->pm_fatblk
-		        + (pmp->pm_FATs * pmp->pm_FATsecs);
-		pmp->pm_fsinfo = getushort(b710->bpbFSInfo) * pmp->pm_BlkPerSec;
-	} else {
-	        pmp->pm_rootdirblk = pmp->pm_fatblk +
-		        (pmp->pm_FATs * pmp->pm_FATsecs);
-		pmp->pm_rootdirsize = (pmp->pm_RootDirEnts * sizeof(struct direntry)
-				       + DEV_BSIZE - 1) / DEV_BSIZE;
-		pmp->pm_firstcluster = pmp->pm_rootdirblk + pmp->pm_rootdirsize;
+	partition_blocks = 0;
+	bsw = bdevsw_lookup(dev);
+	if (bsw != NULL && bsw->d_ioctl != NULL &&
+	    bsw->d_ioctl(dev, DIOCGPART, (caddr_t)&dpart, FREAD, p) == 0) {
+		if (dpart.disklab->d_secsize == 0 ||
+		    DL_GETPSIZE(dpart.part) >
+		    UINT64_MAX / dpart.disklab->d_secsize) {
+			error = EINVAL;
+			goto error_exit;
+		}
+		partition_bytes = DL_GETPSIZE(dpart.part) *
+		    dpart.disklab->d_secsize;
+		partition_blocks = partition_bytes / DEV_BSIZE;
+		if (total_blocks > partition_blocks) {
+			error = EINVAL;
+			goto error_exit;
+		}
 	}
 
-	pmp->pm_nmbrofclusters = (pmp->pm_HugeSectors - pmp->pm_firstcluster) /
-	    SecPerClust;
-	pmp->pm_maxcluster = pmp->pm_nmbrofclusters + 1;
-	pmp->pm_fatsize = pmp->pm_FATsecs * DEV_BSIZE;
+	pmp->pm_HugeSectors = total_blocks;
+	pmp->pm_HiddenSects = hidden_blocks;
+	pmp->pm_FATsecs = fat_blocks;
+	pmp->pm_fatblk = reserved_blocks;
+	pmp->pm_firstcluster = firstcluster;
+	pmp->pm_nmbrofclusters = nmbrofclusters;
+	pmp->pm_maxcluster = nmbrofclusters + 1;
+	pmp->pm_fatsize = fat_blocks * DEV_BSIZE;
+	if (FAT32(pmp)) {
+		pmp->pm_rootdirblk = getulong(b710->bpbRootClust);
+		if (!MSDOSFS_VALID_CLUSTER(pmp, pmp->pm_rootdirblk) ||
+		    ((extflags & FATMIRROR) && pmp->pm_curfat >= pmp->pm_FATs)) {
+			error = EINVAL;
+			goto error_exit;
+		}
+		if (fsinfo_sector != 0 && fsinfo_sector != 0xffff) {
+			if (fsinfo_sector >= pmp->pm_ResSectors) {
+				error = EINVAL;
+				goto error_exit;
+			}
+			pmp->pm_fsinfo = fsinfo_sector * pmp->pm_BlkPerSec;
+		}
+	} else {
+		pmp->pm_rootdirblk = fat_end;
+		pmp->pm_rootdirsize = rootdir_blocks;
+	}
 
 	if (pmp->pm_fatmask == 0) {
 		if (pmp->pm_maxcluster
@@ -390,9 +471,17 @@ msdosfs_mountfs(struct vnode *devvp, struct mount *mp, struct proc *p,
 			pmp->pm_fatdiv = 1;
 		}
 	}
-	if (FAT12(pmp))
+	if (pmp->pm_maxcluster >= (CLUST_RSRVD & pmp->pm_fatmask)) {
+		error = EINVAL;
+		goto error_exit;
+	}
+	if (FAT12(pmp)) {
+		if (pmp->pm_BytesPerSec > MAXBSIZE / 3) {
+			error = EINVAL;
+			goto error_exit;
+		}
 		pmp->pm_fatblocksize = 3 * pmp->pm_BytesPerSec;
-	else
+	} else
 		pmp->pm_fatblocksize = MAXBSIZE;
 
 	/*
@@ -407,15 +496,11 @@ msdosfs_mountfs(struct vnode *devvp, struct mount *mp, struct proc *p,
 	 * from 0, so the max cluster value is one less than the value
 	 * we end up with.
 	 */
-	fat_max_clusters = pmp->pm_fatsize / pmp->pm_fatmult;
-	fat_max_clusters *= pmp->pm_fatdiv;
+	fat_max_clusters = (uint64_t)pmp->pm_fatsize * pmp->pm_fatdiv /
+	    pmp->pm_fatmult;
 	if (pmp->pm_maxcluster >= fat_max_clusters) {
-#ifndef SMALL_KERNEL
-		printf("msdosfs: reducing max cluster to %d from %d "
-		    "due to FAT size\n", fat_max_clusters - 1,
-		    pmp->pm_maxcluster);
-#endif
-		pmp->pm_maxcluster = fat_max_clusters - 1;
+		error = EINVAL;
+		goto error_exit;
 	}
 
 	pmp->pm_fatblocksec = pmp->pm_fatblocksize / DEV_BSIZE;
@@ -425,7 +510,7 @@ msdosfs_mountfs(struct vnode *devvp, struct mount *mp, struct proc *p,
 	 * Compute mask and shift value for isolating cluster relative byte
 	 * offsets and cluster numbers from a file offset.
 	 */
-	pmp->pm_bpcluster = SecPerClust * DEV_BSIZE;
+	pmp->pm_bpcluster = cluster_blocks * DEV_BSIZE;
 	pmp->pm_crbomask = pmp->pm_bpcluster - 1;
 	pmp->pm_cnshift = ffs(pmp->pm_bpcluster) - 1;
 
@@ -453,11 +538,14 @@ msdosfs_mountfs(struct vnode *devvp, struct mount *mp, struct proc *p,
 		if ((error = bread(devvp, pmp->pm_fsinfo, fsi_size(pmp),
 		    &bp)) != 0)
 		        goto error_exit;
+		if (bp->b_bcount < 512) {
+			error = EINVAL;
+			goto error_exit;
+		}
 		fp = (struct fsinfo *)bp->b_data;
 		if (!bcmp(fp->fsisig1, "RRaA", 4)
 		    && !bcmp(fp->fsisig2, "rrAa", 4)
-		    && !bcmp(fp->fsisig3, "\0\0\125\252", 4)
-		    && !bcmp(fp->fsisig4, "\0\0\125\252", 4))
+		    && !bcmp(fp->fsisig3, "\0\0\125\252", 4))
 		        /* Valid FSInfo. */
 			;
 		else
@@ -500,6 +588,25 @@ msdosfs_mountfs(struct vnode *devvp, struct mount *mp, struct proc *p,
 	 */
 	if ((error = fillinusemap(pmp)) != 0)
 		goto error_exit;
+
+	/*
+	 * A FAT32 root directory is a normal cluster chain.  Validate it
+	 * before publishing the mount, since VFS_ROOT cannot construct a
+	 * usable root vnode from a corrupt or cyclic chain.
+	 */
+	if (FAT32(pmp)) {
+		bzero(&rootde, sizeof(rootde));
+		rootde.de_pmp = pmp;
+		rootde.de_Attributes = ATTR_DIRECTORY;
+		rootde.de_StartCluster = pmp->pm_rootdirblk;
+		fc_purge(&rootde, 0);
+		error = pcbmap(&rootde, CLUST_END, 0, &root_clusters, 0);
+		if (error != E2BIG) {
+			if (error == 0)
+				error = EIO;
+			goto error_exit;
+		}
+	}
 
 	/*
 	 * If they want fat updates to be synchronous then let them suffer
@@ -584,6 +691,7 @@ msdosfs_unmount(struct mount *mp, int mntflags,struct proc *p)
 	(void)VOP_CLOSE(vp,
 	    pmp->pm_flags & MSDOSFSMNT_RONLY ? FREAD : FREAD|FWRITE, NOCRED, p);
 	vput(vp);
+	msdosfs_fh_destroy(pmp);
 	free(pmp->pm_inusemap, M_MSDOSFSFAT, 0);
 	free(pmp, M_MSDOSFSMNT, 0);
 	mp->mnt_data = NULL;
@@ -715,14 +823,27 @@ int
 msdosfs_fhtovp(struct mount *mp, struct fid *fhp, struct vnode **vpp)
 {
 	struct msdosfsmount *pmp = VFSTOMSDOSFS(mp);
-	struct defid *defhp = (struct defid *) fhp;
+	struct defid defh;
 	struct denode *dep;
+	uint32_t generation;
 	int error;
 
-	error = deget(pmp, defhp->defid_dirclust, defhp->defid_dirofs, &dep);
-	if (error) {
-		*vpp = NULL;
+	*vpp = NULL;
+	if (fhp->fid_len != sizeof(defh))
+		return (EINVAL);
+	bcopy(fhp, &defh, sizeof(defh));
+	error = msdosfs_fh_lookup(pmp, defh.defid_dirclust,
+	    defh.defid_dirofs, &generation);
+	if (error != 0 || generation != defh.defid_gen)
+		return (ESTALE);
+	error = deget(pmp, defh.defid_dirclust, defh.defid_dirofs, &dep);
+	if (error)
 		return (error);
+	error = msdosfs_fh_lookup(pmp, defh.defid_dirclust,
+	    defh.defid_dirofs, &generation);
+	if (error != 0 || generation != defh.defid_gen) {
+		vput(DETOV(dep));
+		return (ESTALE);
 	}
 	*vpp = DETOV(dep);
 	return (0);
@@ -732,14 +853,19 @@ int
 msdosfs_vptofh(struct vnode *vp, struct fid *fhp)
 {
 	struct denode *dep;
-	struct defid *defhp;
+	struct defid defh;
+	int error;
 
 	dep = VTODE(vp);
-	defhp = (struct defid *)fhp;
-	defhp->defid_len = sizeof(struct defid);
-	defhp->defid_dirclust = dep->de_dirclust;
-	defhp->defid_dirofs = dep->de_diroffset;
-	/* defhp->defid_gen = dep->de_gen; */
+	bzero(&defh, sizeof(defh));
+	defh.defid_len = sizeof(defh);
+	defh.defid_dirclust = dep->de_dirclust;
+	defh.defid_dirofs = dep->de_diroffset;
+	error = msdosfs_fh_enter(dep->de_pmp, dep->de_dirclust,
+	    dep->de_diroffset, &defh.defid_gen);
+	if (error != 0)
+		return (error);
+	bcopy(&defh, fhp, sizeof(defh));
 	return (0);
 }
 

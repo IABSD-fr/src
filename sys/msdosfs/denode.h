@@ -1,3 +1,4 @@
+/* Copyright (C) 2025,2026 kmx.io <contact@kmx.io> */
 /*	$OpenBSD: denode.h,v 1.36 2022/08/15 01:47:09 jsg Exp $	*/
 /*	$NetBSD: denode.h,v 1.24 1997/10/17 11:23:39 ws Exp $	*/
 
@@ -250,9 +251,7 @@ struct defid {
 
 	uint32_t defid_dirclust;	/* cluster this dir entry came from */
 	uint32_t defid_dirofs;	/* offset of entry within the cluster */
-#if 0
 	uint32_t	defid_gen;	/* generation number */
-#endif
 };
 
 
@@ -303,6 +302,11 @@ int doscheckpath(struct denode *, struct denode *);
 int dosdirempty(struct denode *);
 int readde(struct denode *, struct buf **, struct direntry **);
 int readep(struct msdosfsmount *, uint32_t, uint32_t, struct buf **, struct direntry **);
+int msdosfs_validate_direntry(struct msdosfsmount *, uint32_t, uint32_t);
+int msdosfs_fh_enter(struct msdosfsmount *, uint32_t, uint32_t, uint32_t *);
+int msdosfs_fh_lookup(struct msdosfsmount *, uint32_t, uint32_t, uint32_t *);
+int msdosfs_fh_remove(struct msdosfsmount *, uint32_t, uint32_t);
+void msdosfs_fh_destroy(struct msdosfsmount *);
 void reinsert(struct denode *);
 int removede(struct denode *, struct denode *);
 int uniqdosname(struct denode *, struct componentname *, u_char *);
