@@ -16,4 +16,6 @@
 CVS
 .claude
 obj
+regress/sys/msdosfs/msdosfs_test
+sbin/newfs_msdos/newfs_msdos
 tags

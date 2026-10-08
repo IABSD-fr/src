@@ -1,3 +1,4 @@
+/* Copyright (C) 2025,2026 kmx.io <contact@kmx.io> */
 /*	$OpenBSD: msdosfs_vnops.c,v 1.143 2024/10/18 05:52:32 miod Exp $	*/
 /*	$NetBSD: msdosfs_vnops.c,v 1.63 1997/10/17 11:24:19 ws Exp $	*/
 
@@ -1776,8 +1777,14 @@ msdosfs_strategy(void *v)
 	 */
 	if (bp->b_blkno == bp->b_lblkno) {
 		error = pcbmap(dep, bp->b_lblkno, &bp->b_blkno, 0, 0);
-		if (error)
-			bp->b_blkno = -1;
+		if (error) {
+			bp->b_error = error;
+			SET(bp->b_flags, B_ERROR);
+			s = splbio();
+			biodone(bp);
+			splx(s);
+			return (error);
+		}
 		if (bp->b_blkno == -1)
 			clrbuf(bp);
 	}
