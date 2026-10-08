@@ -1,3 +1,4 @@
+/* Copyright (C) 2025,2026 kmx.io <contact@kmx.io> */
 /*	$OpenBSD: msdosfs_conv.c,v 1.22 2024/09/12 09:07:28 claudio Exp $	*/
 /*	$NetBSD: msdosfs_conv.c,v 1.24 1997/10/17 11:23:54 ws Exp $	*/
 
@@ -184,7 +185,7 @@ void
 dos2unixtime(u_int dd, u_int dt, u_int dh, struct timespec *tsp)
 {
 	uint32_t seconds;
-	uint32_t m, month;
+	uint32_t day, m, month;
 	uint32_t y, year;
 	uint32_t days;
 	const u_short *months;
@@ -193,6 +194,16 @@ dos2unixtime(u_int dd, u_int dt, u_int dh, struct timespec *tsp)
 		/*
 		 * Uninitialized field, return the epoch.
 		 */
+		tsp->tv_sec = 0;
+		tsp->tv_nsec = 0;
+		return;
+	}
+	year = (dd & DD_YEAR_MASK) >> DD_YEAR_SHIFT;
+	month = (dd & DD_MONTH_MASK) >> DD_MONTH_SHIFT;
+	day = (dd & DD_DAY_MASK) >> DD_DAY_SHIFT;
+	months = year & 0x03 ? regyear : leapyear;
+	if (month < 1 || month > 12 || day < 1 || day > months[month - 1]) {
+		/* Treat malformed on-disk dates like an uninitialized date. */
 		tsp->tv_sec = 0;
 		tsp->tv_nsec = 0;
 		return;
@@ -208,23 +219,11 @@ dos2unixtime(u_int dd, u_int dt, u_int dh, struct timespec *tsp)
 	if (lastdosdate != dd) {
 		lastdosdate = dd;
 		days = 0;
-		year = (dd & DD_YEAR_MASK) >> DD_YEAR_SHIFT;
 		for (y = 0; y < year; y++)
 			days += y & 0x03 ? 365 : 366;
-		months = year & 0x03 ? regyear : leapyear;
-		/*
-		 * Prevent going from 0 to 0xffffffff in the following
-		 * loop.
-		 */
-		month = (dd & DD_MONTH_MASK) >> DD_MONTH_SHIFT;
-		if (month == 0) {
-			printf("dos2unixtime(): month value out of range (%u)\n",
-			    month);
-			month = 1;
-		}
 		for (m = 0; m < month - 1; m++)
 			days += months[m];
-		days += ((dd & DD_DAY_MASK) >> DD_DAY_SHIFT) - 1;
+		days += day - 1;
 		lastseconds = (days * 24 * 60 * 60) + SECONDSTO1980;
 	}
 	tsp->tv_sec = seconds + lastseconds;

@@ -1,6 +1,8 @@
 /*	$OpenBSD: newfs_msdos.c,v 1.30 2025/09/17 16:07:57 deraadt Exp $	*/
 
 /*
+ * Copyright (c) 2025,2026 kmx.io <contact@kmx.io>
+ *
  * Copyright (c) 1998 Robert Nordier
  * All rights reserved.
  *
@@ -57,9 +59,9 @@
 #define MINBPS	  512		/* minimum bytes per sector */
 #define MAXSPC	  128		/* maximum sectors per cluster */
 #define MAXNFT	  16		/* maximum number of FATs */
-#define DEFBLK	  4096		/* default block size */
-#define DEFBLK16  2048		/* default block size FAT16 */
 #define DEFRDE	  512		/* default root directory entries */
+#define DEFRES32  32		/* default FAT32 reserved sectors */
+#define DEFBKBS32 6		/* default FAT32 backup boot sector */
 #define RESFTE	  2		/* reserved FAT entries */
 #define MINCLS12  1		/* minimum FAT12 clusters */
 #define MINCLS16  0xff5		/* minimum FAT16 clusters */
@@ -162,6 +164,32 @@ struct bpb {
     u_int bkbs; 		/* backup boot sector */
 };
 
+struct cluster_size {
+    u_int64_t max_kb;		/* maximum volume size in KiB */
+    u_int bytes;		/* bytes per cluster */
+};
+
+/* Microsoft FAT specification defaults, expressed independently of bps. */
+static const struct cluster_size fat16_sizes[] = {
+    {       4200,     0 },
+    {      16340,  1024 },
+    {     131072,  2048 },
+    {     262144,  4096 },
+    {     524288,  8192 },
+    {    1048576, 16384 },
+    {    2097152, 32768 },
+    { ULLONG_MAX,     0 }
+};
+
+static const struct cluster_size fat32_sizes[] = {
+    {      33300,     0 },
+    {     266240,   512 },
+    {    8388608,  4096 },
+    {   16777216,  8192 },
+    {   33554432, 16384 },
+    { ULLONG_MAX, 32768 }
+};
+
 static struct {
     const char *name;
     struct bpb bpb;
@@ -208,11 +236,17 @@ static u_int8_t bootcode[] = {
     0
 };
 
-static void check_mounted(const char *, mode_t);
+static void check_mounted(const char *, const struct stat *);
 static void getstdfmt(const char *, struct bpb *);
 static void getdiskinfo(int, const char *, const char *, int,
 			struct bpb *);
+static u_int default_spc(u_int, u_int64_t, u_int);
+static u_int label_sectors(const char *, u_int64_t, u_int, u_int,
+			const char *);
 static void print_bpb(struct bpb *);
+static u_int progress_width(void);
+static void show_progress(u_int, u_int, u_int, u_int *);
+static void end_progress(int);
 static u_int ckgeom(const char *, u_int, const char *);
 static u_int argtou(const char *, u_int, u_int, const char *);
 static int oklabel(const char *);
@@ -231,7 +265,7 @@ main(int argc, char *argv[])
     static u_int opt_F, opt_I, opt_S, opt_a, opt_b, opt_c, opt_e;
     static u_int opt_h, opt_i, opt_k, opt_m, opt_n, opt_o, opt_r;
     static u_int opt_s, opt_u;
-    static int opt_N;
+    static int opt_N, opt_q;
     static int Iflag, mflag, oflag;
     char buf[PATH_MAX];
     struct stat sb;
@@ -243,15 +277,18 @@ main(int argc, char *argv[])
     struct bsxbpb *bsxbpb;
     struct bsx *bsx;
     struct de *de;
-    u_int8_t *img;
+    u_int8_t *img, *sec;
     const char *dtype, *bname;
     char *sname, *fname;
     ssize_t n;
     time_t now;
-    u_int fat, bss, rds, cls, dir, lsn, x, x1, x2;
-    int ch, fd, fd1;
+    u_int fat, bss, rds, cls, dir, lsn, sectors, start, x, x1, x2;
+    u_int bar_width, last_percent;
+    u_int64_t data_clusters, fat_capacity, metadata_sectors, size_kb;
+    size_t bytes;
+    int auto_fat, ch, fd, fd1, progress;
 
-    if (pledge("stdio rpath wpath disklabel", NULL) == -1)
+    if (pledge("stdio rpath wpath disklabel tty", NULL) == -1)
 	err(1, "pledge");
 
     while ((ch = getopt(argc, argv, opts)) != -1)
@@ -322,6 +359,7 @@ main(int argc, char *argv[])
 	    oflag = 1;
 	    break;
 	case 'q':			/* Compat with newfs -q */
+	    opt_q = 1;
 	    break;
 	case 'r':
 	    opt_r = argto2(optarg, 1, "reserved sectors");
@@ -347,7 +385,7 @@ main(int argc, char *argv[])
 	fstat(fd, &sb))
 	err(1, "%s", fname);
     if (!opt_N)
-	check_mounted(fname, sb.st_mode);
+	check_mounted(fname, &sb);
     if (S_ISBLK(sb.st_mode))
 	errx(1, "%s: block device", fname);
     if (!S_ISCHR(sb.st_mode))
@@ -445,22 +483,46 @@ main(int argc, char *argv[])
     }
     if (!bpb.nft)
 	bpb.nft = 2;
-    if (!fat) {
+    size_kb = howmany((u_int64_t)bpb.bps * bpb.bsec, 1024);
+    if (!bpb.spc) {
+	if (!fat) {
+	    if ((bpb.bps == 512 && bpb.bsec <= 8400) ||
+		(bpb.bps != 512 && bpb.bsec <= 4200))
+		fat = 12;
+	    else if (bpb.rde || size_kb < 524288 || bpb.bsec <= 66600)
+		fat = 16;
+	    else
+		fat = 32;
+	}
+	if (fat == 12) {
+	    for (bpb.spc = 1; bpb.spc < MAXSPC; bpb.spc <<= 1) {
+		x = bpb.res ? bpb.res : bss;
+		x += howmany((RESFTE + MAXCLS12 + 1) * (12 / BPN),
+		    bpb.bps * NPB) * bpb.nft;
+		x += howmany(bpb.rde ? bpb.rde : DEFRDE,
+		    bpb.bps / sizeof(struct de));
+		x += (MAXCLS12 + 1) * bpb.spc;
+		if (x >= bpb.bsec)
+		    break;
+	    }
+	} else
+	    bpb.spc = default_spc(fat, size_kb, bpb.bps);
+	if (!bpb.spc)
+	    errx(1, "no default cluster size for FAT%u at %llu KiB", fat,
+		(unsigned long long)size_kb);
+    } else if (!fat) {
 	if (bpb.bsec < (bpb.res ? bpb.res : bss) +
-	    howmany((RESFTE + (bpb.spc ? MINCLS16 : MAXCLS12 + 1)) *
-		    ((bpb.spc ? 16 : 12) / BPN), bpb.bps * NPB) *
-	    bpb.nft +
+	    howmany((RESFTE + MAXCLS12 + 1) * (12 / BPN),
+		bpb.bps * NPB) * bpb.nft +
 	    howmany(bpb.rde ? bpb.rde : DEFRDE,
-		    bpb.bps / sizeof(struct de)) +
-	    (bpb.spc ? MINCLS16 : MAXCLS12 + 1) *
-	    (bpb.spc ? bpb.spc : howmany(DEFBLK, bpb.bps)))
+		bpb.bps / sizeof(struct de)) +
+	    (MAXCLS12 + 1) * bpb.spc)
 	    fat = 12;
 	else if (bpb.rde || bpb.bsec <
 		 (bpb.res ? bpb.res : bss) +
 		 howmany((RESFTE + MAXCLS16) * 2, bpb.bps) * bpb.nft +
 		 howmany(DEFRDE, bpb.bps / sizeof(struct de)) +
-		 (MAXCLS16 + 1) *
-		 (bpb.spc ? bpb.spc : howmany(8192, bpb.bps)))
+		 (MAXCLS16 + 1) * bpb.spc)
 	    fat = 16;
 	else
 	    fat = 32;
@@ -472,33 +534,44 @@ main(int argc, char *argv[])
 		errx(1, "no room for info sector");
 	    bpb.infs = x;
 	}
-	if (bpb.infs != MAXU16 && x <= bpb.infs)
-	    x = bpb.infs + 1;
+	if (bpb.infs != MAXU16) {
+	    if (bpb.infs < bss)
+		errx(1, "info sector would overwrite bootstrap");
+	    if (x <= bpb.infs)
+		x = bpb.infs + 1;
+	}
 	if (!bpb.bkbs) {
 	    if (x == MAXU16)
 		errx(1, "no room for backup sector");
-	    bpb.bkbs = x;
+	    bpb.bkbs = x <= DEFBKBS32 ? DEFBKBS32 : x;
 	} else if (bpb.bkbs != MAXU16 && bpb.bkbs == bpb.infs)
 	    errx(1, "backup sector would overwrite info sector");
-	if (bpb.bkbs != MAXU16 && x <= bpb.bkbs)
-	    x = bpb.bkbs + 1;
+	if (bpb.bkbs != MAXU16) {
+	    if (bpb.bkbs < bss)
+		errx(1, "backup sector would overwrite bootstrap");
+	    if (bpb.infs != MAXU16 && bpb.infs >= bpb.bkbs &&
+		bpb.infs - bpb.bkbs < bss)
+		errx(1, "backup bootstrap would overwrite info sector");
+	    if ((u_int64_t)bpb.bkbs + bss > MAXU16)
+		errx(1, "no room for backup bootstrap");
+	    x = MAXIMUM(x, bpb.bkbs + bss);
+	    if (bpb.infs != MAXU16) {
+		if ((u_int64_t)bpb.bkbs + bpb.infs >= MAXU16)
+		    errx(1, "no room for backup info sector");
+		x = MAXIMUM(x, bpb.bkbs + bpb.infs + 1);
+	    }
+	}
     }
     if (!bpb.res)
-	bpb.res = fat == 32 ? MAXIMUM(x, MAXIMUM(16384 / bpb.bps, 4)) : x;
+	bpb.res = fat == 32 ? MAXIMUM(x, DEFRES32) : x;
     else if (bpb.res < x)
 	errx(1, "too few reserved sectors");
     if (fat != 32 && !bpb.rde)
 	bpb.rde = DEFRDE;
     rds = howmany(bpb.rde, bpb.bps / sizeof(struct de));
-    if (!bpb.spc)
-	for (bpb.spc = howmany(fat == 16 ? DEFBLK16 : DEFBLK, bpb.bps);
-	     bpb.spc < MAXSPC &&
-	     bpb.res +
-	     howmany((RESFTE + maxcls(fat)) * (fat / BPN),
-		     bpb.bps * NPB) * bpb.nft +
-	     rds +
-	     (u_int64_t)(maxcls(fat) + 1) * bpb.spc <= bpb.bsec;
-	     bpb.spc <<= 1);
+    if ((u_int64_t)bpb.bps * bpb.spc > MAXBSIZE)
+	errx(1, "block size (%llu) is too large; maximum is %u",
+	    (unsigned long long)bpb.bps * bpb.spc, MAXBSIZE);
     if (fat != 32 && bpb.bspf > MAXU16)
 	errx(1, "too many sectors/FAT for FAT12/16");
     x1 = bpb.res + rds;
@@ -510,17 +583,33 @@ main(int argc, char *argv[])
 	(bpb.spc * bpb.bps * NPB + fat / BPN * bpb.nft);
     x2 = howmany((RESFTE + MINIMUM(x, maxcls(fat))) * (fat / BPN),
 		 bpb.bps * NPB);
-    if (!bpb.bspf) {
+    auto_fat = bpb.bspf == 0;
+    if (auto_fat)
 	bpb.bspf = x2;
-	x1 += (bpb.bspf - 1) * bpb.nft;
+    for (;;) {
+	metadata_sectors = (u_int64_t)bpb.res + rds +
+	    (u_int64_t)bpb.bspf * bpb.nft;
+	if (metadata_sectors > bpb.bsec)
+	    errx(1, "meta data exceeds file system size");
+	data_clusters = (bpb.bsec - metadata_sectors) / bpb.spc;
+	fat_capacity = (u_int64_t)bpb.bspf * bpb.bps * NPB /
+	    (fat / BPN);
+	if (fat_capacity < RESFTE)
+	    errx(1, "%u sectors/FAT too few", bpb.bspf);
+	fat_capacity -= RESFTE;
+	if (MINIMUM(data_clusters, maxcls(fat)) <= fat_capacity)
+	    break;
+	if (!auto_fat)
+	    errx(1, "%u sectors/FAT too few for %llu data clusters",
+		bpb.bspf, (unsigned long long)data_clusters);
+	if (bpb.bspf == UINT_MAX)
+	    errx(1, "too many sectors/FAT");
+	bpb.bspf++;
     }
-    cls = (bpb.bsec - x1) / bpb.spc;
-    x = (u_int64_t)bpb.bspf * bpb.bps * NPB / (fat / BPN) - RESFTE;
-    if (cls > x)
-	cls = x;
     if (bpb.bspf < x2)
-	warnx("warning: sectors/FAT limits file system to %u clusters",
-	      cls);
+	errx(1, "%u sectors/FAT too few; minimum is %u", bpb.bspf, x2);
+    x1 = metadata_sectors;
+    cls = data_clusters;
     if (cls < mincls(fat))
 	errx(1, "%u clusters too few clusters for FAT%u, need %u", cls, fat,
 	    mincls(fat));
@@ -538,7 +627,7 @@ main(int argc, char *argv[])
 	bpb.mid = !bpb.hid ? 0xf0 : 0xf8;
     if (fat == 32)
 	bpb.rdcl = RESFTE;
-    if (bpb.hid + bpb.bsec <= MAXU16) {
+    if ((u_int64_t)bpb.hid + bpb.bsec <= MAXU16) {
 	bpb.sec = bpb.bsec;
 	bpb.bsec = 0;
     }
@@ -553,140 +642,233 @@ main(int argc, char *argv[])
 	if ((tm = localtime(&now)) == NULL)
 		errx(1, "Invalid time");
 
-	if (!(img = malloc(bpb.bps)))
+	if (!(img = malloc(MAXBSIZE)))
 	    err(1, NULL);
 	dir = bpb.res + (bpb.spf ? bpb.spf : bpb.bspf) * bpb.nft;
-	for (lsn = 0; lsn < dir + (fat == 32 ? bpb.spc : rds); lsn++) {
-	    x = lsn;
-	    if (opt_B &&
-		fat == 32 && bpb.bkbs != MAXU16 &&
-		bss <= bpb.bkbs && x >= bpb.bkbs) {
-		x -= bpb.bkbs;
-		if (!x && lseek(fd1, 0, SEEK_SET))
-		    err(1, "%s", bname);
-	    }
-	    if (opt_B && x < bss) {
-		if ((n = read(fd1, img, bpb.bps)) == -1)
-		    err(1, "%s", bname);
-		if (n != bpb.bps)
-		    errx(1, "%s: can't read sector %u", bname, x);
-	    } else
-		memset(img, 0, bpb.bps);
-	    if (!lsn ||
-	      (fat == 32 && bpb.bkbs != MAXU16 && lsn == bpb.bkbs)) {
-		x1 = sizeof(struct bs);
-		bsbpb = (struct bsbpb *)(img + x1);
-		mk2(bsbpb->bps, bpb.bps);
-		mk1(bsbpb->spc, bpb.spc);
-		mk2(bsbpb->res, bpb.res);
-		mk1(bsbpb->nft, bpb.nft);
-		mk2(bsbpb->rde, bpb.rde);
-		mk2(bsbpb->sec, bpb.sec);
-		mk1(bsbpb->mid, bpb.mid);
-		mk2(bsbpb->spf, bpb.spf);
-		mk2(bsbpb->spt, bpb.spt);
-		mk2(bsbpb->hds, bpb.hds);
-		mk4(bsbpb->hid, bpb.hid);
-		mk4(bsbpb->bsec, bpb.bsec);
-		x1 += sizeof(struct bsbpb);
-		if (fat == 32) {
-		    bsxbpb = (struct bsxbpb *)(img + x1);
-		    mk4(bsxbpb->bspf, bpb.bspf);
-		    mk2(bsxbpb->xflg, 0);
-		    mk2(bsxbpb->vers, 0);
-		    mk4(bsxbpb->rdcl, bpb.rdcl);
-		    mk2(bsxbpb->infs, bpb.infs);
-		    mk2(bsxbpb->bkbs, bpb.bkbs);
-		    x1 += sizeof(struct bsxbpb);
-		}
-		bsx = (struct bsx *)(img + x1);
-		mk1(bsx->sig, 0x29);
-		if (Iflag)
-		    x = opt_I;
-		else
-		    x = (((u_int)(1 + tm->tm_mon) << 8 |
-			  (u_int)tm->tm_mday) +
-			 ((u_int)tm->tm_sec << 8 |
-			  (u_int)(tv.tv_usec / 10))) << 16 |
-			((u_int)(1900 + tm->tm_year) +
-			 ((u_int)tm->tm_hour << 8 |
-			  (u_int)tm->tm_min));
-		mk4(bsx->volid, x);
-		mklabel(bsx->label, opt_L ? opt_L : "NO NAME");
-		snprintf(buf, sizeof buf, "FAT%u", fat);
-		setstr(bsx->type, buf, sizeof(bsx->type));
-		if (!opt_B) {
-		    x1 += sizeof(struct bsx);
-		    bs = (struct bs *)img;
-		    mk1(bs->jmp[0], 0xeb);
-		    mk1(bs->jmp[1], x1 - 2);
-		    mk1(bs->jmp[2], 0x90);
-		    setstr(bs->oem, opt_O ? opt_O : "BSD  4.4",
-			   sizeof(bs->oem));
-		    memcpy(img + x1, bootcode, sizeof(bootcode));
-		    mk2(img + MINBPS - 2, DOSMAGIC);
-		}
-	    } else if (fat == 32 && bpb.infs != MAXU16 &&
-		       (lsn == bpb.infs ||
-			(bpb.bkbs != MAXU16 &&
-			 lsn == bpb.bkbs + bpb.infs))) {
-		mk4(img, 0x41615252);
-		mk4(img + MINBPS - 28, 0x61417272);
-		mk4(img + MINBPS - 24, 0xffffffff);
-		mk4(img + MINBPS - 20, 0xffffffff);
-		mk2(img + MINBPS - 2, DOSMAGIC);
-	    } else if (lsn >= bpb.res && lsn < dir &&
-		       !((lsn - bpb.res) %
-			 (bpb.spf ? bpb.spf : bpb.bspf))) {
-		mk1(img[0], bpb.mid);
-		for (x = 1; x < fat * (fat == 32 ? 3 : 2) / 8; x++)
-		    mk1(img[x], fat == 32 && x % 4 == 3 ? 0x0f : 0xff);
-	    } else if (lsn == dir && opt_L) {
-		de = (struct de *)img;
-		mklabel(de->namext, opt_L);
-		mk1(de->attr, 050);
-		x = (u_int)tm->tm_hour << 11 |
-		    (u_int)tm->tm_min << 5 |
-		    (u_int)tm->tm_sec >> 1;
-		mk2(de->time, x);
-		x = (u_int)(tm->tm_year - 80) << 9 |
-		    (u_int)(tm->tm_mon + 1) << 5 |
-		    (u_int)tm->tm_mday;
-		mk2(de->date, x);
-	    }
-	    if ((n = write(fd, img, bpb.bps)) == -1)
-		err(1, "%s", fname);
-	    if (n != bpb.bps)
-		errx(1, "%s: can't write sector %u", fname, lsn);
+	sectors = dir + (fat == 32 ? bpb.spc : rds);
+	progress = !opt_q && isatty(STDERR_FILENO);
+	last_percent = UINT_MAX;
+	if (progress) {
+	    bar_width = progress_width();
+	    show_progress(0, sectors, bar_width, &last_percent);
 	}
+	/* Batch adjacent sectors to avoid one write(2) call per sector. */
+	for (lsn = 0; lsn < sectors;) {
+	    start = lsn;
+	    memset(img, 0, MAXBSIZE);
+	    for (; lsn < sectors && lsn - start < MAXBSIZE / bpb.bps;
+		lsn++) {
+		sec = img + (lsn - start) * bpb.bps;
+		x = lsn;
+		if (opt_B &&
+		    fat == 32 && bpb.bkbs != MAXU16 &&
+		    bss <= bpb.bkbs && x >= bpb.bkbs) {
+		    x -= bpb.bkbs;
+		    if (!x && lseek(fd1, 0, SEEK_SET)) {
+			end_progress(progress);
+			err(1, "%s", bname);
+		    }
+		}
+		if (opt_B && x < bss) {
+		    if ((n = read(fd1, sec, bpb.bps)) == -1) {
+			end_progress(progress);
+			err(1, "%s", bname);
+		    }
+		    if (n != bpb.bps) {
+			end_progress(progress);
+			errx(1, "%s: can't read sector %u", bname, x);
+		    }
+		}
+		if (!lsn ||
+		  (fat == 32 && bpb.bkbs != MAXU16 && lsn == bpb.bkbs)) {
+		    x1 = sizeof(struct bs);
+		    bsbpb = (struct bsbpb *)(sec + x1);
+		    mk2(bsbpb->bps, bpb.bps);
+		    mk1(bsbpb->spc, bpb.spc);
+		    mk2(bsbpb->res, bpb.res);
+		    mk1(bsbpb->nft, bpb.nft);
+		    mk2(bsbpb->rde, bpb.rde);
+		    mk2(bsbpb->sec, bpb.sec);
+		    mk1(bsbpb->mid, bpb.mid);
+		    mk2(bsbpb->spf, bpb.spf);
+		    mk2(bsbpb->spt, bpb.spt);
+		    mk2(bsbpb->hds, bpb.hds);
+		    mk4(bsbpb->hid, bpb.hid);
+		    mk4(bsbpb->bsec, bpb.bsec);
+		    x1 += sizeof(struct bsbpb);
+		    if (fat == 32) {
+			bsxbpb = (struct bsxbpb *)(sec + x1);
+			mk4(bsxbpb->bspf, bpb.bspf);
+			mk2(bsxbpb->xflg, 0);
+			mk2(bsxbpb->vers, 0);
+			mk4(bsxbpb->rdcl, bpb.rdcl);
+			mk2(bsxbpb->infs, bpb.infs);
+			mk2(bsxbpb->bkbs, bpb.bkbs);
+			x1 += sizeof(struct bsxbpb);
+		    }
+		    bsx = (struct bsx *)(sec + x1);
+		    mk1(bsx->sig, 0x29);
+		    if (Iflag)
+			x = opt_I;
+		    else
+			x = (((u_int)(1 + tm->tm_mon) << 8 |
+			      (u_int)tm->tm_mday) +
+			     ((u_int)tm->tm_sec << 8 |
+			      (u_int)(tv.tv_usec / 10))) << 16 |
+			    ((u_int)(1900 + tm->tm_year) +
+			     ((u_int)tm->tm_hour << 8 |
+			      (u_int)tm->tm_min));
+		    mk4(bsx->volid, x);
+		    mklabel(bsx->label, opt_L ? opt_L : "NO NAME");
+		    snprintf(buf, sizeof buf, "FAT%u", fat);
+		    setstr(bsx->type, buf, sizeof(bsx->type));
+		    if (!opt_B) {
+			x1 += sizeof(struct bsx);
+			bs = (struct bs *)sec;
+			mk1(bs->jmp[0], 0xeb);
+			mk1(bs->jmp[1], x1 - 2);
+			mk1(bs->jmp[2], 0x90);
+			setstr(bs->oem, opt_O ? opt_O : "BSD  4.4",
+			       sizeof(bs->oem));
+			memcpy(sec + x1, bootcode, sizeof(bootcode));
+			mk2(sec + MINBPS - 2, DOSMAGIC);
+		    }
+		} else if (fat == 32 && bpb.infs != MAXU16 &&
+			   (lsn == bpb.infs ||
+			    (bpb.bkbs != MAXU16 &&
+			     lsn == bpb.bkbs + bpb.infs))) {
+		    mk4(sec, 0x41615252);
+		    mk4(sec + MINBPS - 28, 0x61417272);
+		    mk4(sec + MINBPS - 24, 0xffffffff);
+		    mk4(sec + MINBPS - 20, 0xffffffff);
+		    mk2(sec + MINBPS - 2, DOSMAGIC);
+		} else if (lsn >= bpb.res && lsn < dir &&
+			   !((lsn - bpb.res) %
+			     (bpb.spf ? bpb.spf : bpb.bspf))) {
+		    mk1(sec[0], bpb.mid);
+		    for (x = 1; x < fat * (fat == 32 ? 3 : 2) / 8; x++)
+			mk1(sec[x], fat == 32 && x % 4 == 3 ? 0x0f :
+			    0xff);
+		} else if (lsn == dir && opt_L) {
+		    de = (struct de *)sec;
+		    mklabel(de->namext, opt_L);
+		    mk1(de->attr, 050);
+		    x = (u_int)tm->tm_hour << 11 |
+			(u_int)tm->tm_min << 5 |
+			(u_int)tm->tm_sec >> 1;
+		    mk2(de->time, x);
+		    x = (u_int)(tm->tm_year - 80) << 9 |
+			(u_int)(tm->tm_mon + 1) << 5 |
+			(u_int)tm->tm_mday;
+		    mk2(de->date, x);
+		}
+	    }
+	    bytes = (size_t)(lsn - start) * bpb.bps;
+	    if ((n = write(fd, img, bytes)) == -1) {
+		end_progress(progress);
+		err(1, "%s", fname);
+	    }
+	    if ((size_t)n != bytes) {
+		end_progress(progress);
+		errx(1, "%s: can't write sectors %u-%u", fname, start,
+		    lsn - 1);
+	    }
+	    if (progress)
+		show_progress(lsn, sectors, bar_width, &last_percent);
+	}
+	end_progress(progress);
     }
     return 0;
+}
+
+/*
+ * Pick a bar width that fits the terminal, leaving room for the label and
+ * percentage.  A zero-width bar is used only for unusually narrow terminals.
+ */
+static u_int
+progress_width(void)
+{
+    struct winsize ws;
+
+    if (ioctl(STDERR_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0)
+	return 40;
+    if (ws.ws_col <= 20)
+	return 0;
+    return MINIMUM(ws.ws_col - 20, 60);
+}
+
+static void
+show_progress(u_int done, u_int total, u_int width, u_int *last_percent)
+{
+    u_int filled, i, percent;
+
+    percent = (u_int)((u_int64_t)done * 100 / total);
+    if (percent == *last_percent)
+	return;
+    *last_percent = percent;
+    if (width == 0) {
+	fprintf(stderr, "\rFormatting: %3u%%", percent);
+    } else {
+	filled = (u_int)((u_int64_t)done * width / total);
+	fputs("\rFormatting: [", stderr);
+	for (i = 0; i < width; i++) {
+	    if (i < filled)
+		fputc('=', stderr);
+	    else if (i == filled && done < total)
+		fputc('>', stderr);
+	    else
+		fputc(' ', stderr);
+	}
+	fprintf(stderr, "] %3u%%", percent);
+    }
+    fflush(stderr);
+}
+
+static void
+end_progress(int progress)
+{
+    if (progress) {
+	fputc('\n', stderr);
+	fflush(stderr);
+    }
 }
 
 /*
  * Exit with error if file system is mounted.
  */
 static void
-check_mounted(const char *fname, mode_t mode)
+check_mounted(const char *fname, const struct stat *sb)
 {
     struct statfs *mp;
+    struct stat msb;
+    char path[PATH_MAX], resolved[PATH_MAX];
     const char *s1, *s2;
     size_t len;
-    int n, r;
+    int n, r, ret;
 
     if (!(n = getmntinfo(&mp, MNT_NOWAIT)))
 	err(1, "getmntinfo");
     len = sizeof(_PATH_DEV) - 1;
-    s1 = fname;
+    s1 = realpath(fname, resolved) != NULL ? resolved : fname;
     if (!strncmp(s1, _PATH_DEV, len))
 	s1 += len;
-    r = S_ISCHR(mode) && s1 != fname && *s1 == 'r';
+    r = S_ISCHR(sb->st_mode) && !strncmp(s1, "r", 1);
     for (; n--; mp++) {
 	s2 = mp->f_mntfromname;
 	if (!strncmp(s2, _PATH_DEV, len))
 	    s2 += len;
 	if ((r && s2 != mp->f_mntfromname && !strcmp(s1 + 1, s2)) ||
 	    !strcmp(s1, s2))
+	    errx(1, "%s is mounted on %s", fname, mp->f_mntonname);
+	if (!S_ISCHR(sb->st_mode) ||
+	    strncmp(mp->f_mntfromname, _PATH_DEV, len))
+	    continue;
+	ret = snprintf(path, sizeof(path), "%sr%s", _PATH_DEV,
+	    mp->f_mntfromname + len);
+	if (ret < 0 || (size_t)ret >= sizeof(path))
+	    continue;
+	if (stat(path, &msb) == 0 && S_ISCHR(msb.st_mode) &&
+	    msb.st_rdev == sb->st_rdev)
 	    errx(1, "%s is mounted on %s", fname, mp->f_mntonname);
     }
 }
@@ -713,8 +895,10 @@ static void
 getdiskinfo(int fd, const char *fname, const char *dtype, int oflag,
 	    struct bpb *bpb)
 {
+    struct stat sb;
     struct disklabel dl, *lp;
     const char *s1, *s2;
+    u_int diskbps, fsbps, hid;
     int part, i;
 
     part = -1;
@@ -734,7 +918,14 @@ getdiskinfo(int fd, const char *fname, const char *dtype, int oflag,
     if ((((!oflag && part != -1) || !bpb->bsec)) ||
 	!bpb->bps || !bpb->spt || !bpb->hds) {
 	lp = &dl;
-	i = ioctl(fd, DIOCGDINFO, lp);
+	if (fstat(fd, &sb) == -1)
+	    err(1, "%s", fname);
+	if (S_ISCHR(sb.st_mode))
+	    i = ioctl(fd, DIOCGDINFO, lp);
+	else {
+	    errno = ENOTTY;
+	    i = -1;
+	}
 	if (i == -1) {
 	    if (!dtype) {
 		warn("ioctl (GDINFO)");
@@ -748,12 +939,22 @@ getdiskinfo(int fd, const char *fname, const char *dtype, int oflag,
 	if (part >= lp->d_npartitions ||
 	    !DL_GETPSIZE(&lp->d_partitions[part]))
 	    errx(1, "%s: partition is unavailable", fname);
-	if (!oflag && part != -1)
-	    bpb->hid += DL_GETPOFFSET(&lp->d_partitions[part]);
+	diskbps = ckgeom(fname, lp->d_secsize, "bytes/sector");
+	fsbps = bpb->bps ? bpb->bps : diskbps;
+	if (!oflag && part != -1) {
+	    hid = label_sectors(fname,
+		DL_GETPOFFSET(&lp->d_partitions[part]), diskbps, fsbps,
+		"partition offset");
+	    if (bpb->hid > UINT_MAX - hid)
+		errx(1, "%s: partition offset is too large", fname);
+	    bpb->hid += hid;
+	}
 	if (!bpb->bsec)
-	    bpb->bsec = DL_GETPSIZE(&lp->d_partitions[part]);
+	    bpb->bsec = label_sectors(fname,
+		DL_GETPSIZE(&lp->d_partitions[part]), diskbps, fsbps,
+		"partition size");
 	if (!bpb->bps)
-	    bpb->bps = ckgeom(fname, lp->d_secsize, "bytes/sector");
+	    bpb->bps = diskbps;
 	if (!bpb->spt)
 	    bpb->spt = ckgeom(fname, lp->d_nsectors, "sectors/track");
 	if (!bpb->hds)
@@ -763,6 +964,48 @@ getdiskinfo(int fd, const char *fname, const char *dtype, int oflag,
 	    bpb->spt = 63;
 	}
     }
+}
+
+/*
+ * Select Microsoft's default cluster size and express it in sectors.
+ * The published tables assume 512-byte sectors, but their byte-sized
+ * clusters can also be used with larger sectors by rounding up to one
+ * file system sector.
+ */
+static u_int
+default_spc(u_int fat, u_int64_t size_kb, u_int bps)
+{
+    const struct cluster_size *sizes;
+    u_int bytes, i;
+
+    sizes = fat == 16 ? fat16_sizes : fat32_sizes;
+    for (i = 0; size_kb > sizes[i].max_kb; i++)
+	continue;
+    bytes = sizes[i].bytes;
+    if (bytes != 0 && bytes < bps)
+	bytes = bps;
+    return bytes / bps;
+}
+
+/*
+ * Convert a disklabel sector count to file system sectors.
+ */
+static u_int
+label_sectors(const char *fname, u_int64_t sectors, u_int diskbps,
+    u_int fsbps, const char *what)
+{
+    u_int64_t bytes;
+
+    if (sectors > ULLONG_MAX / diskbps)
+	errx(1, "%s: %s is too large", fname, what);
+    bytes = sectors * diskbps;
+    if (bytes % fsbps)
+	errx(1, "%s: %s is not aligned to %u-byte sectors", fname, what,
+	    fsbps);
+    sectors = bytes / fsbps;
+    if (sectors > UINT_MAX)
+	errx(1, "%s: %s is too large", fname, what);
+    return sectors;
 }
 
 /*
@@ -871,7 +1114,7 @@ usage(void)
 	extern const char	*__progname;
 
 	fprintf(stderr, "usage: %s "
-	    "[-N] [-a FAT-size] [-B boot] [-b block-size]\n"
+	    "[-Nq] [-a FAT-size] [-B boot] [-b block-size]\n"
 	    "\t[-c cluster-size] [-e dirents] [-F FAT-type] [-f format]\n"
 	    "\t[-h heads] [-I volid] [-i info] [-k backup] [-L label]\n"
 	    "\t[-m media] [-n FATs] [-O OEM] [-o hidden] [-r reserved]\n"
