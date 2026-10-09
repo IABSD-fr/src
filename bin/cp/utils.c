@@ -141,7 +141,9 @@ copy_file(FTSENT *entp, int exists)
 #endif
 	{
 		int skipholes = 0;
+		off_t offset;
 		struct stat tosb;
+
 		if (!fstat(to_fd, &tosb) && S_ISREG(tosb.st_mode))
 			skipholes = 1;
 		while ((rcount = read(from_fd, buf, buflen)) > 0) {
@@ -155,11 +157,15 @@ copy_file(FTSENT *entp, int exists)
 				break;
 			}
 		}
-		if (skipholes && rcount != -1)
-			rcount = ftruncate(to_fd, lseek(to_fd, 0, SEEK_CUR));
 		if (rcount == -1) {
 			warn("%s", entp->fts_path);
 			rval = 1;
+		} else if (skipholes) {
+			offset = lseek(to_fd, 0, SEEK_CUR);
+			if (offset == -1 || ftruncate(to_fd, offset) == -1) {
+				warn("%s", to.p_path);
+				rval = 1;
+			}
 		}
 	}
 
