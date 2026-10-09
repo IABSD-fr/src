@@ -577,6 +577,20 @@ detrunc(struct denode *dep, uint32_t length, int flags, struct ucred *cred,
 
 	uvm_vnp_setsize(DETOV(dep), length);
 
+	/*
+	 * A same-size truncate changes file timestamps but must not
+	 * rewrite the FAT chain.  In particular, pcbmap() uses E2BIG as
+	 * its internal end-of-chain result; there is no mapping operation
+	 * to perform here from which that result could be meaningful.
+	 */
+	if (dep->de_FileSize == length) {
+		if (!isadir) {
+			dep->de_flag |= DE_UPDATE | DE_MODIFIED;
+			return (deupdat(dep, 1));
+		}
+		return (0);
+	}
+
 	if (dep->de_FileSize < length)
 		return (deextend(dep, length, cred));
 

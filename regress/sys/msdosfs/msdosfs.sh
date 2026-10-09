@@ -124,6 +124,9 @@ create_base()
 {
 	profile=$1
 	case "$profile" in
+	fat12)
+		bps=512; sectors=5744; args='-F 12 -c 2 -e 512'
+		;;
 	fat32)
 		bps=512; sectors=131072; args='-F 32 -c 1 -a 1009'
 		;;
@@ -385,7 +388,29 @@ run_full_root()
 	echo " ok"
 }
 
+run_same_size_truncate()
+{
+	profile=$1
+	test_name="same-size truncate $profile"
+	printf '%-62s' "kernel: $test_name"
+	case_dir=$work/same-size-truncate-$profile
+	image=$work/base-$profile.img
+	mkdir "$case_dir"
+	attach_image
+	mount_image rw || { detach_image; fail "valid image was rejected"; }
+	if ! "$TIMEOUT" -k 2 "$MSDOSFS_TIMEOUT" "$MSDOSFS_TEST" \
+	    same-size-truncate "$mountpoint/TRUNCATE.BIN" \
+	    >"$case_dir/truncate.log" 2>&1; then
+		cat "$case_dir/truncate.log" >&2
+		detach_image
+		fail "same-size truncate regression failed"
+	fi
+	detach_image
+	echo " ok"
+}
+
 test_name=fixture-setup
+create_base fat12
 create_base fat32
 create_base fat16
 create_base fat16-2048
@@ -411,6 +436,7 @@ fi
 create_base fat32-16384
 create_base fat32-32768
 
+mount_control fat12
 mount_control fat16
 mount_control fat32
 mount_control fat32-16384
@@ -442,3 +468,6 @@ run_free_cycle free-two-cycle FREETWO.BIN 2
 run_dates
 run_fh
 run_full_root
+run_same_size_truncate fat12
+run_same_size_truncate fat16
+run_same_size_truncate fat32

@@ -57,6 +57,7 @@
 #define ATTR_DIRECTORY	0x10
 #define ATTR_ARCHIVE	0x20
 #define FAT32_EOF	0x0fffffffU
+#define SAME_SIZE_TRUNCATE_SIZE	239709
 
 struct fat_image {
 	int		 fd;
@@ -108,6 +109,7 @@ static void	test_parent_cycle(const char *, const char *);
 static void	test_free_cycle(const char *, const char *, uint64_t);
 static void	test_dates(const char *);
 static void	test_full_root(const char *);
+static void	test_same_size_truncate(const char *);
 
 static void
 read_exact(int fd, void *buf, size_t len, off_t offset, const char *what)
@@ -694,6 +696,45 @@ test_full_root(const char *path)
 }
 
 static void
+test_same_size_truncate(const char *path)
+{
+	struct stat st;
+	uint8_t buf[4096];
+	off_t offset;
+	ssize_t n;
+	size_t i, len;
+	int fd;
+
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	for (offset = 0; offset < SAME_SIZE_TRUNCATE_SIZE;
+	    offset += (off_t)len) {
+		len = sizeof(buf);
+		if (len > SAME_SIZE_TRUNCATE_SIZE - (size_t)offset)
+			len = SAME_SIZE_TRUNCATE_SIZE - (size_t)offset;
+		for (i = 0; i < len; i++)
+			buf[i] = (uint8_t)((size_t)offset + i);
+		n = write(fd, buf, len);
+		if (n == -1)
+			err(1, "write %s", path);
+		if ((size_t)n != len)
+			errx(1, "short write to %s", path);
+	}
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (st.st_size != SAME_SIZE_TRUNCATE_SIZE)
+		errx(1, "%s has unexpected size %lld", path,
+		    (long long)st.st_size);
+	if (ftruncate(fd, st.st_size) == -1)
+		err(1, "same-size ftruncate %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
 usage(void)
 {
 	fprintf(stderr, "usage: msdosfs_test mutate image mutation\n"
@@ -703,7 +744,8 @@ usage(void)
 	    "       msdosfs_test parent-cycle source target\n"
 	    "       msdosfs_test free-cycle path probe expected-clusters\n"
 	    "       msdosfs_test dates mountpoint\n"
-	    "       msdosfs_test full-root path\n");
+	    "       msdosfs_test full-root path\n"
+	    "       msdosfs_test same-size-truncate path\n");
 	exit(1);
 }
 
@@ -733,6 +775,9 @@ main(int argc, char **argv)
 		test_dates(argv[2]);
 	else if (argc == 3 && strcmp(argv[1], "full-root") == 0)
 		test_full_root(argv[2]);
+	else if (argc == 3 &&
+	    strcmp(argv[1], "same-size-truncate") == 0)
+		test_same_size_truncate(argv[2]);
 	else
 		usage();
 	return 0;
