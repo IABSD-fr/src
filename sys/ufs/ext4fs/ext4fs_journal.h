@@ -235,6 +235,8 @@ u_int32_t	jbd2_block_checksum (struct jbd2_replay_ctx *,
     const void *, size_t);
 u_int32_t	jbd2_data_block_checksum (struct jbd2_replay_ctx *,
     const void *, u_int32_t);
+u_int32_t	jbd2_data_block_checksum_escaped (
+    struct jbd2_replay_ctx *, const void *, u_int32_t);
 u_int32_t	jbd2_descriptor_limit (struct jbd2_replay_ctx *);
 int	jbd2_superblock_csum_verify (struct jbd2_replay_ctx *,
     struct jbd2_superblock *);

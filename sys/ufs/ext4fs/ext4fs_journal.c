@@ -565,16 +565,41 @@ jbd2_data_block_csum_verify (struct jbd2_replay_ctx *ctx, void *data,
 	return ((u_int16_t)crc == (u_int16_t)provided);
 }
 
+static u_int32_t
+jbd2_data_block_checksum_start (struct jbd2_replay_ctx *ctx,
+    u_int32_t sequence)
+{
+	u_int32_t sequence_be;
+
+	sequence_be = htobe32(sequence);
+	return (crc32c(ctx->rc_checksum_seed,
+	    (const uint8_t *)&sequence_be, sizeof(sequence_be)));
+}
+
 u_int32_t
 jbd2_data_block_checksum (struct jbd2_replay_ctx *ctx, const void *data,
     u_int32_t sequence)
 {
-	u_int32_t crc, sequence_be;
+	u_int32_t crc;
 
-	sequence_be = htobe32(sequence);
-	crc = crc32c(ctx->rc_checksum_seed,
-	    (const uint8_t *)&sequence_be, sizeof(sequence_be));
+	crc = jbd2_data_block_checksum_start(ctx, sequence);
 	return (~crc32c(crc, data, ctx->rc_blocksize));
+}
+
+u_int32_t
+jbd2_data_block_checksum_escaped (struct jbd2_replay_ctx *ctx,
+    const void *data, u_int32_t sequence)
+{
+	const uint8_t *bytes;
+	u_int32_t crc, zero;
+
+	KASSERT(ctx->rc_blocksize >= sizeof(zero));
+	bytes = data;
+	zero = 0;
+	crc = jbd2_data_block_checksum_start(ctx, sequence);
+	crc = crc32c(crc, (const uint8_t *)&zero, sizeof(zero));
+	return (~crc32c(crc, bytes + sizeof(zero),
+	    ctx->rc_blocksize - sizeof(zero)));
 }
 
 u_int32_t

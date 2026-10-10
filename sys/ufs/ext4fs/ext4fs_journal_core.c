@@ -156,7 +156,6 @@ struct ext4fs_journal {
 	struct taskq	*j_commit_taskq;
 	/* Serialized commit workspace; queued buffers copy its data. */
 	void		*j_scratch_block;
-	void		*j_scratch_data;
 
 	struct jbd2_blockmap_entry *j_blockmap;
 	u_int64_t	*j_blockset;
@@ -238,7 +237,7 @@ static void	ext4fs_journal_io_submit_raw (
 static int	ext4fs_journal_io_wait (
 		    struct ext4fs_journal_io_batch *);
 static void	ext4fs_journal_scratch_acquire (
-		    struct ext4fs_journal *, void **, void **);
+		    struct ext4fs_journal *, void **);
 static void	ext4fs_journal_scratch_release (
 		    struct ext4fs_journal *);
 static void	ext4fs_journal_checksum_ctx (struct ext4fs_journal *,
@@ -271,7 +270,7 @@ static int	ext4fs_journal_snapshot_metadata (
 		    struct ext4fs_journal_transaction *);
 static int	ext4fs_journal_write_metadata (struct ext4fs_journal *,
 		    struct ext4fs_journal_transaction *, u_int32_t *,
-		    void *, void *, struct ext4fs_journal_io_batch *);
+		    void *, struct ext4fs_journal_io_batch *);
 static int	ext4fs_journal_write_revokes (struct ext4fs_journal *,
 		    struct ext4fs_journal_transaction *, u_int32_t *,
 		    void *, struct ext4fs_journal_io_batch *);
@@ -776,16 +775,14 @@ ext4fs_journal_wait_pending_data (struct mount *mp)
 
 static void
 ext4fs_journal_scratch_acquire (struct ext4fs_journal *journal,
-    void **blockp, void **datap)
+    void **blockp)
 {
 	mtx_enter(&journal->j_lock);
 	KASSERT(journal->j_commit_busy);
 	KASSERT(! journal->j_scratch_busy);
 	KASSERT(journal->j_scratch_block != NULL);
-	KASSERT(journal->j_scratch_data != NULL);
 	journal->j_scratch_busy = 1;
 	*blockp = journal->j_scratch_block;
-	*datap = journal->j_scratch_data;
 	mtx_leave(&journal->j_lock);
 }
 
@@ -1167,15 +1164,16 @@ ext4fs_journal_snapshot_metadata (struct ext4fs_journal *journal,
 static int
 ext4fs_journal_write_metadata (struct ext4fs_journal *journal,
     struct ext4fs_journal_transaction *tx, u_int32_t *jblockp,
-    void *descriptor, void *data,
+    void *descriptor,
     struct ext4fs_journal_io_batch *batch)
 {
 	struct ext4fs_journal_metadata *first, *metadata, *next;
 	struct jbd2_block_tail *tail;
 	struct jbd2_header *header;
 	struct jbd2_replay_ctx ctx;
+	const void *payload;
 	u_int32_t checksum, count, flags, i, limit, offset, word;
-	int error, has_64bit, has_csum_v2, has_csum_v3;
+	int error, escaped, has_64bit, has_csum_v2, has_csum_v3;
 
 	ext4fs_journal_checksum_ctx(journal, &ctx);
 	limit = jbd2_descriptor_limit(&ctx);
@@ -1199,19 +1197,28 @@ ext4fs_journal_write_metadata (struct ext4fs_journal *journal,
 		offset = sizeof(*header);
 		metadata = first;
 		for (i = 0; i < count; i++) {
+			/*
+			 * Checksum the immutable snapshot directly.  Escaping
+			 * logically replaces its first word with zero.
+			 */
 			flags = i == count - 1 ? JBD2_FLAG_LAST_TAG : 0;
 			if (i != 0)
 				flags |= JBD2_FLAG_SAME_UUID;
-			memcpy(data, metadata->jm_snapshot,
-			    journal->j_blocksize);
-			memcpy(&word, data, sizeof(word));
-			if (word == htobe32(JBD2_MAGIC)) {
-				memset(data, 0, sizeof(word));
+			memcpy(&word, metadata->jm_snapshot, sizeof(word));
+			escaped = word == htobe32(JBD2_MAGIC);
+			if (escaped)
 				flags |= JBD2_FLAG_ESCAPE;
-			}
-			checksum = jbd2_has_csum_v2or3(&ctx) ?
-			    jbd2_data_block_checksum(&ctx, data,
-			    tx->jt_sequence) : 0;
+			if (! jbd2_has_csum_v2or3(&ctx))
+				checksum = 0;
+			else if (escaped)
+				checksum =
+				    jbd2_data_block_checksum_escaped(&ctx,
+				    metadata->jm_snapshot,
+				    tx->jt_sequence);
+			else
+				checksum = jbd2_data_block_checksum(&ctx,
+				    metadata->jm_snapshot,
+				    tx->jt_sequence);
 
 			if (has_csum_v3) {
 				ext4fs_journal_put32(descriptor, offset,
@@ -1272,14 +1279,21 @@ ext4fs_journal_write_metadata (struct ext4fs_journal *journal,
 
 		metadata = first;
 		for (i = 0; i < count; i++) {
+			/*
+			 * The queued buffer copies its input.  Only escaped
+			 * payloads need the reusable workspace.
+			 */
 			next = TAILQ_NEXT(metadata, jm_entry);
-			memcpy(data, metadata->jm_snapshot,
-			    journal->j_blocksize);
-			memcpy(&word, data, sizeof(word));
-			if (word == htobe32(JBD2_MAGIC))
-				memset(data, 0, sizeof(word));
+			payload = metadata->jm_snapshot;
+			memcpy(&word, payload, sizeof(word));
+			if (word == htobe32(JBD2_MAGIC)) {
+				memcpy(descriptor, payload,
+				    journal->j_blocksize);
+				memset(descriptor, 0, sizeof(word));
+				payload = descriptor;
+			}
 			error = ext4fs_journal_queue_block(journal,
-			    *jblockp, data, batch);
+			    *jblockp, payload, batch);
 			if (error)
 				return (error);
 			*jblockp = ext4fs_journal_next_block(journal,
@@ -1688,7 +1702,7 @@ ext4fs_journal_commit_transaction (struct ext4fs_journal *journal,
 	struct ext4fs_journal_io_batch batch;
 	struct ext4fs_journal_transaction *oldest;
 	struct ufsmount *ump;
-	void *block, *data;
+	void *block;
 	u_int32_t commit_block, expected_head, jblock, required;
 	u_int32_t expose_sequence, expose_start;
 	u_int32_t start, usable;
@@ -1710,7 +1724,7 @@ ext4fs_journal_commit_transaction (struct ext4fs_journal *journal,
 	    usable;
 	expected_head = ext4fs_journal_next_block(journal,
 	    commit_block);
-	ext4fs_journal_scratch_acquire(journal, &block, &data);
+	ext4fs_journal_scratch_acquire(journal, &block);
 	ext4fs_journal_io_init(&batch);
 
 	/*
@@ -1752,7 +1766,7 @@ ext4fs_journal_commit_transaction (struct ext4fs_journal *journal,
 	ext4fs_journal_set_stage(journal,
 	    EXT4FS_JOURNAL_STAGE_METADATA);
 	error = ext4fs_journal_write_metadata(journal, tx, &jblock,
-	    block, data, &batch);
+	    block, &batch);
 	if (error)
 		goto precommit_wait;
 	ext4fs_journal_set_stage(journal,
@@ -1945,8 +1959,6 @@ ext4fs_journal_init (struct mount *mp)
 	journal->j_blocksize = ctx.rc_blocksize;
 	journal->j_scratch_block = malloc(journal->j_blocksize,
 	    M_UFSMNT, M_WAITOK);
-	journal->j_scratch_data = malloc(journal->j_blocksize,
-	    M_UFSMNT, M_WAITOK);
 	journal->j_maxlen = ctx.rc_maxlen;
 	journal->j_first = ctx.rc_first;
 	journal->j_head = ctx.rc_head != 0 ? ctx.rc_head : ctx.rc_first;
@@ -2043,8 +2055,6 @@ ext4fs_journal_destroy (struct mount *mp)
 		free(journal->j_blockmap, M_TEMP,
 		    journal->j_blockmap_count *
 		    sizeof(*journal->j_blockmap));
-	free(journal->j_scratch_data, M_UFSMNT,
-	    journal->j_blocksize);
 	free(journal->j_scratch_block, M_UFSMNT,
 	    journal->j_blocksize);
 	taskq_destroy(journal->j_commit_taskq);

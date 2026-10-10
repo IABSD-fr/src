@@ -742,16 +742,24 @@ durable but uncheckpointed transactions.  It no longer depends on the
 operations.  The 1024-byte journal-wrap case passed with indexed lookup
 on 2026-10-05.
 
-The bounded-scratch implementation allocates two block-sized workspaces
-when a journal is initialized instead of allocating and freeing them for
-every commit.  One workspace constructs descriptors, revoke records,
-and the commit block; the other constructs escaped metadata payloads.
-Queued journal buffers copy the complete workspace contents before I/O,
-so reuse cannot modify an outstanding write.  The serialized committer
-owns both workspaces explicitly, and journal teardown asserts that they
-have been released before freeing them.  The production GENERIC.MP
-object builds with this implementation.  Booted-kernel operation,
-failure-injection, and crash tests passed on 2026-10-07.  Live rsync
+The bounded-scratch implementation first replaced per-commit allocation
+with two block-sized journal workspaces.  The immutable-snapshot audit
+then removed the second workspace and the two intermediate copies made
+for every ordinary metadata block.  Descriptor checksums now read the
+snapshot directly.  The queued journal buffer also copies directly from
+that snapshot into its I/O buffer.  An escaped checksum treats the first
+word as zero incrementally, and only an escaped payload reuses the one
+descriptor workspace after its descriptor has been queued.  Thus every
+metadata image is checksummed once and copied once per necessary I/O
+destination, with no temporary full-block copy.  Transaction sequences
+remain part of the JBD2 data checksum, so checksums are deliberately not
+reused across transactions.  The affected production GENERIC.MP objects
+build with this implementation.  The grouping, synchronous-write, and
+directory-churn regressions passed on the booted production kernel on
+2026-10-10.
+
+The original bounded-scratch implementation passed booted-kernel
+operation, failure-injection, and crash tests on 2026-10-07.  Live rsync
 testing then remained very slow on a many-small-file tree and showed
 visible waits between update bursts.  Per-commit scratch allocation was
 therefore not the dominant cost for that workload.
@@ -780,8 +788,9 @@ use this path before opening a write handle.  Direct journal-less
 mutation and ordinary file-data reads remain unchanged.  The affected
 production GENERIC.MP objects build successfully.  A focused regression
 alternates creates and negative lookups in one dirty directory and
-rejects the former one-age-wait-per-lookup behavior.  Booted-kernel and
-full regression results are pending.
+rejects the former one-age-wait-per-lookup behavior.  The focused
+read-through, grouping, directory-churn, and orphan regressions passed
+on the booted production kernel on 2026-10-10.
 
 - [x] Reuse bounded per-journal scratch storage rather than allocating
       it for every commit.
@@ -789,7 +798,7 @@ full regression results are pending.
       retaining lists for deterministic journal order.
 - [ ] Deduplicate ordered-vnode dependencies without repeated linear
       scans.
-- [ ] Avoid copying or checksumming an unchanged metadata snapshot more
+- [x] Avoid copying or checksumming an unchanged metadata snapshot more
       than once.
 - [ ] Coalesce repeated inode, group-descriptor, and superblock changes
       within one transaction.
