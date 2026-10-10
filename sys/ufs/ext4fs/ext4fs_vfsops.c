@@ -1354,11 +1354,9 @@ int
 ext4fs_bgd_write_handle (struct m_ext4fs *fs, struct vnode *devvp,
     u_int32_t group, struct ext4fs_journal_handle *handle)
 {
-	struct ext4fs_block_group_descriptor saved, *gd;
 	struct buf *bp;
 	u_int64_t fsblock;
-	u_int16_t saved_checksum;
-	size_t bgd_off, size;
+	size_t bgd_off;
 	int error;
 
 	if (handle == NULL)
@@ -1366,27 +1364,16 @@ ext4fs_bgd_write_handle (struct m_ext4fs *fs, struct vnode *devvp,
 	error = ext4fs_bgd_location(fs, group, &fsblock, &bgd_off);
 	if (error)
 		return (error);
-	size = fs->m_block_group_descriptor_size;
 
 	error = ext4fs_journal_get_metadata(handle, devvp, fsblock,
 	    &bp);
 	if (error)
 		return (error);
-	memcpy(&saved, (char *)bp->b_data + bgd_off, size);
-	gd = &fs->m_gd[group];
-	saved_checksum = gd->bgd_checksum;
-	gd->bgd_checksum = htole16(ext4fs_bgd_csum(fs, gd, group));
-	memcpy((char *)bp->b_data + bgd_off, gd, size);
-	error = ext4fs_journal_dirty_metadata(handle, bp);
-	if (error) {
-		memcpy((char *)bp->b_data + bgd_off, &saved,
-		    size);
-		gd->bgd_checksum = saved_checksum;
-	}
-	return (error);
+	return (ext4fs_journal_dirty_group_descriptor(handle, bp,
+	    group));
 }
 
-static void
+void
 ext4fs_sbprepare (struct m_ext4fs *fs, struct ext4fs *sble)
 {
 	struct timespec ts;
@@ -1470,8 +1457,6 @@ ext4fs_sbwrite_handle (struct mount *mp,
 {
 	struct ufsmount *ump = VFSTOUFS(mp);
 	struct m_ext4fs *fs = ump->um_e4fs;
-	struct ext4fs saved_disk;
-	struct ext4fs *sble;
 	struct buf *bp;
 	u_int64_t fsblock;
 	u_int32_t offset;
@@ -1488,16 +1473,7 @@ ext4fs_sbwrite_handle (struct mount *mp,
 	    fsblock, &bp);
 	if (error)
 		return (error);
-	sble = (struct ext4fs *)((char *)bp->b_data + offset);
-	memcpy(&saved_disk, sble, sizeof(saved_disk));
-	memcpy(sble, &fs->m_sble, sizeof(*sble));
-	ext4fs_sbprepare(fs, sble);
-	error = ext4fs_journal_dirty_metadata(handle, bp);
-	if (error)
-		memcpy(sble, &saved_disk, sizeof(saved_disk));
-	else
-		memcpy(&fs->m_sble, sble, sizeof(fs->m_sble));
-	return (error);
+	return (ext4fs_journal_dirty_superblock(handle, bp));
 }
 
 static u_long ext4fs_gennumber;
@@ -2556,6 +2532,14 @@ retry:
 			brelse(bp);
 		*vpp = NULL;
 		return (error);
+	}
+	if (handle != NULL) {
+		error = ext4fs_journal_materialize_metadata(handle, bp);
+		if (error) {
+			vput(vp);
+			*vpp = NULL;
+			return (error);
+		}
 	}
 
 	dp = (struct ext4fs_dinode *)

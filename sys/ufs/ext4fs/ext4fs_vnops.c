@@ -446,7 +446,7 @@ ext4fs_update_handle (struct inode *ip,
 	struct ext4fs_block_group_descriptor *gd;
 	struct buf *bp;
 	u_int64_t fsblock, inode_table_block;
-	u_int32_t block_in_table, csum, inode_group, inode_index;
+	u_int32_t block_in_table, inode_group, inode_index;
 	u_int32_t offset_in_block;
 	u_int8_t saved_inode[sizeof(struct ext4fs_dinode_256)];
 	int error;
@@ -478,17 +478,12 @@ ext4fs_update_handle (struct inode *ip,
 	if (error)
 		return (error);
 
-	csum = ext4fs_inode_csum(fs, ip->i_e4din, ip->i_number);
-	ip->i_e4din->dinode.i_checksum_lo = htole16(csum & 0xFFFF);
-	if (ext4fs_inode_has_csum_hi(ip->i_e4din))
-		ip->i_e4din->dinode.i_checksum_hi =
-		    htole16((csum >> 16) & 0xFFFF);
-
 	memcpy(saved_inode, (char *)bp->b_data + offset_in_block,
 	    fs->m_inode_size);
 	memcpy((char *)bp->b_data + offset_in_block, ip->i_e4din,
 	    fs->m_inode_size);
-	error = ext4fs_journal_dirty_metadata(handle, bp);
+	error = ext4fs_journal_dirty_inode(handle, bp,
+	    ip->i_number);
 	if (error)
 		memcpy((char *)bp->b_data + offset_in_block,
 		    saved_inode, fs->m_inode_size);

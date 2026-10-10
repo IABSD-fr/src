@@ -792,6 +792,24 @@ rejects the former one-age-wait-per-lookup behavior.  The focused
 read-through, grouping, directory-churn, and orphan regressions passed
 on the booted production kernel on 2026-10-10.
 
+Repeated checksum finalization is now coalesced by transaction metadata
+block.  Inode-table and group-descriptor records contain a compact
+bitset of changed slots; the superblock record needs only one pending
+flag.  Its 16-byte bound follows from the supported 4096-byte maximum
+block and 32-byte minimum descriptor.  Repeated updates set an existing
+bit in constant time and perform no dynamic allocation.
+
+The final inode checksum, group-descriptor checksum and copy, and
+superblock preparation occur only when the stable transaction image is
+needed.  Commit materializes every pending field before taking its
+immutable snapshot.  A checksum-verifying handle reader and the stable
+running-transaction copy path materialize the requested block first.
+The inline bitset remains with the metadata record until transaction
+teardown.  Abort discards pending finalization, while commit clears the
+bits only after producing the final checksummed image.  The affected
+amd64 `GENERIC.MP` and i386 `GENERIC` objects build successfully.
+Booted-kernel regression results remain pending.
+
 - [x] Reuse bounded per-journal scratch storage rather than allocating
       it for every commit.
 - [x] Add lookup structures for transaction metadata and revokes while
@@ -800,7 +818,7 @@ on the booted production kernel on 2026-10-10.
       scans.
 - [x] Avoid copying or checksumming an unchanged metadata snapshot more
       than once.
-- [ ] Coalesce repeated inode, group-descriptor, and superblock changes
+- [x] Coalesce repeated inode, group-descriptor, and superblock changes
       within one transaction.
 - [x] Validate each block and inode bitmap once per transaction-owned
       metadata record rather than once per allocation or free.

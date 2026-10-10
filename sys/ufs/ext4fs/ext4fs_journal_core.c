@@ -43,8 +43,26 @@
 #include <ufs/ufs/ufsmount.h>
 
 #include <ufs/ext4fs/ext4fs.h>
+#include <ufs/ext4fs/ext4fs_crc32c.h>
+#include <ufs/ext4fs/ext4fs_dinode.h>
 #include <ufs/ext4fs/ext4fs_journal.h>
 #include <ufs/ext4fs/ext4fs_journal_state.h>
+
+enum ext4fs_journal_update_kind {
+	EXT4FS_JOURNAL_UPDATE_NONE = 0,
+	EXT4FS_JOURNAL_UPDATE_INODE = 1,
+	EXT4FS_JOURNAL_UPDATE_GROUP_DESCRIPTOR,
+	EXT4FS_JOURNAL_UPDATE_SUPERBLOCK
+};
+
+/*
+ * Mount validation limits blocks to 4096 and descriptors to 32 or 64.
+ */
+#define EXT4FS_JOURNAL_UPDATE_SLOTS_MAX				\
+	((1U << (EXT4FS_LOG_MIN_BLOCK_SIZE + 2)) /		\
+	EXT4FS_BGD_SIZE_32)
+#define EXT4FS_JOURNAL_UPDATE_BYTES				\
+	howmany(EXT4FS_JOURNAL_UPDATE_SLOTS_MAX, NBBY)
 
 struct ext4fs_journal_metadata {
 	TAILQ_ENTRY(ext4fs_journal_metadata) jm_entry;
@@ -60,6 +78,12 @@ struct ext4fs_journal_metadata {
 	u_int32_t	 jm_snapshot_size;
 	u_int32_t	 jm_validated;
 	int		 jm_dirty;
+	/* Deferred checksum and copy finalization within this block. */
+	u_int8_t	 jm_update_bits[EXT4FS_JOURNAL_UPDATE_BYTES];
+	u_int32_t	 jm_update_base;
+	u_int32_t	 jm_update_slots;
+	enum ext4fs_journal_update_kind jm_update_kind;
+	int		 jm_update_pending;
 };
 
 struct ext4fs_journal_revoke {
@@ -211,6 +235,15 @@ struct ext4fs_journal_abort_info {
 };
 
 static void	ext4fs_journal_transaction_free (
+		    struct ext4fs_journal_transaction *);
+static void	ext4fs_journal_update_reset (
+		    struct ext4fs_journal_metadata *);
+static int	ext4fs_journal_materialize_record (
+		    struct ext4fs_journal *,
+		    struct ext4fs_journal_transaction *,
+		    struct ext4fs_journal_metadata *);
+static int	ext4fs_journal_materialize_transaction (
+		    struct ext4fs_journal *,
 		    struct ext4fs_journal_transaction *);
 static int	ext4fs_journal_block_member (struct ext4fs_journal *,
 		    u_int64_t);
@@ -386,6 +419,7 @@ ext4fs_journal_metadata_remove (
 {
 	struct ext4fs_journal_metadata *removed;
 
+	KASSERT(! metadata->jm_update_pending);
 	removed = RB_REMOVE(ext4fs_journal_metadata_block_tree,
 	    &tx->jt_metadata_blocks, metadata);
 	KASSERT(removed == metadata);
@@ -412,6 +446,206 @@ ext4fs_journal_revoke_remove (
 }
 
 static void
+ext4fs_journal_update_reset (
+    struct ext4fs_journal_metadata *metadata)
+{
+	memset(metadata->jm_update_bits, 0,
+	    sizeof(metadata->jm_update_bits));
+	metadata->jm_update_base = 0;
+	metadata->jm_update_slots = 0;
+	metadata->jm_update_kind = EXT4FS_JOURNAL_UPDATE_NONE;
+	metadata->jm_update_pending = 0;
+}
+
+static int
+ext4fs_journal_update_location (struct m_ext4fs *fs,
+    enum ext4fs_journal_update_kind kind, u_int32_t key,
+    u_int64_t *fsblockp, u_int32_t *offsetp)
+{
+	struct ext4fs_block_group_descriptor *gd;
+	u_int64_t table;
+	u_int32_t group, index;
+	size_t offset, size;
+	int error;
+
+	switch (kind) {
+	case EXT4FS_JOURNAL_UPDATE_INODE:
+		if (key == 0 || key > fs->m_inodes_count ||
+		    fs->m_inodes_per_group == 0 ||
+		    fs->m_inodes_per_block == 0 ||
+		    fs->m_inode_size >
+		    sizeof(struct ext4fs_dinode_256))
+			return (EINVAL);
+		group = (key - 1) / fs->m_inodes_per_group;
+		index = (key - 1) % fs->m_inodes_per_group;
+		if (group >= fs->m_block_group_count)
+			return (EINVAL);
+		gd = &fs->m_gd[group];
+		table = ext4fs_bgd_get_block(fs, gd,
+		    EXT4FS_BGD_INODE_TABLE);
+		*fsblockp = table + index / fs->m_inodes_per_block;
+		offset = (size_t)(index % fs->m_inodes_per_block) *
+		    fs->m_inode_size;
+		size = fs->m_inode_size;
+		break;
+	case EXT4FS_JOURNAL_UPDATE_GROUP_DESCRIPTOR:
+		if (key >= fs->m_block_group_count)
+			return (EINVAL);
+		error = ext4fs_bgd_location(fs, key, fsblockp,
+		    &offset);
+		if (error)
+			return (error);
+		size = fs->m_block_group_descriptor_size;
+		break;
+	case EXT4FS_JOURNAL_UPDATE_SUPERBLOCK:
+		if (key != 0)
+			return (EINVAL);
+		*fsblockp = EXT4FS_SUPER_BLOCK_OFFSET /
+		    fs->m_block_size;
+		offset = EXT4FS_SUPER_BLOCK_OFFSET %
+		    fs->m_block_size;
+		size = sizeof(struct ext4fs);
+		break;
+	default:
+		return (EINVAL);
+	}
+	if (*fsblockp >= fs->m_blocks_count ||
+	    offset > fs->m_block_size ||
+	    size > fs->m_block_size - offset ||
+	    offset > UINT32_MAX)
+		return (EINVAL);
+	*offsetp = (u_int32_t)offset;
+	return (0);
+}
+
+static int
+ext4fs_journal_materialize_update (struct ext4fs_journal *journal,
+    struct ext4fs_journal_metadata *metadata, u_int32_t key)
+{
+	struct ext4fs_block_group_descriptor *gd;
+	struct ext4fs_dinode_256 dinode, *disk_inode;
+	struct m_ext4fs *fs;
+	struct ext4fs *sble;
+	struct buf *bp;
+	u_int32_t checksum, offset;
+	u_int64_t fsblock;
+	int error;
+
+	fs = VFSTOUFS(journal->j_mp)->um_e4fs;
+	bp = metadata->jm_buf;
+	error = ext4fs_journal_update_location(fs,
+	    metadata->jm_update_kind, key, &fsblock, &offset);
+	if (error)
+		return (error);
+	if (bp == NULL || bp->b_data == NULL ||
+	    metadata->jm_fsblock != fsblock)
+		return (EINVAL);
+
+	switch (metadata->jm_update_kind) {
+	case EXT4FS_JOURNAL_UPDATE_INODE:
+		memset(&dinode, 0, sizeof(dinode));
+		memcpy(&dinode, (char *)bp->b_data + offset,
+		    fs->m_inode_size);
+		checksum = ext4fs_inode_csum(fs, &dinode, key);
+		disk_inode = (struct ext4fs_dinode_256 *)
+		    ((char *)bp->b_data + offset);
+		disk_inode->dinode.i_checksum_lo =
+		    htole16(checksum & 0xffff);
+		if (ext4fs_inode_has_csum_hi(&dinode))
+			disk_inode->dinode.i_checksum_hi =
+			    htole16(checksum >> 16);
+		break;
+	case EXT4FS_JOURNAL_UPDATE_GROUP_DESCRIPTOR:
+		gd = &fs->m_gd[key];
+		gd->bgd_checksum = htole16(ext4fs_bgd_csum(fs, gd,
+		    key));
+		memcpy((char *)bp->b_data + offset, gd,
+		    fs->m_block_group_descriptor_size);
+		break;
+	case EXT4FS_JOURNAL_UPDATE_SUPERBLOCK:
+		sble = (struct ext4fs *)((char *)bp->b_data + offset);
+		memcpy(sble, &fs->m_sble, sizeof(*sble));
+		ext4fs_sbprepare(fs, sble);
+		memcpy(&fs->m_sble, sble, sizeof(fs->m_sble));
+		break;
+	default:
+		return (EINVAL);
+	}
+	return (0);
+}
+
+static int
+ext4fs_journal_materialize_record (struct ext4fs_journal *journal,
+    struct ext4fs_journal_transaction *tx,
+    struct ext4fs_journal_metadata *metadata)
+{
+	struct ext4fs_journal_metadata *found;
+	u_int32_t bytes, i, key;
+	int error;
+
+	if (! metadata->jm_update_pending)
+		return (0);
+	if (metadata->jm_buf == NULL || ! metadata->jm_dirty ||
+	    metadata->jm_owner != NULL ||
+	    ! ISSET(metadata->jm_buf->b_flags, B_BUSY) ||
+	    ! ISSET(metadata->jm_buf->b_flags, B_DONE))
+		return (EINVAL);
+	found = ext4fs_journal_metadata_buffer_find(tx,
+	    metadata->jm_buf);
+	if (found != metadata)
+		return (EINVAL);
+	if (metadata->jm_update_kind ==
+	    EXT4FS_JOURNAL_UPDATE_SUPERBLOCK) {
+		if (metadata->jm_update_base != 0 ||
+		    metadata->jm_update_slots != 0)
+			return (EINVAL);
+		error = ext4fs_journal_materialize_update(journal,
+		    metadata, 0);
+		if (error)
+			return (error);
+	} else {
+		bytes = howmany(metadata->jm_update_slots, NBBY);
+		if (metadata->jm_update_slots == 0 ||
+		    bytes > sizeof(metadata->jm_update_bits))
+			return (EINVAL);
+		for (i = 0; i < metadata->jm_update_slots; i++) {
+			if (isclr(metadata->jm_update_bits, i))
+				continue;
+			if (metadata->jm_update_base > UINT32_MAX - i)
+				return (EOVERFLOW);
+			key = metadata->jm_update_base + i;
+			error = ext4fs_journal_materialize_update(journal,
+			    metadata, key);
+			if (error)
+				return (error);
+		}
+		memset(metadata->jm_update_bits, 0,
+		    bytes);
+	}
+	metadata->jm_update_pending = 0;
+	return (0);
+}
+
+static int
+ext4fs_journal_materialize_transaction (
+    struct ext4fs_journal *journal,
+    struct ext4fs_journal_transaction *tx)
+{
+	struct ext4fs_journal_metadata *metadata;
+	int error;
+
+	TAILQ_FOREACH(metadata, &tx->jt_metadata, jm_entry) {
+		if (! metadata->jm_update_pending)
+			continue;
+		error = ext4fs_journal_materialize_record(journal, tx,
+		    metadata);
+		if (error)
+			return (error);
+	}
+	return (0);
+}
+
+static void
 ext4fs_journal_transaction_free (struct ext4fs_journal_transaction *tx)
 {
 	struct ext4fs_journal_metadata *metadata;
@@ -422,6 +656,7 @@ ext4fs_journal_transaction_free (struct ext4fs_journal_transaction *tx)
 		return;
 	(void)ext4fs_journal_io_wait(&tx->jt_data_io);
 	while ((metadata = TAILQ_FIRST(&tx->jt_metadata)) != NULL) {
+		ext4fs_journal_update_reset(metadata);
 		ext4fs_journal_metadata_remove(tx, metadata);
 		/*
 		 * Only dirtied, transaction-owned buffers survive a
@@ -1150,6 +1385,7 @@ ext4fs_journal_snapshot_metadata (struct ext4fs_journal *journal,
 		if (metadata->jm_snapshot != NULL ||
 		    metadata->jm_buf == NULL || ! metadata->jm_dirty ||
 		    metadata->jm_owner != NULL ||
+		    metadata->jm_update_pending ||
 		    ! ISSET(metadata->jm_buf->b_flags, B_BUSY))
 			return (EINVAL);
 		metadata->jm_snapshot = malloc(journal->j_blocksize,
@@ -1496,6 +1732,7 @@ ext4fs_journal_checkpoint (struct ext4fs_journal *journal,
 	while ((metadata = TAILQ_FIRST(&tx->jt_metadata)) != NULL) {
 		if (ext4fs_journal_metadata_revoked(tx,
 		    metadata->jm_fsblock)) {
+			ext4fs_journal_update_reset(metadata);
 			ext4fs_journal_metadata_remove(tx, metadata);
 			free(metadata->jm_snapshot, M_UFSMNT,
 			    metadata->jm_snapshot_size);
@@ -1508,6 +1745,7 @@ ext4fs_journal_checkpoint (struct ext4fs_journal *journal,
 		bp->b_lblkno = bp->b_blkno;
 		memcpy(bp->b_data, metadata->jm_snapshot,
 		    metadata->jm_snapshot_size);
+		ext4fs_journal_update_reset(metadata);
 		ext4fs_journal_metadata_remove(tx, metadata);
 		free(metadata->jm_snapshot, M_UFSMNT,
 		    metadata->jm_snapshot_size);
@@ -1712,6 +1950,9 @@ ext4fs_journal_commit_transaction (struct ext4fs_journal *journal,
 	ext4fs_journal_set_stage(journal,
 	    EXT4FS_JOURNAL_STAGE_VALIDATE);
 	error = ext4fs_journal_log_blocks(journal, tx, &required);
+	if (error)
+		return (error);
+	error = ext4fs_journal_materialize_transaction(journal, tx);
 	if (error)
 		return (error);
 	error = ext4fs_journal_snapshot_metadata(journal, tx);
@@ -2339,6 +2580,12 @@ ext4fs_journal_read_metadata (struct mount *mp, struct vnode *devvp,
 			    (daddr_t)EXT4FS_FSBTODB(fs, fsblock),
 			    fs->m_block_size, bpp));
 		}
+		if (metadata->jm_update_pending) {
+			error = ext4fs_journal_materialize_record(journal,
+			    journal->j_running, metadata);
+			if (error)
+				goto out;
+		}
 		if (metadata->jm_buf == NULL ||
 		    metadata->jm_buf->b_vp != devvp ||
 		    metadata->jm_owner != NULL ||
@@ -2603,6 +2850,173 @@ out:
 	return (error);
 }
 
+static int
+ext4fs_journal_dirty_record_locked (
+    struct ext4fs_journal_handle *handle,
+    struct ext4fs_journal_metadata *metadata)
+{
+	int error;
+
+	if (metadata->jm_dirty)
+		return (0);
+	if (metadata->jm_owner != handle)
+		return (EBUSY);
+	error = ext4fs_journal_state_consume(&handle->jh_credits,
+	    &handle->jh_transaction->jt_credits_reserved,
+	    &handle->jh_transaction->jt_credits_used);
+	if (error)
+		return (error);
+	metadata->jm_dirty = 1;
+	/* Transfer the busy buffer to the transaction. */
+	metadata->jm_owner = NULL;
+	return (0);
+}
+
+static int
+ext4fs_journal_dirty_update (struct ext4fs_journal_handle *handle,
+    struct buf *bp, enum ext4fs_journal_update_kind kind,
+    u_int32_t key)
+{
+	struct ext4fs_journal_metadata *metadata;
+	struct ext4fs_journal *journal;
+	struct m_ext4fs *fs;
+	u_int64_t fsblock;
+	u_int32_t base, bytes, offset, slot, slots;
+	size_t size;
+	int error;
+
+	if (handle == NULL || bp == NULL ||
+	    handle->jh_journal == NULL ||
+	    ! ISSET(bp->b_flags, B_BUSY) ||
+	    ! ISSET(bp->b_flags, B_DONE))
+		return (EINVAL);
+	journal = handle->jh_journal;
+	fs = VFSTOUFS(journal->j_mp)->um_e4fs;
+	error = ext4fs_journal_update_location(fs, kind, key,
+	    &fsblock, &offset);
+	if (error)
+		return (error);
+	base = bytes = slot = slots = 0;
+	size = 0;
+	switch (kind) {
+	case EXT4FS_JOURNAL_UPDATE_INODE:
+		size = fs->m_inode_size;
+		slots = fs->m_inodes_per_block;
+		break;
+	case EXT4FS_JOURNAL_UPDATE_GROUP_DESCRIPTOR:
+		size = fs->m_block_group_descriptor_size;
+		if (size != 0)
+			slots = fs->m_block_size / size;
+		break;
+	case EXT4FS_JOURNAL_UPDATE_SUPERBLOCK:
+		break;
+	default:
+		return (EINVAL);
+	}
+	if (kind != EXT4FS_JOURNAL_UPDATE_SUPERBLOCK) {
+		if (size == 0 || slots == 0 || offset % size != 0)
+			return (EINVAL);
+		slot = offset / size;
+		if (slot >= slots || key < slot)
+			return (EINVAL);
+		base = key - slot;
+		bytes = howmany(slots, NBBY);
+		if (bytes > EXT4FS_JOURNAL_UPDATE_BYTES)
+			return (EINVAL);
+	}
+
+	mtx_enter(&journal->j_lock);
+	error = ext4fs_journal_handle_error(handle);
+	if (error)
+		goto out;
+	metadata = ext4fs_journal_metadata_buffer_find(
+	    handle->jh_transaction, bp);
+	if (metadata == NULL || metadata->jm_fsblock != fsblock) {
+		error = EINVAL;
+		goto out;
+	}
+	if (metadata->jm_update_kind !=
+	    EXT4FS_JOURNAL_UPDATE_NONE &&
+	    (metadata->jm_update_kind != kind ||
+	    metadata->jm_update_base != base ||
+	    metadata->jm_update_slots != slots)) {
+		error = EINVAL;
+		goto out;
+	}
+	error = ext4fs_journal_dirty_record_locked(handle, metadata);
+	if (error)
+		goto out;
+	if (metadata->jm_update_kind ==
+	    EXT4FS_JOURNAL_UPDATE_NONE) {
+		metadata->jm_update_base = base;
+		metadata->jm_update_slots = slots;
+		metadata->jm_update_kind = kind;
+	}
+	if (bytes != 0)
+		setbit(metadata->jm_update_bits, slot);
+	metadata->jm_update_pending = 1;
+
+out:
+	mtx_leave(&journal->j_lock);
+	return (error);
+}
+
+int
+ext4fs_journal_dirty_inode (struct ext4fs_journal_handle *handle,
+    struct buf *bp, u_int32_t ino)
+{
+	return (ext4fs_journal_dirty_update(handle, bp,
+	    EXT4FS_JOURNAL_UPDATE_INODE, ino));
+}
+
+int
+ext4fs_journal_dirty_group_descriptor (
+    struct ext4fs_journal_handle *handle, struct buf *bp,
+    u_int32_t group)
+{
+	return (ext4fs_journal_dirty_update(handle, bp,
+	    EXT4FS_JOURNAL_UPDATE_GROUP_DESCRIPTOR, group));
+}
+
+int
+ext4fs_journal_dirty_superblock (
+    struct ext4fs_journal_handle *handle, struct buf *bp)
+{
+	return (ext4fs_journal_dirty_update(handle, bp,
+	    EXT4FS_JOURNAL_UPDATE_SUPERBLOCK, 0));
+}
+
+int
+ext4fs_journal_materialize_metadata (
+    struct ext4fs_journal_handle *handle, struct buf *bp)
+{
+	struct ext4fs_journal_metadata *metadata;
+	struct ext4fs_journal *journal;
+	int error;
+
+	if (handle == NULL || bp == NULL ||
+	    handle->jh_journal == NULL)
+		return (EINVAL);
+	journal = handle->jh_journal;
+	mtx_enter(&journal->j_lock);
+	error = ext4fs_journal_handle_error(handle);
+	if (error)
+		goto out;
+	metadata = ext4fs_journal_metadata_buffer_find(
+	    handle->jh_transaction, bp);
+	if (metadata == NULL) {
+		error = EINVAL;
+		goto out;
+	}
+	if (metadata->jm_update_pending)
+		error = ext4fs_journal_materialize_record(journal,
+		    handle->jh_transaction, metadata);
+
+out:
+	mtx_leave(&journal->j_lock);
+	return (error);
+}
+
 int
 ext4fs_journal_dirty_metadata (struct ext4fs_journal_handle *handle,
     struct buf *bp)
@@ -2623,27 +3037,11 @@ ext4fs_journal_dirty_metadata (struct ext4fs_journal_handle *handle,
 		goto out;
 	metadata = ext4fs_journal_metadata_buffer_find(
 	    handle->jh_transaction, bp);
-	if (metadata != NULL) {
-		if (metadata->jm_dirty) {
-			error = 0;
-			goto out;
-		}
-		if (metadata->jm_owner != handle) {
-			error = EBUSY;
-			goto out;
-		}
-		error = ext4fs_journal_state_consume(
-		    &handle->jh_credits,
-		    &handle->jh_transaction->jt_credits_reserved,
-		    &handle->jh_transaction->jt_credits_used);
-		if (error)
-			goto out;
-		metadata->jm_dirty = 1;
-		/* Transfer the busy buffer to the transaction. */
-		metadata->jm_owner = NULL;
-		goto out;
-	}
-	error = EINVAL;
+	if (metadata == NULL)
+		error = EINVAL;
+	else
+		error = ext4fs_journal_dirty_record_locked(handle,
+		    metadata);
 
 out:
 	mtx_leave(&journal->j_lock);
@@ -2824,6 +3222,7 @@ ext4fs_journal_end_internal (struct ext4fs_journal_handle *handle,
 		KASSERT(metadata->jm_owner == handle);
 		KASSERT(! metadata->jm_dirty);
 		KASSERT(ISSET(metadata->jm_buf->b_flags, B_BUSY));
+		ext4fs_journal_update_reset(metadata);
 		brelse(metadata->jm_buf);
 		free(metadata, M_UFSMNT, sizeof(*metadata));
 	}

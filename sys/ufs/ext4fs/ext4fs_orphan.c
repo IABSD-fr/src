@@ -258,7 +258,7 @@ ext4fs_orphan_inode_next_write_handle (struct m_ext4fs *fs,
 	struct ext4fs_dinode_256 dp, saved;
 	struct buf *bp;
 	u_int64_t block;
-	u_int32_t checksum, group, offset;
+	u_int32_t group, offset;
 	int error;
 
 	if (handle == NULL)
@@ -270,6 +270,9 @@ ext4fs_orphan_inode_next_write_handle (struct m_ext4fs *fs,
 	error = ext4fs_journal_get_metadata(handle, devvp, block, &bp);
 	if (error)
 		return (error);
+	error = ext4fs_journal_materialize_metadata(handle, bp);
+	if (error)
+		return (error);
 	memcpy(&dp, (char *)bp->b_data + offset, sizeof(dp));
 	error = ext4fs_inode_csum_verify(fs, &dp, ino);
 	if (error)
@@ -278,12 +281,8 @@ ext4fs_orphan_inode_next_write_handle (struct m_ext4fs *fs,
 		return (EINVAL);
 	saved = dp;
 	dp.dinode.i_dtime = htole32(next);
-	checksum = ext4fs_inode_csum(fs, &dp, ino);
-	dp.dinode.i_checksum_lo = htole16(checksum & 0xffff);
-	if (ext4fs_inode_has_csum_hi(&dp))
-		dp.dinode.i_checksum_hi = htole16(checksum >> 16);
 	memcpy((char *)bp->b_data + offset, &dp, sizeof(dp));
-	error = ext4fs_journal_dirty_metadata(handle, bp);
+	error = ext4fs_journal_dirty_inode(handle, bp, ino);
 	if (error)
 		memcpy((char *)bp->b_data + offset, &saved,
 		    sizeof(saved));

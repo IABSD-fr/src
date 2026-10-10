@@ -742,5 +742,6 @@ int	ext4fs_bgd_write_handle (struct m_ext4fs *, struct vnode *,
     u_int32_t, struct ext4fs_journal_handle *);
 int	ext4fs_sbwrite_direct (struct mount *);
 int	ext4fs_sbwrite_lifecycle (struct mount *);
+void	ext4fs_sbprepare (struct m_ext4fs *, struct ext4fs *);
 int	ext4fs_sbwrite_handle (struct mount *,
     struct ext4fs_journal_handle *);

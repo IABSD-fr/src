@@ -271,7 +271,10 @@ int	ext4fs_journal_error (struct mount *);
  * reused within the running transaction.  read_metadata() returns an
  * anonymous, read-only copy when the requested block is stable in the
  * running transaction, so a pre-handle reader does not block on the
- * transaction-owned buffer.
+ * transaction-owned buffer.  The specialized dirty calls defer inode,
+ * group-descriptor, and superblock checksums and copies until the final
+ * transaction image is needed.  A handle user that inspects those raw
+ * fields must call materialize_metadata() first.
  */
 int	ext4fs_journal_begin (struct mount *, unsigned int,
     struct ext4fs_journal_handle **);
@@ -279,6 +282,14 @@ int	ext4fs_journal_add_ordered (struct ext4fs_journal_handle *,
     struct vnode *);
 int	ext4fs_journal_dirty_metadata (struct ext4fs_journal_handle *,
     struct buf *);
+int	ext4fs_journal_dirty_inode (struct ext4fs_journal_handle *,
+    struct buf *, u_int32_t);
+int	ext4fs_journal_dirty_group_descriptor (
+    struct ext4fs_journal_handle *, struct buf *, u_int32_t);
+int	ext4fs_journal_dirty_superblock (
+    struct ext4fs_journal_handle *, struct buf *);
+int	ext4fs_journal_materialize_metadata (
+    struct ext4fs_journal_handle *, struct buf *);
 int	ext4fs_journal_end (struct ext4fs_journal_handle *);
 int	ext4fs_journal_end_commit (struct ext4fs_journal_handle *,
     enum ext4fs_journal_commit_reason);
