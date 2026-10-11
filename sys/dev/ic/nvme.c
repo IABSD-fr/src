@@ -1109,6 +1109,8 @@ nvme_q_submit(struct nvme_softc *sc, struct nvme_queue *q, struct nvme_ccb *ccb,
 	sqe->cid = ccb->ccb_id;
 	bus_dmamap_sync(sc->sc_dmat, NVME_DMA_MAP(q->q_sq_dmamem),
 	    sqe_size * tail, sqe_size, BUS_DMASYNC_PREWRITE);
+	KASSERT(ccb->ccb_active == 0);
+	ccb->ccb_active = 1;
 
 	sc->sc_ops->op_sq_leave(sc, q, ccb);
 }
@@ -1143,6 +1145,13 @@ nvme_poll(struct nvme_softc *sc, struct nvme_queue *q, struct nvme_ccb *ccb,
 		if (nvme_q_complete(sc, q) == 0)
 			delay(NVME_TIMO_DELAYNS);
 		nvme_barrier(sc, NVME_CSTS, 4, BUS_SPACE_BARRIER_READ);
+	}
+
+	if (! ISSET(state.c.flags, NVME_CQE_PHASE)) {
+		printf("%s: polled command %u timed out\n",
+		    DEVNAME(sc), ccb->ccb_id);
+		ccb->ccb_active = 0;
+		ccb->ccb_cqe_flags = NVME_CQE_SC_INTERNAL_DEV_ERR;
 	}
 
 	ccb->ccb_cookie = cookie;
@@ -1196,7 +1205,7 @@ nvme_q_complete(struct nvme_softc *sc, struct nvme_queue *q)
 	struct nvme_ccb *ccb, *ccbtmp;
 	struct nvme_cqe *ring = NVME_DMA_KVA(q->q_cq_dmamem), *cqe;
 	u_int32_t head;
-	u_int16_t flags;
+	u_int16_t cid, flags;
 	struct nvme_ccb_list done_list;
 	int rv = 0;
 
@@ -1215,12 +1224,31 @@ nvme_q_complete(struct nvme_softc *sc, struct nvme_queue *q)
 
 		membar_consumer();
 
-		ccb = &sc->sc_ccbs[cqe->cid];
+		cid = cqe->cid;
+		if (cid >= sc->sc_nccbs) {
+			printf("%s: completion for invalid ccb %u\n",
+			    DEVNAME(sc), cid);
+			goto next;
+		}
+
+		ccb = &sc->sc_ccbs[cid];
+		/*
+		 * The callback may release its SCSI transfer and CCB.
+		 * Do not let a late or duplicate CQE use them again.
+		 */
+		if (ccb->ccb_active == 0) {
+			printf("%s: late or duplicate completion for "
+			    "ccb %u\n",
+			    DEVNAME(sc), cid);
+			goto next;
+		}
+		ccb->ccb_active = 0;
 		sc->sc_ops->op_cq_done(sc, q, ccb);
 
 		ccb->ccb_cqe_flags = lemtoh16(&cqe->flags);
 		SIMPLEQ_INSERT_TAIL(&done_list, ccb, ccb_entry);
 
+	next:
 		if (++head >= q->q_entries) {
 			head = 0;
 			q->q_cq_phase ^= NVME_CQE_PHASE;
@@ -1436,6 +1464,7 @@ nvme_ccbs_alloc(struct nvme_softc *sc, u_int nccbs)
 			goto free_maps;
 
 		ccb->ccb_id = i;
+		ccb->ccb_active = 0;
 		ccb->ccb_prpl = prpl;
 		ccb->ccb_prpl_off = off;
 		ccb->ccb_prpl_dva = NVME_DMA_DVA(sc->sc_ccb_prpls) + off;
@@ -1445,6 +1474,7 @@ nvme_ccbs_alloc(struct nvme_softc *sc, u_int nccbs)
 		prpl += sc->sc_max_prpl;
 		off += sizeof(*prpl) * sc->sc_max_prpl;
 	}
+	sc->sc_nccbs = nccbs;
 
 	return (0);
 
@@ -1461,8 +1491,10 @@ nvme_ccb_get(void *cookie)
 
 	mtx_enter(&sc->sc_ccb_mtx);
 	ccb = SIMPLEQ_FIRST(&sc->sc_ccb_list);
-	if (ccb != NULL)
+	if (ccb != NULL) {
 		SIMPLEQ_REMOVE_HEAD(&sc->sc_ccb_list, ccb_entry);
+		KASSERT(ccb->ccb_active == 0);
+	}
 	mtx_leave(&sc->sc_ccb_mtx);
 
 	return (ccb);
@@ -1474,6 +1506,7 @@ nvme_ccb_put(void *cookie, void *io)
 	struct nvme_softc *sc = cookie;
 	struct nvme_ccb *ccb = io;
 
+	KASSERT(ccb->ccb_active == 0);
 	mtx_enter(&sc->sc_ccb_mtx);
 	SIMPLEQ_INSERT_HEAD(&sc->sc_ccb_list, ccb, ccb_entry);
 	mtx_leave(&sc->sc_ccb_mtx);
@@ -1491,6 +1524,7 @@ nvme_ccbs_free(struct nvme_softc *sc, unsigned int nccbs)
 
 	nvme_dmamem_free(sc, sc->sc_ccb_prpls);
 	free(sc->sc_ccbs, M_DEVBUF, nccbs * sizeof(*ccb));
+	sc->sc_nccbs = 0;
 }
 
 struct nvme_queue *
