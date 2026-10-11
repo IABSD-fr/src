@@ -50,6 +50,7 @@ struct nvme_ccb {
 
 	u_int16_t		ccb_id;
 	u_int16_t		ccb_cqe_flags;
+	int			ccb_active;
 };
 SIMPLEQ_HEAD(nvme_ccb_list, nvme_ccb);
 
@@ -125,6 +126,7 @@ struct nvme_softc {
 
 	struct mutex		sc_ccb_mtx;
 	struct nvme_ccb		*sc_ccbs;
+	u_int			sc_nccbs;
 	struct nvme_ccb_list	sc_ccb_list;
 	struct nvme_dmamem	*sc_ccb_prpls;
 	struct scsi_iopool	sc_iopool;
