@@ -1878,7 +1878,7 @@ run_allocation_run_case()
 	sequence_after=$(journal_sequence)
 	sequence_distance=$(journal_sequence_distance \
 	    "$sequence_before" "$sequence_after")
-	[ "$sequence_distance" -eq 4 ] ||
+	[ "$sequence_distance" -eq 5 ] ||
 	    fail "allocation runs used $sequence_distance transactions"
 	check_image allocation-run-write
 

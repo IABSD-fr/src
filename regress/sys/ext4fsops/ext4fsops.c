@@ -45,6 +45,7 @@
 #define EXTENT_BATCH_BYTES	(4 * MAXBSIZE)
 #define ALLOCATION_RUN_BYTES	(1024 * 1024)
 #define ALLOCATION_TOTAL_BYTES	(3 * ALLOCATION_RUN_BYTES)
+#define ALLOCATION_PARTIAL_BYTES	31
 #define DIR_TAIL_BYTES	12
 #define FAST_SYMLINK_BYTES	60
 #define ORPHAN_INODE_BYTES	256
@@ -2487,8 +2488,9 @@ write_allocation_run (void)
 {
 	struct stat st;
 	char path[PATH_MAX];
-	off_t offset;
-	size_t lengths[3], i;
+	blkcnt_t expected_blocks;
+	off_t expected_size, offset;
+	size_t lengths[4], i;
 	int fd;
 
 	make_path(path, sizeof(path), "allocation-run");
@@ -2498,6 +2500,7 @@ write_allocation_run (void)
 	lengths[0] = ALLOCATION_RUN_BYTES - block_size;
 	lengths[1] = ALLOCATION_RUN_BYTES;
 	lengths[2] = ALLOCATION_RUN_BYTES + block_size;
+	lengths[3] = block_size + ALLOCATION_PARTIAL_BYTES;
 	offset = 0;
 	for (i = 0; i < nitems(lengths); i++) {
 		write_pattern_once_fd(fd, offset, lengths[i],
@@ -2508,8 +2511,12 @@ write_allocation_run (void)
 		err(1, "fsync %s", path);
 	if (fstat(fd, &st) == -1)
 		err(1, "fstat %s", path);
-	if (st.st_size != ALLOCATION_TOTAL_BYTES ||
-	    st.st_blocks != ALLOCATION_TOTAL_BYTES / DEV_BSIZE)
+	expected_size = ALLOCATION_TOTAL_BYTES + block_size +
+	    ALLOCATION_PARTIAL_BYTES;
+	expected_blocks = (ALLOCATION_TOTAL_BYTES + 2 * block_size) /
+	    DEV_BSIZE;
+	if (st.st_size != expected_size ||
+	    st.st_blocks != expected_blocks)
 		errx(1, "allocation run has wrong inode shape");
 	if (close(fd) == -1)
 		err(1, "close %s", path);
@@ -2520,6 +2527,8 @@ verify_allocation_run (void)
 {
 	struct stat st;
 	char path[PATH_MAX];
+	blkcnt_t expected_blocks;
+	off_t expected_size;
 	int fd;
 
 	make_path(path, sizeof(path), "allocation-run");
@@ -2528,11 +2537,15 @@ verify_allocation_run (void)
 		err(1, "open %s", path);
 	if (fstat(fd, &st) == -1)
 		err(1, "fstat %s", path);
+	expected_size = ALLOCATION_TOTAL_BYTES + block_size +
+	    ALLOCATION_PARTIAL_BYTES;
+	expected_blocks = (ALLOCATION_TOTAL_BYTES + 2 * block_size) /
+	    DEV_BSIZE;
 	if (! S_ISREG(st.st_mode) ||
-	    st.st_size != ALLOCATION_TOTAL_BYTES ||
-	    st.st_blocks != ALLOCATION_TOTAL_BYTES / DEV_BSIZE)
+	    st.st_size != expected_size ||
+	    st.st_blocks != expected_blocks)
 		errx(1, "allocation run has wrong inode shape");
-	check_pattern_fd(fd, 0, ALLOCATION_TOTAL_BYTES,
+	check_pattern_fd(fd, 0, expected_size,
 	    ALLOCATION_RUN_SEED);
 	if (close(fd) == -1)
 		err(1, "close %s", path);

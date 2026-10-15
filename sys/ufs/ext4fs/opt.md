@@ -910,6 +910,21 @@ The production kernel builds and the allocation-run, extent, and
 synchronous-write regressions pass.  The VMM allocation-error test also
 passes at the first, middle, and last raw-write boundaries.
 
+The next small-file experiment includes a new file's final partial block
+in the same allocation run as its complete blocks.  The previous path
+rounded the run down to complete blocks, committed them, then allocated
+and committed one more zero-padded block for the tail.  The new path
+rounds the allocation count up while limiting `uiomove()` to the exact
+byte count.  Its ordered-data batch still writes a zero-padded final
+filesystem block before exposing the single metadata commit.  The
+focused allocation-run regression appends one block plus 31 bytes in a
+single `pwrite()` and requires one transaction instead of two.  Kernel
+build, boot, and regression results are pending.  The existing VMM
+allocation-error matrix now writes four complete `MAXPHYS` buffers plus
+31 bytes.  Its unchanged first, middle, and last injection cases
+therefore include failure of the partial final raw buffer without adding
+another VM run.
+
 - [x] Reuse bounded per-journal scratch storage rather than allocating
       it for every commit.
 - [x] Add lookup structures for transaction metadata and revokes while
@@ -938,6 +953,8 @@ passes at the first, middle, and last raw-write boundaries.
       mutation continues to validate its affected blocks.
 - [x] Submit contiguous ordered data in `MAXPHYS` raw buffers while
       preserving write-error and crash ordering guarantees.
+- [ ] Include a new file's final partial block in its allocation run
+      without adding a second ordered transaction.
 - [x] Build the production kernel and pass bitmap, inode-bitmap,
       counter-corruption, directory-churn, and full consistency tests.
 - [x] Build and test the lazy transaction-allocation change with

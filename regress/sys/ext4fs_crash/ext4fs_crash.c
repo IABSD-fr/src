@@ -60,7 +60,7 @@
 #define EXHAUST_DIR	"exhausted"
 #define EXHAUST_PROBE	"exhaustion-probe"
 #define ALLOCATION_ERROR_FILE	"allocation-error"
-#define ALLOCATION_ERROR_BYTES	(4 * MAXBSIZE)
+#define ALLOCATION_ERROR_BYTES	(4 * MAXBSIZE + 31)
 #define ALLOCATION_ERROR_SEED	0x5eU
 
 #define JBD2_MAGIC		UINT32_C(0xc03b3998)

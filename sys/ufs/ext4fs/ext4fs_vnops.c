@@ -4633,7 +4633,7 @@ ext4fs_read (void *v)
  */
 static int
 ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
-    u_int64_t lbn, int blkoffset, int xfersize, u_int32_t count,
+    u_int64_t lbn, int blkoffset, size_t run_bytes, u_int32_t count,
     off_t *filesizep)
 {
 	struct vnode *vp = ITOV(ip);
@@ -4646,16 +4646,20 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 	u_int64_t goal, pblk, previous, ncontig;
 	u_int32_t chunk, chunk_limit, got, i, j;
 	int changed, end_error, error, saved_flags;
-	int offset, size;
-	size_t bytes, saved_resid;
+	size_t bytes, offset, remaining, saved_resid, size;
 
 	if (fs->m_journal == NULL)
 		return (EOPNOTSUPP);
 	if (lbn > UINT32_MAX || count == 0 ||
 	    count > UINT16_MAX || count > UINT32_MAX - lbn + 1)
 		return (EFBIG);
-	if (count > 1 && (blkoffset != 0 ||
-	    xfersize != fs->m_block_size))
+	if (blkoffset < 0 || blkoffset >= (int)fs->m_block_size ||
+	    run_bytes == 0 || run_bytes > uio->uio_resid ||
+	    (count > 1 && blkoffset != 0) ||
+	    (u_int64_t)blkoffset + run_bytes >
+	    (u_int64_t)count * fs->m_block_size ||
+	    (count > 1 && (u_int64_t)run_bytes <=
+	    (u_int64_t)(count - 1) * fs->m_block_size))
 		return (EINVAL);
 	memcpy(&saved_inode, ip->i_e4din, sizeof(saved_inode));
 	saved_flags = ip->i_flag;
@@ -4720,7 +4724,8 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 		error = EIO;
 		goto fail;
 	}
-	for (i = 0; i < got; i += chunk) {
+	remaining = run_bytes;
+	for (i = 0; i < got && remaining != 0; i += chunk) {
 		chunk = got - i;
 		if (chunk > chunk_limit)
 			chunk = chunk_limit;
@@ -4733,7 +4738,9 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 		}
 		bytes = (size_t)chunk * fs->m_block_size;
 		offset = i == 0 ? blkoffset : 0;
-		size = got == 1 ? xfersize : (int)bytes;
+		size = bytes - offset;
+		if (size > remaining)
+			size = remaining;
 		bp = geteblk(bytes);
 		clrbuf(bp);
 		error = uiomove((char *)bp->b_data + offset, size, uio);
@@ -4744,7 +4751,9 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 		if (error)
 			goto fail;
 		bp = NULL;
+		remaining -= size;
 	}
+	KASSERT(remaining == 0 || got < count);
 	(void)uvm_vnp_uncache(vp);
 
 	if (uio->uio_offset > *filesizep) {
@@ -4816,7 +4825,7 @@ ext4fs_write (void *v)
 	int ioflag = ap->a_ioflag;
 	int blkoffset, xfersize;
 	int error;
-	size_t full_blocks, resid, run_limit;
+	size_t resid, run_bytes, run_limit;
 	ssize_t overrun;
 
 	if (uio->uio_resid == 0)
@@ -4860,24 +4869,25 @@ ext4fs_write (void *v)
 		 * that busy leaf, and the handle can reuse it directly.
 		 */
 		if (fs->m_journal != NULL && blkoffset == 0 &&
-		    xfersize == fs->m_block_size &&
 		    uio->uio_offset == filesz) {
-			full_blocks = uio->uio_resid /
-			    fs->m_block_size;
 			run_limit = EXT4FS_ALLOC_RUN_MAX_BYTES /
 			    fs->m_block_size;
 			if (run_limit > fs->m_blocks_per_group)
 				run_limit = fs->m_blocks_per_group;
 			if (run_limit > UINT16_MAX)
 				run_limit = UINT16_MAX;
-			if (full_blocks > run_limit)
-				full_blocks = run_limit;
+			run_bytes = uio->uio_resid;
+			if (run_bytes > run_limit * fs->m_block_size)
+				run_bytes = run_limit * fs->m_block_size;
+			run_count = howmany(run_bytes, fs->m_block_size);
 			lbn_limit = (u_int64_t)UINT32_MAX - lbn + 1;
-			if (full_blocks > lbn_limit)
-				full_blocks = (size_t)lbn_limit;
-			run_count = (u_int32_t)full_blocks;
+			if (run_count > lbn_limit) {
+				run_count = (u_int32_t)lbn_limit;
+				run_bytes = (size_t)run_count *
+				    fs->m_block_size;
+			}
 			error = ext4fs_write_allocated_run(ip, uio,
-			    lbn, blkoffset, xfersize, run_count,
+			    lbn, blkoffset, run_bytes, run_count,
 			    &filesz);
 			if (error)
 				break;
