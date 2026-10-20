@@ -103,8 +103,12 @@ if ${DO_CLEAN}; then
 	echo "=== Cleaning ==="
 	run rm -rf /usr/obj/*
 	run rm -rf /usr/xobj/*
+	run rm -rf /usr/ports/logs/*
+	run rm -rf /usr/ports/packages/*
+	run rm -rf /usr/ports/pobj/*
+	run rm -rf "${CHROOT}"/usr/ports/logs/*
+	run rm -rf "${CHROOT}"/usr/ports/packages/*
 	run rm -rf "${CHROOT}"/usr/ports/pobj/*
-	run rm -rf "${CHROOT}"/usr/ports/logs/*/locks/*
 	echo "=== Cleaning done ==="
 fi
 
