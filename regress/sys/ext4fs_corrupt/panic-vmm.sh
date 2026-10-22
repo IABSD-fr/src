@@ -21,6 +21,7 @@ EXT4FS_VMM_BOOT_TIMEOUT=${EXT4FS_VMM_BOOT_TIMEOUT:-120}
 EXT4FS_VMM_PANIC_TIMEOUT=${EXT4FS_VMM_PANIC_TIMEOUT:-30}
 EXT4FS_VMM_IMAGE_MB=${EXT4FS_VMM_IMAGE_MB:-128}
 EXT4FS_VMM_SSH_KEY=${EXT4FS_VMM_SSH_KEY:-}
+EXT4FS_VMM_BLOCK_SIZE=${EXT4FS_VMM_BLOCK_SIZE:-1024}
 
 fail()
 {
@@ -67,6 +68,10 @@ if [ -n "$EXT4FS_VMM_SSH_KEY" ]; then
 	[ -r "$EXT4FS_VMM_SSH_KEY" ] ||
 	    fail "SSH identity is not readable"
 fi
+case "$EXT4FS_VMM_BLOCK_SIZE" in
+1024|2048|4096) ;;
+*)	fail "unsupported block size: $EXT4FS_VMM_BLOCK_SIZE" ;;
+esac
 
 work=$(mktemp -d "$EXT4FS_VMM_DIR/ext4fs_panic.XXXXXXXX")
 case "$work" in
@@ -129,12 +134,14 @@ ssh_run()
 	fi
 }
 
-printf '%-64s' 'vmm: errors=panic journal abort policy'
+test_label="vmm: errors=panic ($EXT4FS_VMM_BLOCK_SIZE byte blocks)"
+printf '%-64s' "$test_label"
 
 "$SYSCTL" -n kern.version >"$work/host-version.log"
 dd if=/dev/zero of="$image" bs=1m count=0 \
     seek="$EXT4FS_VMM_IMAGE_MB" status=none
-"$MKE2FS" -q -F -t ext4 -I 256 -b 1024 -e panic \
+"$MKE2FS" -q -F -t ext4 -I 256 \
+    -b "$EXT4FS_VMM_BLOCK_SIZE" -e panic \
     -O '^orphan_file,^uninit_bg' "$image"
 "$E2FSCK" -fn "$image" >"$work/e2fsck.log" 2>&1 ||
     fail "e2fsck rejected the clean fixture"

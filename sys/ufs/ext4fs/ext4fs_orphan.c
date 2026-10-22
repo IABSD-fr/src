@@ -787,8 +787,8 @@ ext4fs_recovery_recount (struct mount *mp, int64_t dir_group)
 			for (i = 0; i < valid; i++)
 				if (isclr((u_int8_t *)bp->b_data, i))
 					free_count++;
-			checksum = ext4fs_bitmap_csum(fs, group,
-			    bp->b_data, fs->m_block_size);
+			checksum = ext4fs_block_bitmap_csum(fs, group,
+			    bp->b_data);
 			gd->bgd_block_bitmap_checksum_lo =
 			    htole16(checksum & 0xffff);
 			if (fs->m_feature_incompat &

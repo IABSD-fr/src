@@ -61,6 +61,18 @@ esac
 	echo "EXT4FS_IMAGE_MB must not exceed 4096" >&2
 	exit 1
 }
+[ -n "$EXT4FS_BLOCK_SIZES" ] || {
+	echo "EXT4FS_BLOCK_SIZES must not be empty" >&2
+	exit 1
+}
+for block_size in $EXT4FS_BLOCK_SIZES; do
+	case "$block_size" in
+	1024|2048|4096) ;;
+	*)	echo "bad block size: $block_size" >&2
+		exit 1
+		;;
+	esac
+done
 
 work=$(mktemp -d /tmp/ext4fs_operations.XXXXXXXX)
 case "$work" in
@@ -119,9 +131,17 @@ run_step()
 {
 	mode=$1
 	step_root=${2:-$mountpoint/tree}
-	if ! "$TIMEOUT" -k 2 "$EXT4FS_TIMEOUT" "$EXT4FSOPS" "$mode" \
-	    "$step_root" >"$case_dir/$mode.log" 2>&1; then
+	set +e
+	"$TIMEOUT" -k 2 "$EXT4FS_TIMEOUT" "$EXT4FSOPS" "$mode" \
+	    "$step_root" >"$case_dir/$mode.log" 2>&1
+	step_status=$?
+	set -e
+	if [ "$step_status" -ne 0 ]; then
 		cat "$case_dir/$mode.log" >&2
+		if [ "$step_status" -eq 124 ]; then
+			fail "$mode workload timed out after" \
+			    "$EXT4FS_TIMEOUT seconds"
+		fi
 		fail "$mode workload failed"
 	fi
 }
@@ -617,18 +637,19 @@ run_case()
 
 run_flex_uninit_case()
 {
-	case_dir=$work/flex-bg-block-uninit
+	block_size=$1
+	case_dir=$work/flex-bg-block-uninit-$block_size
 	image=$case_dir/ext4.img
 	empty=$case_dir/empty
 	mkdir "$case_dir"
 	: >"$empty"
 
-	test_name="FLEX_BG BLOCK_UNINIT allocation"
+	test_name="FLEX_BG BLOCK_UNINIT ($block_size byte blocks)"
 	print_test_name "$test_name"
 	dd if=/dev/zero of="$image" bs=1m count=0 \
 	    seek="$EXT4FS_IMAGE_MB" status=none
-	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b 1024 \
-	    -O '^orphan_file' "$image" \
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -g 1024 -O '^orphan_file' "$image" \
 	    >"$case_dir/mke2fs.log" 2>&1; then
 		cat "$case_dir/mke2fs.log" >&2
 		fail "mke2fs failed"
@@ -638,16 +659,44 @@ run_flex_uninit_case()
 	grep -q '^Filesystem features:.*flex_bg' \
 	    "$case_dir/dumpe2fs-before.log" ||
 	    fail "fixture does not enable FLEX_BG"
-	grep -q '^Group 2:.*BLOCK_UNINIT' \
-	    "$case_dir/dumpe2fs-before.log" ||
-	    fail "fixture group 2 is not BLOCK_UNINIT"
-
-	free0=$(group_free_blocks 0)
-	free1=$(group_free_blocks 1)
-	case "$free0:$free1" in
-	*[!0-9:]*) fail "could not read group free-block counts" ;;
+	target_group=$(awk '
+	    /^Group [0-9]+:/ && /BLOCK_UNINIT/ {
+		group = $2
+		gsub(/:/, "", group)
+		print group
+		exit
+	    }
+	' "$case_dir/dumpe2fs-before.log")
+	case "$target_group" in
+	''|*[!0-9]*) fail "fixture has no BLOCK_UNINIT group" ;;
 	esac
-	reserve_count=$((free0 + free1))
+	target_name=$target_group:
+	group_range=$(awk -v group="$target_name" '
+	    $1 == "Group" && $2 == group {
+		range = $4
+		gsub(/[^0-9-]/, "", range)
+		print range
+		exit
+	    }
+	' "$case_dir/dumpe2fs-before.log")
+	case "$group_range" in
+	*[!0-9-]*|''|-*|*-)
+		fail "could not read target block-group bounds"
+		;;
+	esac
+	group_first=${group_range%-*}
+	group_last=${group_range#*-}
+
+	reserve_count=0
+	group=0
+	while [ "$group" -lt "$target_group" ]; do
+		free_blocks=$(group_free_blocks "$group")
+		case "$free_blocks" in
+		''|*[!0-9]*) fail "could not read group free blocks" ;;
+		esac
+		reserve_count=$((reserve_count + free_blocks))
+		group=$((group + 1))
+	done
 	[ "$reserve_count" -gt 0 ] ||
 	    fail "fixture has no blocks to reserve"
 	reserve_last=$((reserve_count - 1))
@@ -658,17 +707,19 @@ run_flex_uninit_case()
 	if ! "$DEBUGFS" -w -f "$case_dir/debugfs.cmd" "$image" \
 	    >"$case_dir/debugfs.log" 2>&1; then
 		cat "$case_dir/debugfs.log" >&2
-		fail "could not exhaust block groups 0 and 1"
+		fail "could not exhaust preceding block groups"
 	fi
-	[ "$(group_free_blocks 0)" -eq 0 ] ||
-	    fail "block group 0 was not exhausted"
-	[ "$(group_free_blocks 1)" -eq 0 ] ||
-	    fail "block group 1 was not exhausted"
+	group=0
+	while [ "$group" -lt "$target_group" ]; do
+		[ "$(group_free_blocks "$group")" -eq 0 ] ||
+		    fail "block group $group was not exhausted"
+		group=$((group + 1))
+	done
 	"$DUMPE2FS" "$image" >"$case_dir/dumpe2fs-filled.log" 2>&1 ||
 	    fail "dumpe2fs rejected the filled image"
-	grep -q '^Group 2:.*BLOCK_UNINIT' \
+	grep -q "^Group $target_group:.*BLOCK_UNINIT" \
 	    "$case_dir/dumpe2fs-filled.log" ||
-	    fail "offline preparation initialized block group 2"
+	    fail "offline preparation initialized the target group"
 
 	attach_image
 	mount_image ""
@@ -679,9 +730,9 @@ run_flex_uninit_case()
 
 	"$DUMPE2FS" "$image" >"$case_dir/dumpe2fs-after.log" 2>&1 ||
 	    fail "dumpe2fs rejected the allocated image"
-	if grep -q '^Group 2:.*BLOCK_UNINIT' \
+	if grep -q "^Group $target_group:.*BLOCK_UNINIT" \
 	    "$case_dir/dumpe2fs-after.log"; then
-		fail "kernel did not initialize block group 2"
+		fail "kernel did not initialize the target block group"
 	fi
 	probe_blocks=$(
 	    "$DEBUGFS" -R 'blocks /allocation-probe' "$image" \
@@ -694,9 +745,9 @@ run_flex_uninit_case()
 		case "$probe_block" in
 		*[!0-9]*|'') fail "invalid allocation probe block" ;;
 		esac
-		[ "$probe_block" -ge 16385 ] &&
-		    [ "$probe_block" -le 24576 ] ||
-		    fail "allocation probe block is outside group 2"
+		[ "$probe_block" -ge "$group_first" ] &&
+		    [ "$probe_block" -le "$group_last" ] ||
+		    fail "allocation probe is outside the target group"
 	done
 
 	attach_image
@@ -1038,12 +1089,13 @@ run_counter_case()
 
 prepare_counter_corrupt_base()
 {
-	counter_base_dir=$work/counter-corrupt-base
+	block_size=$1
+	counter_base_dir=$work/counter-corrupt-base-$block_size
 	counter_base=$counter_base_dir/ext4.img
 	mkdir "$counter_base_dir"
 	dd if=/dev/zero of="$counter_base" bs=1m count=0 \
 	    seek="$EXT4FS_IMAGE_MB" status=none
-	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b 1024 \
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
 	    -O 'metadata_csum,^orphan_file' "$counter_base" \
 	    >"$counter_base_dir/mke2fs.log" 2>&1; then
 		cat "$counter_base_dir/mke2fs.log" >&2
@@ -1065,36 +1117,36 @@ prepare_counter_corrupt_base()
 
 run_counter_mount_reject_case()
 {
-	kind=$1
-	case_dir=$work/counter-reject-$kind
+	block_size=$1
+	kind=$2
+	case_dir=$work/counter-reject-$kind-$block_size
 	image=$case_dir/ext4.img
-	block_size=1024
 	mkdir "$case_dir"
 	cp "$counter_base" "$image"
 
 	case "$kind" in
 	super-blocks)
-		test_name="inconsistent superblock free-block count"
+		test_name="bad superblock block count ($block_size-byte)"
 		value=$(super_free_blocks)
 		field=free_blocks_count
 		;;
 	super-inodes)
-		test_name="inconsistent superblock free-inode count"
+		test_name="bad superblock inode count ($block_size-byte)"
 		value=$(super_free_inodes)
 		field=free_inodes_count
 		;;
 	group-blocks)
-		test_name="inconsistent group free-block count"
+		test_name="bad group block count ($block_size-byte)"
 		value=$(group_free_blocks 0)
 		field=free_blocks_count
 		;;
 	group-inodes)
-		test_name="inconsistent group free-inode count"
+		test_name="bad group inode count ($block_size-byte)"
 		value=$(group_free_inodes 0)
 		field=free_inodes_count
 		;;
 	group-dirs)
-		test_name="out-of-range group directory count"
+		test_name="bad group directory count ($block_size-byte)"
 		value=65534
 		field=used_dirs_count
 		;;
@@ -1132,16 +1184,16 @@ run_counter_mount_reject_case()
 
 run_counter_local_reject_case()
 {
-	kind=$1
-	case_dir=$work/counter-local-$kind
+	block_size=$1
+	kind=$2
+	case_dir=$work/counter-local-$kind-$block_size
 	image=$case_dir/ext4.img
-	block_size=1024
 	mkdir "$case_dir"
 	cp "$counter_base" "$image"
 
 	case "$kind" in
 	blocks)
-		test_name="local free-block mismatch is non-mutating"
+		test_name="local block mismatch ($block_size-byte)"
 		probe_inode=$("$DEBUGFS" -R \
 		    'stat /counter-block-probe' "$image" 2>/dev/null |
 		    awk '$1 == "Inode:" { print $2; exit }')
@@ -1161,7 +1213,7 @@ run_counter_local_reject_case()
 		mode=counter-reject-block
 		;;
 	inodes)
-		test_name="local free-inode mismatch is non-mutating"
+		test_name="local inode mismatch ($block_size-byte)"
 		group=0
 		group_value=$(group_free_inodes "$group")
 		super_value=$(super_free_inodes)
@@ -1436,16 +1488,16 @@ expect_superblock_mount_failure()
 
 run_superblock_reject_case()
 {
-	kind=$1
-	case_dir=$work/superblock-reject-$kind
+	block_size=$1
+	kind=$2
+	case_dir=$work/superblock-reject-$kind-$block_size
 	image=$case_dir/ext4.img
-	block_size=1024
 	mkdir "$case_dir"
-	cp "$work/superblock-1024/ext4.img" "$image"
+	cp "$work/superblock-$block_size/ext4.img" "$image"
 
 	case "$kind" in
 	checksum)
-		test_name="bad superblock checksum is non-mutating"
+		test_name="bad superblock checksum ($block_size byte blocks)"
 		offset=$((1024 + 1020))
 		value=$(dd if="$image" bs=1 skip="$offset" count=1 \
 		    status=none | hexdump -ve '1/1 "%u"')
@@ -1457,7 +1509,7 @@ run_superblock_reject_case()
 		write_image_byte "$image" "$offset" $((value ^ 1))
 		;;
 	dirty)
-		test_name="dirty superblock mount is non-mutating"
+		test_name="dirty superblock ($block_size byte blocks)"
 		if ! "$DEBUGFS" -w -R 'ssv state 0' "$image" \
 		    >"$case_dir/debugfs.log" 2>&1; then
 			cat "$case_dir/debugfs.log" >&2
@@ -2014,11 +2066,11 @@ run_extent_case()
 
 run_extent_reject_case()
 {
-	block_size=1024
+	block_size=$1
 	case_dir=$work/extents-reject-$block_size
 	image=$case_dir/ext4.img
 	mkdir "$case_dir"
-	test_name="depth-2 extent growth rejection"
+	test_name="depth-2 extent rejection ($block_size byte blocks)"
 	print_test_name "$test_name"
 
 	extent_capacity=$(((block_size - 12) / 12))
@@ -2124,13 +2176,13 @@ run_directory_case()
 
 run_directory_corrupt_case()
 {
-	block_size=1024
-	case_dir=$work/directory-corrupt-tail
+	block_size=$1
+	case_dir=$work/directory-corrupt-tail-$block_size
 	image=$case_dir/ext4.img
 	mkdir "$case_dir"
-	test_name="corrupt directory tail is non-mutating"
+	test_name="corrupt directory tail ($block_size byte blocks)"
 	print_test_name "$test_name"
-	cp "$work/directory-enabled-1024/ext4.img" "$image"
+	cp "$work/directory-enabled-$block_size/ext4.img" "$image"
 
 	directory_blocks=$(
 		"$DEBUGFS" -R 'blocks /directory/remove' "$image" \
@@ -2225,7 +2277,7 @@ run_orphan_case()
 	unmount_image orphan-create
 	detach_image
 	check_image orphan-create
-	if [ "$orphan_format:$block_size" = orphan-file:1024 ]; then
+	if [ "$orphan_format" = orphan-file ]; then
 		cp "$image" "$case_dir/base.img"
 	fi
 	sequence_before=$(journal_sequence)
@@ -2262,13 +2314,13 @@ run_orphan_case()
 
 run_orphan_corrupt_case()
 {
-	block_size=1024
-	case_dir=$work/orphan-corrupt-file
+	block_size=$1
+	case_dir=$work/orphan-corrupt-file-$block_size
 	image=$case_dir/ext4.img
 	mkdir "$case_dir"
-	test_name="corrupt orphan file is non-mutating"
+	test_name="corrupt orphan file ($block_size byte blocks)"
 	print_test_name "$test_name"
-	cp "$work/orphan-orphan-file-1024/base.img" "$image"
+	cp "$work/orphan-orphan-file-$block_size/base.img" "$image"
 
 	orphan_inode=$("$DUMPE2FS" -h "$image" 2>/dev/null | awk '
 	    $1 == "Orphan" && $2 == "file" && $3 == "inode:" {
@@ -2545,15 +2597,16 @@ run_revoke_enable_case()
 
 run_wxallowed_case()
 {
-	case_dir=$work/wxallowed
+	block_size=$1
+	case_dir=$work/wxallowed-$block_size
 	image=$case_dir/ext4.img
 	mkdir "$case_dir"
-	test_name="wxallowed mount option"
+	test_name="wxallowed mount ($block_size byte blocks)"
 	print_test_name "$test_name"
 
 	dd if=/dev/zero of="$image" bs=1m count=0 \
 	    seek="$EXT4FS_IMAGE_MB" status=none
-	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b 1024 \
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
 	    -O 'metadata_csum,orphan_file' "$image" \
 	    >"$case_dir/mke2fs.log" 2>&1; then
 		cat "$case_dir/mke2fs.log" >&2
@@ -2660,15 +2713,16 @@ run_directory_churn_case()
 
 run_special_case()
 {
-	case_dir=$work/special-inodes
+	block_size=$1
+	case_dir=$work/special-inodes-$block_size
 	image=$case_dir/ext4.img
 	mkdir "$case_dir"
-	test_name="special-inode lookup and removal"
+	test_name="special inodes ($block_size byte blocks)"
 	print_test_name "$test_name"
 
 	dd if=/dev/zero of="$image" bs=1m count=0 \
 	    seek="$EXT4FS_IMAGE_MB" status=none
-	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b 1024 \
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
 	    -O 'metadata_csum,^orphan_file' "$image" \
 	    >"$case_dir/mke2fs.log" 2>&1; then
 		cat "$case_dir/mke2fs.log" >&2
@@ -2694,7 +2748,9 @@ run_special_case()
 
 case "$EXT4FSOPS_MODE" in
 wxallowed)
-	run_wxallowed_case
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		run_wxallowed_case "$block_size"
+	done
 	exit 0
 	;;
 revoke-enable)
@@ -2776,7 +2832,9 @@ handoff)
 	exit 0
 	;;
 special)
-	run_special_case
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		run_special_case "$block_size"
+	done
 	exit 0
 	;;
 bitmap)
@@ -2832,19 +2890,17 @@ counters)
 			;;
 		esac
 		run_counter_case "$block_size"
-	done
-	case " $EXT4FS_BLOCK_SIZES " in
-	*' 1024 '*)
-		prepare_counter_corrupt_base
+		prepare_counter_corrupt_base "$block_size"
 		for kind in super-blocks super-inodes group-blocks \
 		    group-inodes group-dirs; do
-			run_counter_mount_reject_case "$kind"
+			run_counter_mount_reject_case \
+			    "$block_size" "$kind"
 		done
 		for kind in blocks inodes; do
-			run_counter_local_reject_case "$kind"
+			run_counter_local_reject_case \
+			    "$block_size" "$kind"
 		done
-		;;
-	esac
+	done
 	exit 0
 	;;
 superblock)
@@ -2857,14 +2913,11 @@ superblock)
 			;;
 		esac
 		run_superblock_case "$block_size"
-	done
-	case " $EXT4FS_BLOCK_SIZES " in
-	*' 1024 '*)
 		for kind in checksum dirty; do
-			run_superblock_reject_case "$kind"
+			run_superblock_reject_case \
+			    "$block_size" "$kind"
 		done
-		;;
-	esac
+	done
 	exit 0
 	;;
 sector-size)
@@ -2920,8 +2973,8 @@ remount)
 			;;
 		esac
 		run_remount_case "$block_size" classic
+		run_remount_case "$block_size" orphan-file
 	done
-	run_remount_case 1024 orphan-file
 	exit 0
 	;;
 allocation-run)
@@ -2947,10 +3000,8 @@ extents)
 			;;
 		esac
 		run_extent_case "$block_size"
+		run_extent_reject_case "$block_size"
 	done
-	case " $EXT4FS_BLOCK_SIZES " in
-	*' 1024 '*) run_extent_reject_case ;;
-	esac
 	exit 0
 	;;
 directory)
@@ -2966,9 +3017,9 @@ directory)
 			run_directory_case "$block_size" "$checksum"
 		done
 	done
-	case " $EXT4FS_BLOCK_SIZES " in
-	*' 1024 '*) run_directory_corrupt_case ;;
-	esac
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		run_directory_corrupt_case "$block_size"
+	done
 	exit 0
 	;;
 orphan)
@@ -2984,9 +3035,9 @@ orphan)
 			run_orphan_case "$block_size" "$orphan_format"
 		done
 	done
-	case " $EXT4FS_BLOCK_SIZES " in
-	*' 1024 '*) run_orphan_corrupt_case ;;
-	esac
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		run_orphan_corrupt_case "$block_size"
+	done
 	exit 0
 	;;
 full) ;;
@@ -3008,10 +3059,7 @@ for block_size in $EXT4FS_BLOCK_SIZES; do
 	run_case "$block_size"
 done
 
-case " $EXT4FS_BLOCK_SIZES " in
-*' 1024 '*) run_case 1024 orphan-file ;;
-esac
-
-case " $EXT4FS_BLOCK_SIZES " in
-*' 1024 '*) run_flex_uninit_case ;;
-esac
+for block_size in $EXT4FS_BLOCK_SIZES; do
+	run_case "$block_size" orphan-file
+	run_flex_uninit_case "$block_size"
+done

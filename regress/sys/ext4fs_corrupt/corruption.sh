@@ -19,6 +19,7 @@ EXT4FS_CORRUPT=${EXT4FS_CORRUPT:-./ext4fs_corrupt}
 EXT4FS_CORRUPT_MODE=${EXT4FS_CORRUPT_MODE:-kernel}
 EXT4FS_CORRUPT_TIMEOUT=${EXT4FS_CORRUPT_TIMEOUT:-20}
 EXT4FS_CORRUPT_IMAGE_MB=${EXT4FS_CORRUPT_IMAGE_MB:-64}
+EXT4FS_BLOCK_SIZES=${EXT4FS_BLOCK_SIZES:-"1024 2048 4096"}
 
 case "$EXT4FS_CORRUPT_MODE" in
 fixtures|kernel) ;;
@@ -68,6 +69,18 @@ esac
 	echo "EXT4FS_CORRUPT_IMAGE_MB must not exceed 4096" >&2
 	exit 1
 }
+[ -n "$EXT4FS_BLOCK_SIZES" ] || {
+	echo "EXT4FS_BLOCK_SIZES must not be empty" >&2
+	exit 1
+}
+for block_size in $EXT4FS_BLOCK_SIZES; do
+	case "$block_size" in
+	1024|2048|4096) ;;
+	*)	echo "unsupported ext4fs block size: $block_size" >&2
+		exit 1
+		;;
+	esac
+done
 
 work=$(mktemp -d /tmp/ext4fs_corrupt.XXXXXXXX)
 case "$work" in
@@ -485,7 +498,7 @@ extent-root-unordered extent-root-overlap extent-root-zero-length
 extent-leaf-entries-over-max extent-leaf-max-too-large
 extent-leaf-unordered extent-leaf-overlap extent-block-bad-checksum'
 
-for block_size in 1024 2048 4096; do
+for block_size in $EXT4FS_BLOCK_SIZES; do
 	test_name="create base images, $block_size-byte blocks"
 	create_base checksum "$block_size"
 	create_base no-checksum "$block_size"

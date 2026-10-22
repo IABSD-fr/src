@@ -249,6 +249,18 @@ ext4fs_bitmap_csum (struct m_ext4fs *fs, u_int32_t group,
 }
 
 /*
+ * The checksum covers the configured block-group bitmap width, not
+ * padding through the end of the filesystem block.
+ */
+u_int32_t
+ext4fs_block_bitmap_csum (struct m_ext4fs *fs, u_int32_t group,
+    const void *bitmap)
+{
+	return (ext4fs_bitmap_csum(fs, group, bitmap,
+	    howmany(fs->m_blocks_per_group, NBBY)));
+}
+
+/*
  * Write the checksum tail at the end of a directory block.
  *
  * The tail is a 12-byte structure placed at block_size - 12.

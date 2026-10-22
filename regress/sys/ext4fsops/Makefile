@@ -144,6 +144,7 @@ run-regress-ext4fsops-wxallowed: ${PROG}
 	env EXT4FSOPS='${.OBJDIR}/${PROG}' \
 	    EXT4FS_TIMEOUT='${EXT4FS_TIMEOUT}' \
 	    EXT4FS_IMAGE_MB='${EXT4FS_IMAGE_MB}' \
+	    EXT4FS_BLOCK_SIZES='${EXT4FS_BLOCK_SIZES}' \
 	    EXT4FSOPS_MODE='wxallowed' \
 	    sh ${.CURDIR}/operations.sh
 
@@ -207,6 +208,7 @@ run-regress-ext4fsops-special: ${PROG}
 	env EXT4FSOPS='${.OBJDIR}/${PROG}' \
 	    EXT4FS_TIMEOUT='${EXT4FS_TIMEOUT}' \
 	    EXT4FS_IMAGE_MB='${EXT4FS_IMAGE_MB}' \
+	    EXT4FS_BLOCK_SIZES='${EXT4FS_BLOCK_SIZES}' \
 	    EXT4FSOPS_MODE='special' \
 	    sh ${.CURDIR}/operations.sh
 

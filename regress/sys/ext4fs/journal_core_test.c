@@ -170,7 +170,13 @@ test_credit_limit (void)
 	    "dirty metadata limits transaction credits");
 	check(ext4fs_journal_state_credit_limit(10001, 0, 1024,
 	    4U * 1024U * 1024U) == 4096,
-	    "dirty metadata limit follows block size");
+	    "1K dirty metadata limit follows block size");
+	check(ext4fs_journal_state_credit_limit(10001, 0, 2048,
+	    4U * 1024U * 1024U) == 2048,
+	    "2K dirty metadata limit follows block size");
+	check(ext4fs_journal_state_credit_limit(10001, 0, 4096,
+	    4U * 1024U * 1024U) == 1024,
+	    "4K dirty metadata limit follows block size");
 	check(ext4fs_journal_state_credit_limit(101, 1, 4096,
 	    4U * 1024U * 1024U) == 0,
 	    "empty journal maximum rejects credits");

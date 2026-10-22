@@ -1602,14 +1602,18 @@ static void
 create_grow_directory (void)
 {
 	char path[PATH_MAX];
-	int i;
+	int fd, i;
 
 	make_path(path, sizeof(path), "growdir");
 	if (mkdir(path, 0755) == -1)
 		err(1, "mkdir %s", path);
 	for (i = 0; i < GROW_FILES; i++) {
 		make_indexed_path(path, sizeof(path), "growdir", i);
-		write_text_file(path, "");
+		fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+		if (fd == -1)
+			err(1, "open %s", path);
+		if (close(fd) == -1)
+			err(1, "close %s", path);
 	}
 	make_path(path, sizeof(path), "growdir");
 	fsync_path(path);

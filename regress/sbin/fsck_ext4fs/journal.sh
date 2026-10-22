@@ -17,6 +17,7 @@ CC=${CC:-cc}
 TIMEOUT=${TIMEOUT:-timeout}
 FSCK_TIMEOUT=${FSCK_TIMEOUT:-20}
 JOURNAL_SEED=${JOURNAL_SEED:-260921}
+JOURNAL_BLOCK_SIZE=${JOURNAL_BLOCK_SIZE:-4096}
 RANDOM_CASES=${RANDOM_CASES:-6}
 MUTATION_CASES=${MUTATION_CASES:-18}
 JOURNAL_TEST_MODE=${JOURNAL_TEST_MODE:-all}
@@ -27,6 +28,14 @@ UMOUNT=${UMOUNT:-umount}
 case "$JOURNAL_TEST_MODE" in
 all|kernel) ;;
 *)	echo "JOURNAL_TEST_MODE must be 'all' or 'kernel'" >&2
+	exit 1
+	;;
+esac
+
+case "$JOURNAL_BLOCK_SIZE" in
+1024)	OTHER_BLOCK_SIZE=2048 ;;
+2048|4096)	OTHER_BLOCK_SIZE=1024 ;;
+*)	echo "unsupported journal block size: $JOURNAL_BLOCK_SIZE" >&2
 	exit 1
 	;;
 esac
@@ -63,6 +72,7 @@ esac
 [ "$MUTATION_CASES" -le 96 ] || { echo "MUTATION_CASES is too large" >&2; exit 1; }
 RNG_STATE=$JOURNAL_SEED
 ulimit -c 0
+echo "filesystem block size: $JOURNAL_BLOCK_SIZE"
 
 KERNEL_VND=
 KERNEL_MOUNTPOINT=
@@ -339,8 +349,9 @@ read_be32_journal()
 	within=$3
 	journal_block "$image" "$logical"
 	offset=$((JOURNAL_BLOCK * CURRENT_BLOCK_SIZE + within))
-	set -- $(dd if="$image" bs=1 skip="$offset" count=4 status=none |
-	    od -An -tu1)
+	set -- $(dd if="$image" bs=1 skip="$offset" count=4 \
+	    status=none | od -An -tu1 |
+	    awk '{ for (i = 1; i <= NF; i++) printf "%d ", $i + 0 }')
 	[ "$#" -eq 4 ] || fail "could not read journal word"
 	JOURNAL_WORD=$((($1 << 24) | ($2 << 16) | ($3 << 8) | $4))
 }
@@ -350,7 +361,8 @@ read_le32_image()
 	le_image=$1
 	le_offset=$2
 	set -- $(dd if="$le_image" bs=1 skip="$le_offset" count=4 \
-	    status=none | od -An -tu1)
+	    status=none | od -An -tu1 |
+	    awk '{ for (i = 1; i <= NF; i++) printf "%d ", $i + 0 }')
 	[ "$#" -eq 4 ] || fail "could not read little-endian image word"
 	IMAGE_WORD=$(($1 | ($2 << 8) | ($3 << 16) | ($4 << 24)))
 }
@@ -490,9 +502,9 @@ test_basic_replay()
 	open_command=$2
 	case_dir=$work/$format
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 1
-	make_payload "$case_dir/payload" 4096 1 X
+	make_payload "$case_dir/payload" "$JOURNAL_BLOCK_SIZE" 1 X
 	{
 		printf '%s\n' "$open_command"
 		printf 'journal_write -b %s %s\n' "$FREE_RANGE" \
@@ -501,7 +513,8 @@ test_basic_replay()
 	} >"$case_dir/debugfs.cmd"
 	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
 	replay "$case_dir/image"
-	compare_blocks "$case_dir/image" 4096 "$FREE_FIRST" 1 \
+	compare_blocks "$case_dir/image" "$JOURNAL_BLOCK_SIZE" \
+	    "$FREE_FIRST" 1 \
 	    "$case_dir/payload"
 	verify_e2fsck "$case_dir/image"
 }
@@ -520,9 +533,10 @@ test_csum_v2_multiple_tags()
 {
 	case_dir=$work/csum-v2-multiple-tags
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 3
-	make_random_payload "$case_dir/payload" 4096 3
+	make_random_payload "$case_dir/payload" \
+	    "$JOURNAL_BLOCK_SIZE" 3
 	{
 		printf 'journal_open -c -v 2\n'
 		printf 'journal_write -b %s %s\n' "$FREE_RANGE" \
@@ -534,7 +548,8 @@ test_csum_v2_multiple_tags()
 	    grep -c 'FS block')
 	[ "$tags" -eq 3 ] || fail "fixture does not contain three tags"
 	replay "$case_dir/image"
-	compare_blocks "$case_dir/image" 4096 "$FREE_FIRST" 3 \
+	compare_blocks "$case_dir/image" "$JOURNAL_BLOCK_SIZE" \
+	    "$FREE_FIRST" 3 \
 	    "$case_dir/payload"
 	verify_e2fsck "$case_dir/image"
 }
@@ -548,10 +563,11 @@ test_escape()
 {
 	case_dir=$work/escape
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 1
 	printf '\300\073\071\230' >"$case_dir/payload"
-	dd if=/dev/zero bs=4092 count=1 status=none | tr '\000' E \
+	dd if=/dev/zero bs=$((JOURNAL_BLOCK_SIZE - 4)) count=1 \
+	    status=none | tr '\000' E \
 	    >>"$case_dir/payload"
 	{
 		printf 'journal_open -c -v 3\n'
@@ -561,7 +577,8 @@ test_escape()
 	} >"$case_dir/debugfs.cmd"
 	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
 	replay "$case_dir/image"
-	compare_blocks "$case_dir/image" 4096 "$FREE_FIRST" 1 \
+	compare_blocks "$case_dir/image" "$JOURNAL_BLOCK_SIZE" \
+	    "$FREE_FIRST" 1 \
 	    "$case_dir/payload"
 	verify_e2fsck "$case_dir/image"
 }
@@ -570,10 +587,11 @@ test_revoke()
 {
 	case_dir=$work/revoke
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 1
-	make_payload "$case_dir/payload" 4096 1 R
-	dd if=/dev/zero of="$case_dir/zero" bs=4096 count=1 status=none
+	make_payload "$case_dir/payload" "$JOURNAL_BLOCK_SIZE" 1 R
+	dd if=/dev/zero of="$case_dir/zero" \
+	    bs="$JOURNAL_BLOCK_SIZE" count=1 status=none
 	: >"$case_dir/empty"
 	{
 		printf 'journal_open -c -v 3\n'
@@ -589,7 +607,8 @@ test_revoke()
 		grep -q 'journal revoke: 1 blocks revoked' "$case_dir/fsck.log" ||
 		    fail "revoke record was not processed"
 	fi
-	compare_blocks "$case_dir/image" 4096 "$FREE_FIRST" 1 \
+	compare_blocks "$case_dir/image" "$JOURNAL_BLOCK_SIZE" \
+	    "$FREE_FIRST" 1 \
 	    "$case_dir/zero"
 	verify_e2fsck "$case_dir/image"
 }
@@ -598,9 +617,12 @@ test_multi_descriptor()
 {
 	case_dir=$work/multi-descriptor
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 1024
-	find_free_blocks "$case_dir/image" 130
-	make_payload "$case_dir/payload" 1024 130 M
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
+	tag_capacity=$(((JOURNAL_BLOCK_SIZE - 32) / 16))
+	tag_count=$((2 * tag_capacity + 6))
+	find_free_blocks "$case_dir/image" "$tag_count"
+	make_payload "$case_dir/payload" "$JOURNAL_BLOCK_SIZE" \
+	    "$tag_count" M
 	{
 		printf 'journal_open -c -v 3\n'
 		printf 'journal_write -b %s %s\n' "$FREE_RANGE" \
@@ -612,7 +634,8 @@ test_multi_descriptor()
 	    grep -c 'type 1 (descriptor block)')
 	[ "$descriptors" -ge 3 ] || fail "fixture has fewer than 3 descriptors"
 	replay "$case_dir/image"
-	compare_blocks "$case_dir/image" 1024 "$FREE_FIRST" 130 \
+	compare_blocks "$case_dir/image" "$JOURNAL_BLOCK_SIZE" \
+	    "$FREE_FIRST" "$tag_count" \
 	    "$case_dir/payload"
 	verify_e2fsck "$case_dir/image"
 }
@@ -621,9 +644,9 @@ test_read_only()
 {
 	case_dir=$work/read-only
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 1
-	make_payload "$case_dir/payload" 4096 1 N
+	make_payload "$case_dir/payload" "$JOURNAL_BLOCK_SIZE" 1 N
 	{
 		printf 'journal_open -c -v 3\n'
 		printf 'journal_write -b %s %s\n' "$FREE_RANGE" \
@@ -640,7 +663,8 @@ test_read_only()
 		read_le32_image "$case_dir/image" "$feature_offset"
 		[ $((IMAGE_WORD & 4)) -eq 0 ] ||
 		    fail "read-only kernel replay did not clear RECOVER"
-		compare_blocks "$case_dir/image" 4096 "$FREE_FIRST" 1 \
+		compare_blocks "$case_dir/image" "$JOURNAL_BLOCK_SIZE" \
+		    "$FREE_FIRST" 1 \
 		    "$case_dir/payload"
 		verify_e2fsck "$case_dir/image"
 		return
@@ -662,9 +686,9 @@ test_clean_journal_recovery()
 {
 	case_dir=$work/clean-journal-recovery
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 1
-	make_payload "$case_dir/payload" 4096 1 Z
+	make_payload "$case_dir/payload" "$JOURNAL_BLOCK_SIZE" 1 Z
 	{
 		printf 'journal_open\n'
 		printf 'journal_write -b %s %s\n' "$FREE_FIRST" \
@@ -675,7 +699,8 @@ test_clean_journal_recovery()
 
 	# Model a crash after home-block replay and the durable s_start=0 write,
 	# but before the filesystem superblock's RECOVER bit was cleared.
-	dd if="$case_dir/payload" of="$case_dir/image" bs=4096 \
+	dd if="$case_dir/payload" of="$case_dir/image" \
+	    bs="$JOURNAL_BLOCK_SIZE" \
 	    seek="$FREE_FIRST" count=1 conv=notrunc status=none
 	mark_journal_clean "$case_dir/image"
 	feature_offset=$((1024 + 96))
@@ -701,7 +726,8 @@ test_clean_journal_recovery()
 	[ "$JOURNAL_WORD" -eq 0 ] || fail "clean journal was made non-empty"
 	read_le32_image "$case_dir/image" "$feature_offset"
 	[ $((IMAGE_WORD & 4)) -eq 0 ] || fail "RECOVER was not cleared"
-	compare_blocks "$case_dir/image" 4096 "$FREE_FIRST" 1 \
+	compare_blocks "$case_dir/image" "$JOURNAL_BLOCK_SIZE" \
+	    "$FREE_FIRST" 1 \
 	    "$case_dir/payload"
 	verify_e2fsck "$case_dir/image"
 }
@@ -710,9 +736,9 @@ test_bad_data_checksum()
 {
 	case_dir=$work/bad-data-checksum
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 1
-	make_payload "$case_dir/payload" 4096 1 X
+	make_payload "$case_dir/payload" "$JOURNAL_BLOCK_SIZE" 1 X
 	{
 		printf 'journal_open -c -v 3\n'
 		printf 'journal_write -b %s %s\n' "$FREE_RANGE" \
@@ -728,9 +754,9 @@ test_incomplete_transaction()
 {
 	case_dir=$work/incomplete
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 1
-	make_payload "$case_dir/payload" 4096 1 I
+	make_payload "$case_dir/payload" "$JOURNAL_BLOCK_SIZE" 1 I
 	{
 		printf 'journal_open -c -v 3\n'
 		printf 'journal_write -b %s %s\n' "$FREE_RANGE" \
@@ -738,13 +764,16 @@ test_incomplete_transaction()
 		printf 'journal_close\n'
 	} >"$case_dir/debugfs.cmd"
 	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
-	dd if="$case_dir/image" of="$case_dir/home-before" bs=4096 \
+	dd if="$case_dir/image" of="$case_dir/home-before" \
+	    bs="$JOURNAL_BLOCK_SIZE" \
 	    skip="$FREE_FIRST" count=1 status=none
 	journal_block "$case_dir/image" 3
-	dd if=/dev/zero of="$case_dir/image" bs=4096 \
+	dd if=/dev/zero of="$case_dir/image" \
+	    bs="$JOURNAL_BLOCK_SIZE" \
 	    seek="$JOURNAL_BLOCK" count=1 conv=notrunc status=none
 	replay "$case_dir/image"
-	compare_blocks "$case_dir/image" 4096 "$FREE_FIRST" 1 \
+	compare_blocks "$case_dir/image" "$JOURNAL_BLOCK_SIZE" \
+	    "$FREE_FIRST" 1 \
 	    "$case_dir/home-before"
 	verify_e2fsck "$case_dir/image"
 }
@@ -753,14 +782,15 @@ test_validation_atomicity()
 {
 	case_dir=$work/validation-atomicity
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 2
 	set -- $FREE_BLOCKS
 	first=$1
 	second=$2
-	make_payload "$case_dir/first" 4096 1 A
-	make_payload "$case_dir/second" 4096 1 B
-	dd if=/dev/zero of="$case_dir/zero" bs=4096 count=2 status=none
+	make_payload "$case_dir/first" "$JOURNAL_BLOCK_SIZE" 1 A
+	make_payload "$case_dir/second" "$JOURNAL_BLOCK_SIZE" 1 B
+	dd if=/dev/zero of="$case_dir/zero" \
+	    bs="$JOURNAL_BLOCK_SIZE" count=2 status=none
 	{
 		printf 'journal_open -c -v 3\n'
 		printf 'journal_write -b %s %s\n' "$first" "$case_dir/first"
@@ -770,43 +800,42 @@ test_validation_atomicity()
 	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
 	flip_journal_byte "$case_dir/image" 5 0 1
 	expect_replay_failure_unchanged "$case_dir/image"
-	compare_blocks "$case_dir/image" 4096 "$first" 2 "$case_dir/zero"
+	compare_blocks "$case_dir/image" "$JOURNAL_BLOCK_SIZE" \
+	    "$first" 2 "$case_dir/zero"
 }
 
 test_block_sizes()
 {
-	root_dir=$work/block-sizes
-	mkdir "$root_dir"
-	for size in 1024 2048 4096; do
-		case_dir=$root_dir/$size
-		mkdir "$case_dir"
-		create_image "$case_dir/image" "$size"
-		find_free_blocks "$case_dir/image" 1
-		make_payload "$case_dir/payload" "$size" 1 B
-		{
-			printf 'journal_open -c -v 3\n'
-			printf 'journal_write -b %s %s\n' "$FREE_FIRST" \
-			    "$case_dir/payload"
-			printf 'journal_close\n'
-		} >"$case_dir/debugfs.cmd"
-		run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
-		replay "$case_dir/image"
-		compare_blocks "$case_dir/image" "$size" "$FREE_FIRST" 1 \
+	case_dir=$work/block-size
+	mkdir "$case_dir"
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
+	find_free_blocks "$case_dir/image" 1
+	make_payload "$case_dir/payload" "$JOURNAL_BLOCK_SIZE" 1 B
+	{
+		printf 'journal_open -c -v 3\n'
+		printf 'journal_write -b %s %s\n' "$FREE_FIRST" \
 		    "$case_dir/payload"
-		verify_e2fsck "$case_dir/image"
-	done
+		printf 'journal_close\n'
+	} >"$case_dir/debugfs.cmd"
+	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
+	replay "$case_dir/image"
+	compare_blocks "$case_dir/image" "$JOURNAL_BLOCK_SIZE" \
+	    "$FREE_FIRST" 1 "$case_dir/payload"
+	verify_e2fsck "$case_dir/image"
 }
 
 test_descriptor_boundary()
 {
 	root_dir=$work/descriptor-boundary
 	mkdir "$root_dir"
-	for count in 62 63; do
+	tag_capacity=$(((JOURNAL_BLOCK_SIZE - 32) / 16))
+	for count in "$tag_capacity" $((tag_capacity + 1)); do
 		case_dir=$root_dir/$count
 		mkdir "$case_dir"
-		create_image "$case_dir/image" 1024
+		create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 		find_free_blocks "$case_dir/image" "$count"
-		make_payload "$case_dir/payload" 1024 "$count" D
+		make_payload "$case_dir/payload" \
+		    "$JOURNAL_BLOCK_SIZE" "$count" D
 		{
 			printf 'journal_open -c -v 3\n'
 			printf 'journal_write -b %s %s\n' "$FREE_RANGE" \
@@ -816,15 +845,16 @@ test_descriptor_boundary()
 		run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
 		descriptors=$("$DEBUGFS" -R logdump "$case_dir/image" 2>&1 |
 		    grep -c 'type 1 (descriptor block)')
-		if [ "$count" -eq 62 ]; then
+		if [ "$count" -eq "$tag_capacity" ]; then
 			[ "$descriptors" -eq 1 ] ||
-			    fail "62 tags did not fit in one descriptor"
+			    fail "$count tags did not fit in one descriptor"
 		else
 			[ "$descriptors" -eq 2 ] ||
-			    fail "63 tags did not split into two descriptors"
+			    fail "$count tags did not split descriptors"
 		fi
 		replay "$case_dir/image"
-		compare_blocks "$case_dir/image" 1024 "$FREE_FIRST" "$count" \
+		compare_blocks "$case_dir/image" "$JOURNAL_BLOCK_SIZE" \
+		    "$FREE_FIRST" "$count" \
 		    "$case_dir/payload"
 		verify_e2fsck "$case_dir/image"
 	done
@@ -834,10 +864,10 @@ test_revoke_then_later_write()
 {
 	case_dir=$work/revoke-later-write
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 1
-	make_payload "$case_dir/old" 4096 1 O
-	make_payload "$case_dir/new" 4096 1 L
+	make_payload "$case_dir/old" "$JOURNAL_BLOCK_SIZE" 1 O
+	make_payload "$case_dir/new" "$JOURNAL_BLOCK_SIZE" 1 L
 	: >"$case_dir/empty"
 	{
 		printf 'journal_open -c -v 3\n'
@@ -848,7 +878,8 @@ test_revoke_then_later_write()
 	} >"$case_dir/debugfs.cmd"
 	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
 	replay "$case_dir/image"
-	compare_blocks "$case_dir/image" 4096 "$FREE_FIRST" 1 "$case_dir/new"
+	compare_blocks "$case_dir/image" "$JOURNAL_BLOCK_SIZE" \
+	    "$FREE_FIRST" 1 "$case_dir/new"
 	verify_e2fsck "$case_dir/image"
 }
 
@@ -856,10 +887,11 @@ test_deleted_tag()
 {
 	case_dir=$work/deleted-tag
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 1
-	make_payload "$case_dir/payload" 4096 1 T
-	dd if=/dev/zero of="$case_dir/zero" bs=4096 count=1 status=none
+	make_payload "$case_dir/payload" "$JOURNAL_BLOCK_SIZE" 1 T
+	dd if=/dev/zero of="$case_dir/zero" \
+	    bs="$JOURNAL_BLOCK_SIZE" count=1 status=none
 	{
 		printf 'journal_open\n'
 		printf 'journal_write -b %s %s\n' "$FREE_FIRST" \
@@ -875,7 +907,8 @@ test_deleted_tag()
 		grep -q 'journal replay: 0 blocks replayed' "$case_dir/fsck.log" ||
 		    fail "deleted tag unexpectedly replayed a data block"
 	fi
-	compare_blocks "$case_dir/image" 4096 "$FREE_FIRST" 1 "$case_dir/zero"
+	compare_blocks "$case_dir/image" "$JOURNAL_BLOCK_SIZE" \
+	    "$FREE_FIRST" 1 "$case_dir/zero"
 	verify_e2fsck "$case_dir/image"
 }
 
@@ -883,13 +916,13 @@ test_log_wraparound()
 {
 	case_dir=$work/log-wraparound
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 2
 	set -- $FREE_BLOCKS
 	first_target=$1
 	second_target=$2
-	make_payload "$case_dir/first" 4096 1 W
-	make_payload "$case_dir/second" 4096 1 P
+	make_payload "$case_dir/first" "$JOURNAL_BLOCK_SIZE" 1 W
+	make_payload "$case_dir/second" "$JOURNAL_BLOCK_SIZE" 1 P
 	{
 		printf 'journal_open\n'
 		printf 'journal_write -b %s %s\n' "$first_target" "$case_dir/first"
@@ -902,10 +935,13 @@ test_log_wraparound()
 		    "$case_dir/journal.$logical"
 	done
 	read_be32_journal "$case_dir/image" 0 16
-	maxlen=$JOURNAL_WORD
+	wrap_maxlen=$JOURNAL_WORD
 	read_be32_journal "$case_dir/image" 0 20
 	journal_first=$JOURNAL_WORD
-	wrap_start=$((maxlen - 3))
+	wrap_start=$((wrap_maxlen - 3))
+	printf 'maxlen=%s first=%s start=%s block_size=%s\n' \
+	    "$wrap_maxlen" "$journal_first" "$wrap_start" \
+	    "$JOURNAL_BLOCK_SIZE" >"$case_dir/parameters"
 	replace_journal_block "$case_dir/image" "$wrap_start" \
 	    "$case_dir/journal.1"
 	replace_journal_block "$case_dir/image" $((wrap_start + 1)) \
@@ -925,9 +961,11 @@ test_log_wraparound()
 		    "$case_dir/fsck.log" ||
 		    fail "journal did not start at wrap boundary"
 	fi
-	compare_blocks "$case_dir/image" 4096 "$first_target" 1 \
+	compare_blocks "$case_dir/image" "$JOURNAL_BLOCK_SIZE" \
+	    "$first_target" 1 \
 	    "$case_dir/first"
-	compare_blocks "$case_dir/image" 4096 "$second_target" 1 \
+	compare_blocks "$case_dir/image" "$JOURNAL_BLOCK_SIZE" \
+	    "$second_target" 1 \
 	    "$case_dir/second"
 	verify_e2fsck "$case_dir/image"
 }
@@ -936,13 +974,13 @@ test_sequence_wraparound()
 {
 	case_dir=$work/sequence-wraparound
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 2
 	set -- $FREE_BLOCKS
 	first_target=$1
 	second_target=$2
-	make_payload "$case_dir/first" 4096 1 S
-	make_payload "$case_dir/second" 4096 1 Q
+	make_payload "$case_dir/first" "$JOURNAL_BLOCK_SIZE" 1 S
+	make_payload "$case_dir/second" "$JOURNAL_BLOCK_SIZE" 1 Q
 	{
 		printf 'journal_open\n'
 		printf 'journal_write -b %s %s\n' "$first_target" "$case_dir/first"
@@ -960,9 +998,11 @@ test_sequence_wraparound()
 		grep -q 'end sequence 1 (2 transactions)' "$case_dir/fsck.log" ||
 		    fail "transaction sequence did not wrap through zero"
 	fi
-	compare_blocks "$case_dir/image" 4096 "$first_target" 1 \
+	compare_blocks "$case_dir/image" "$JOURNAL_BLOCK_SIZE" \
+	    "$first_target" 1 \
 	    "$case_dir/first"
-	compare_blocks "$case_dir/image" 4096 "$second_target" 1 \
+	compare_blocks "$case_dir/image" "$JOURNAL_BLOCK_SIZE" \
+	    "$second_target" 1 \
 	    "$case_dir/second"
 	verify_e2fsck "$case_dir/image"
 }
@@ -973,9 +1013,9 @@ test_malformed_tags()
 	mkdir "$root_dir"
 	case_dir=$root_dir/base
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 1
-	make_payload "$case_dir/payload" 4096 1 G
+	make_payload "$case_dir/payload" "$JOURNAL_BLOCK_SIZE" 1 G
 	{
 		printf 'journal_open\n'
 		printf 'journal_write -b %s %s\n' "$FREE_FIRST" \
@@ -1009,9 +1049,9 @@ test_checksum_failures()
 	mkdir "$root_dir"
 	case_dir=$root_dir/base
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 1
-	make_payload "$case_dir/payload" 4096 1 C
+	make_payload "$case_dir/payload" "$JOURNAL_BLOCK_SIZE" 1 C
 	{
 		printf 'journal_open -c -v 3\n'
 		printf 'journal_write -b %s %s\n' "$FREE_FIRST" \
@@ -1035,7 +1075,7 @@ test_checksum_failures()
 
 	case_dir=$root_dir/revoke-base
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 1
 	: >"$case_dir/empty"
 	{
@@ -1058,7 +1098,7 @@ test_malformed_revoke_lengths()
 	mkdir "$root_dir"
 	case_dir=$root_dir/base
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 1
 	: >"$case_dir/empty"
 	{
@@ -1083,9 +1123,9 @@ test_malformed_geometry()
 	mkdir "$root_dir"
 	case_dir=$root_dir/base
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 1
-	make_payload "$case_dir/payload" 4096 1 Y
+	make_payload "$case_dir/payload" "$JOURNAL_BLOCK_SIZE" 1 Y
 	{
 		printf 'journal_open\n'
 		printf 'journal_write -b %s %s\n' "$FREE_FIRST" \
@@ -1095,16 +1135,22 @@ test_malformed_geometry()
 	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
 	base_image=$case_dir/image
 	read_be32_journal "$base_image" 0 16
-	maxlen=$JOURNAL_WORD
+	geometry_maxlen=$JOURNAL_WORD
 	for mutation in block-size maxlen first start unsupported-feature uuid; do
 		case_dir=$root_dir/$mutation
 		mkdir "$case_dir"
 		cp "$base_image" "$case_dir/image"
 		case "$mutation" in
-		block-size)	write_be32_journal "$case_dir/image" 0 12 1024 ;;
+		block-size)
+			write_be32_journal "$case_dir/image" 0 12 \
+			    "$OTHER_BLOCK_SIZE"
+			;;
 		maxlen)	write_be32_journal "$case_dir/image" 0 16 4294967295 ;;
 		first)		write_be32_journal "$case_dir/image" 0 20 0 ;;
-		start)		write_be32_journal "$case_dir/image" 0 28 "$maxlen" ;;
+		start)
+			write_be32_journal "$case_dir/image" 0 28 \
+			    "$geometry_maxlen"
+			;;
 		unsupported-feature)
 			write_be32_journal "$case_dir/image" 0 40 2147483650
 			;;
@@ -1148,10 +1194,11 @@ test_structured_field_fuzz()
 	# A multi-tag, no-checksum descriptor reaches tag parsing directly.
 	case_dir=$root_dir/descriptor-base
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 8
 	descriptor_target=$FREE_FIRST
-	make_random_payload "$case_dir/payload" 4096 8
+	make_random_payload "$case_dir/payload" \
+	    "$JOURNAL_BLOCK_SIZE" 8
 	{
 		printf 'journal_open\n'
 		printf 'journal_write -b %s %s\n' "$FREE_RANGE" \
@@ -1196,11 +1243,13 @@ test_structured_field_fuzz()
 	case_dir=$root_dir/tag-count-too-small
 	mkdir "$case_dir"
 	cp "$descriptor_base" "$case_dir/image"
-	dd if="$descriptor_base" of="$case_dir/home-before" bs=4096 \
+	dd if="$descriptor_base" of="$case_dir/home-before" \
+	    bs="$JOURNAL_BLOCK_SIZE" \
 	    skip="$descriptor_target" count=8 status=none
 	write_be16_journal "$case_dir/image" 1 18 8
 	replay "$case_dir/image"
-	compare_blocks "$case_dir/image" 4096 "$descriptor_target" 8 \
+	compare_blocks "$case_dir/image" "$JOURNAL_BLOCK_SIZE" \
+	    "$descriptor_target" 8 \
 	    "$case_dir/home-before"
 	verify_e2fsck "$case_dir/image"
 
@@ -1210,14 +1259,16 @@ test_structured_field_fuzz()
 	case_dir=$root_dir/tag-count-too-large
 	mkdir "$case_dir"
 	cp "$descriptor_base" "$case_dir/image"
-	dd if="$descriptor_base" of="$case_dir/home-before" bs=4096 \
+	dd if="$descriptor_base" of="$case_dir/home-before" \
+	    bs="$JOURNAL_BLOCK_SIZE" \
 	    skip="$descriptor_target" count=8 status=none
 	write_be16_journal "$case_dir/image" 1 "$tag_final_flags" 2
 	write_be32_journal "$case_dir/image" 1 "$tag_extra_start" \
 	    "$descriptor_target"
 	write_be16_journal "$case_dir/image" 1 "$tag_extra_flags" 10
 	replay "$case_dir/image"
-	compare_blocks "$case_dir/image" 4096 "$descriptor_target" 8 \
+	compare_blocks "$case_dir/image" "$JOURNAL_BLOCK_SIZE" \
+	    "$descriptor_target" 8 \
 	    "$case_dir/home-before"
 	verify_e2fsck "$case_dir/image"
 
@@ -1225,7 +1276,7 @@ test_structured_field_fuzz()
 	# boundary values are invalid for both four- and eight-byte records.
 	case_dir=$root_dir/revoke-base
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 1
 	: >"$case_dir/empty"
 	{
@@ -1236,7 +1287,10 @@ test_structured_field_fuzz()
 	} >"$case_dir/debugfs.cmd"
 	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
 	revoke_base=$case_dir/image
-	for length in 0 1 12 15 17 18 19 21 22 23 25 4095 4097 4294967295; do
+	revoke_short=$((JOURNAL_BLOCK_SIZE - 1))
+	revoke_long=$((JOURNAL_BLOCK_SIZE + 1))
+	for length in 0 1 12 15 17 18 19 21 22 23 25 \
+	    "$revoke_short" "$revoke_long" 4294967295; do
 		fuzz_reject_word "$revoke_base" "$root_dir" \
 		    "revoke-length-$length" 1 32 12 "$length"
 	done
@@ -1256,7 +1310,7 @@ test_structured_field_fuzz()
 	super-magic-zero 0 0
 	super-type-v1 4 3
 	geometry-blocksize-zero 12 0
-	geometry-blocksize-small 12 1024
+	geometry-blocksize-mismatch 12 $OTHER_BLOCK_SIZE
 	geometry-blocksize-large 12 8192
 	geometry-maxlen-zero 16 0
 	geometry-maxlen-one 16 1
@@ -1283,12 +1337,7 @@ test_randomized_replay()
 	while [ "$iteration" -lt "$RANDOM_CASES" ]; do
 		case_dir=$root_dir/$iteration
 		mkdir "$case_dir"
-		random_number
-		case $((RANDOM_VALUE % 3)) in
-		0) block_size=1024 ;;
-		1) block_size=2048 ;;
-		2) block_size=4096 ;;
-		esac
+		block_size=$JOURNAL_BLOCK_SIZE
 		random_number
 		case $((RANDOM_VALUE % 3)) in
 		0) open_command=journal_open ;;
@@ -1332,9 +1381,10 @@ test_randomized_mutations()
 	mkdir "$root_dir"
 	case_dir=$root_dir/base
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 8
-	make_random_payload "$case_dir/payload" 4096 8
+	make_random_payload "$case_dir/payload" \
+	    "$JOURNAL_BLOCK_SIZE" 8
 	{
 		printf 'journal_open -c -v 3\n'
 		printf 'journal_write -b %s %s\n' "$FREE_RANGE" \
@@ -1355,8 +1405,9 @@ test_randomized_mutations()
 		esac
 		random_number
 		case "$logical" in
-		1|10)	within=$((12 + RANDOM_VALUE % (4096 - 12))) ;;
-		*)	within=$((RANDOM_VALUE % 4096)) ;;
+		1|10)	within=$((12 + RANDOM_VALUE % \
+		    (JOURNAL_BLOCK_SIZE - 12))) ;;
+		*)	within=$((RANDOM_VALUE % JOURNAL_BLOCK_SIZE)) ;;
 		esac
 		random_number
 		mask=$((1 << (RANDOM_VALUE % 8)))
@@ -1480,9 +1531,9 @@ test_read_only_device_recovery()
 	pending_image=$case_dir/pending.img
 	empty_image=$case_dir/empty.img
 	outer_image=$case_dir/outer.img
-	create_image "$pending_image" 4096
+	create_image "$pending_image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$pending_image" 1
-	make_payload "$case_dir/payload" 4096 1 W
+	make_payload "$case_dir/payload" "$JOURNAL_BLOCK_SIZE" 1 W
 	{
 		printf 'journal_open\n'
 		printf 'journal_write -b %s %s\n' "$FREE_FIRST" \
@@ -1494,14 +1545,16 @@ test_read_only_device_recovery()
 	# Model recovery after the journal was emptied but before RECOVER
 	# was cleared.  This state still requires device write access.
 	cp "$pending_image" "$empty_image"
-	dd if="$case_dir/payload" of="$empty_image" bs=4096 \
+	dd if="$case_dir/payload" of="$empty_image" \
+	    bs="$JOURNAL_BLOCK_SIZE" \
 	    seek="$FREE_FIRST" count=1 conv=notrunc status=none
 	mark_journal_clean "$empty_image"
 
 	dd if=/dev/zero of="$outer_image" bs=1m count=0 seek=192 \
 	    status=none
-	if ! "$MKE2FS" -q -F -t ext4 -b 4096 -O '^orphan_file' \
-	    "$outer_image" >"$case_dir/mke2fs-outer.log" 2>&1; then
+	if ! "$MKE2FS" -q -F -t ext4 -b "$JOURNAL_BLOCK_SIZE" \
+	    -O '^orphan_file' "$outer_image" \
+	    >"$case_dir/mke2fs-outer.log" 2>&1; then
 		cat "$case_dir/mke2fs-outer.log" >&2
 		fail "could not create outer filesystem"
 	fi
@@ -1574,7 +1627,7 @@ test_runtime_inode_transaction()
 {
 	case_dir=$work/runtime-inode-transaction
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	printf '%s\n' runtime-inode >"$case_dir/payload"
 	{
 		printf 'write %s /runtime-inode\n' "$case_dir/payload"
@@ -1621,11 +1674,14 @@ test_classic_orphan_recovery()
 {
 	case_dir=$work/classic-orphan-recovery
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
-	make_payload "$case_dir/kept-payload" 4096 3 T
-	make_payload "$case_dir/deleted-payload" 4096 2 D
-	dd if=/dev/zero bs=1000 count=1 status=none | tr '\000' X \
-	    >"$case_dir/xattr-value"
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
+	make_payload "$case_dir/kept-payload" \
+	    "$JOURNAL_BLOCK_SIZE" 3 T
+	make_payload "$case_dir/deleted-payload" \
+	    "$JOURNAL_BLOCK_SIZE" 2 D
+	xattr_size=$((JOURNAL_BLOCK_SIZE / 2))
+	dd if=/dev/zero bs="$xattr_size" count=1 status=none |
+	    tr '\000' X >"$case_dir/xattr-value"
 	{
 		printf 'write %s /kept\n' "$case_dir/kept-payload"
 		printf 'write %s /deleted\n' "$case_dir/deleted-payload"
@@ -1649,7 +1705,8 @@ test_classic_orphan_recovery()
 		printf 'unlink /deleted\n'
 		printf 'set_inode_field <%s> links_count 0\n' "$deleted_ino"
 		printf 'set_inode_field <%s> dtime 0\n' "$deleted_ino"
-		printf 'set_inode_field <%s> size 4096\n' "$kept_ino"
+		printf 'set_inode_field <%s> size %s\n' \
+		    "$kept_ino" "$JOURNAL_BLOCK_SIZE"
 		printf 'set_inode_field <%s> dtime %s\n' \
 		    "$kept_ino" "$deleted_ino"
 		printf 'set_super_value last_orphan %s\n' "$kept_ino"
@@ -1665,7 +1722,8 @@ test_classic_orphan_recovery()
 	set -- $("$DEBUGFS" -R "blocks <$kept_ino>" "$case_dir/image" \
 	    2>/dev/null)
 	[ "$#" -eq 1 ] || fail "linked classic orphan was not truncated"
-	dd if="$case_dir/kept-payload" of="$case_dir/expected" bs=4096 \
+	dd if="$case_dir/kept-payload" of="$case_dir/expected" \
+	    bs="$JOURNAL_BLOCK_SIZE" \
 	    count=1 status=none
 	if ! "$DEBUGFS" -R "dump /kept $case_dir/actual" \
 	    "$case_dir/image" >/dev/null 2>&1; then
@@ -1687,7 +1745,7 @@ make_orphan_file_fixture()
 {
 	off_image=$1
 	off_payload=$2
-	create_orphan_file_image "$off_image" 4096
+	create_orphan_file_image "$off_image" "$JOURNAL_BLOCK_SIZE"
 	printf 'write %s /deleted\n' "$off_payload" \
 	    >"$case_dir/debugfs.cmd"
 	run_debugfs "$off_image" "$case_dir/debugfs.cmd"
@@ -1717,7 +1775,8 @@ make_orphan_file_fixture()
 		printf 'set_inode_field <%s> dtime 0\n' "$ORPHAN_TARGET"
 	} >"$case_dir/debugfs.cmd"
 	run_debugfs "$off_image" "$case_dir/debugfs.cmd"
-	if ! "$ORPHAN_FIXTURE" "$off_image" 4096 "$ORPHAN_FILE_BLOCK" \
+	if ! "$ORPHAN_FIXTURE" "$off_image" \
+	    "$JOURNAL_BLOCK_SIZE" "$ORPHAN_FILE_BLOCK" \
 	    "$ORPHAN_FILE_SEED" "$ORPHAN_FILE_INO" "$ORPHAN_FILE_GEN" \
 	    "$ORPHAN_TARGET" >"$case_dir/orphan-fixture.log" 2>&1; then
 		cat "$case_dir/orphan-fixture.log" >&2
@@ -1734,7 +1793,7 @@ test_orphan_file_recovery()
 {
 	case_dir=$work/orphan-file-recovery
 	mkdir "$case_dir"
-	make_payload "$case_dir/payload" 4096 3 O
+	make_payload "$case_dir/payload" "$JOURNAL_BLOCK_SIZE" 3 O
 	make_orphan_file_fixture "$case_dir/image" "$case_dir/payload"
 	"$DEBUGFS" -R orphan_inodes "$case_dir/image" 2>&1 |
 	    grep -q "ino $ORPHAN_TARGET" ||
@@ -1755,10 +1814,11 @@ test_corrupt_orphan_file()
 {
 	case_dir=$work/corrupt-orphan-file
 	mkdir "$case_dir"
-	make_payload "$case_dir/payload" 4096 1 C
+	make_payload "$case_dir/payload" "$JOURNAL_BLOCK_SIZE" 1 C
 	make_orphan_file_fixture "$case_dir/image" "$case_dir/payload"
 	flip_image_byte "$case_dir/image" \
-	    $((ORPHAN_FILE_BLOCK * 4096 + 4095)) 1
+	    $((ORPHAN_FILE_BLOCK * JOURNAL_BLOCK_SIZE + \
+	    JOURNAL_BLOCK_SIZE - 1)) 1
 	read_le32_image "$case_dir/image" $((1024 + 100))
 	[ $((IMAGE_WORD & 65536)) -ne 0 ] ||
 	    fail "corrupt fixture does not have ORPHAN_PRESENT set"
@@ -1772,9 +1832,11 @@ test_corrupt_classic_orphans()
 {
 	case_dir=$work/corrupt-classic-orphans
 	mkdir "$case_dir"
-	create_image "$case_dir/image" 4096
-	make_payload "$case_dir/first-payload" 4096 1 A
-	make_payload "$case_dir/second-payload" 4096 1 B
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
+	make_payload "$case_dir/first-payload" \
+	    "$JOURNAL_BLOCK_SIZE" 1 A
+	make_payload "$case_dir/second-payload" \
+	    "$JOURNAL_BLOCK_SIZE" 1 B
 	{
 		printf 'write %s /first\n' "$case_dir/first-payload"
 		printf 'write %s /second\n' "$case_dir/second-payload"
@@ -1803,9 +1865,9 @@ test_kernel_mount_corruption()
 	root_dir=$work/kernel-mount-corruption
 	case_dir=$root_dir/base
 	mkdir -p "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 1
-	make_payload "$case_dir/payload" 4096 1 K
+	make_payload "$case_dir/payload" "$JOURNAL_BLOCK_SIZE" 1 K
 	{
 		printf 'journal_open -c -v 3\n'
 		printf 'journal_write -b %s %s\n' "$FREE_FIRST" \
@@ -1842,7 +1904,8 @@ test_kernel_mount_corruption()
 	[ $((IMAGE_WORD & 4)) -eq 0 ] ||
 	    fail "valid kernel replay did not clear RECOVER"
 	case_dir=$root_dir
-	compare_blocks "$root_dir/valid.img" 4096 "$FREE_FIRST" 1 \
+	compare_blocks "$root_dir/valid.img" "$JOURNAL_BLOCK_SIZE" \
+	    "$FREE_FIRST" 1 \
 	    "$root_dir/base/payload"
 	verify_e2fsck "$root_dir/valid.img"
 
@@ -1870,10 +1933,11 @@ test_recovery_boundary_states()
 	root_dir=$work/recovery-boundary-states
 	case_dir=$root_dir/base
 	mkdir -p "$case_dir"
-	create_image "$case_dir/image" 4096
+	create_image "$case_dir/image" "$JOURNAL_BLOCK_SIZE"
 	find_free_blocks "$case_dir/image" 3
 	target=$FREE_FIRST
-	make_random_payload "$case_dir/payload" 4096 3
+	make_random_payload "$case_dir/payload" \
+	    "$JOURNAL_BLOCK_SIZE" 3
 	{
 		printf 'journal_open\n'
 		printf 'journal_write -b %s %s\n' "$FREE_RANGE" \
@@ -1885,9 +1949,11 @@ test_recovery_boundary_states()
 	cp "$case_dir/image" "$root_dir/partial-home-replay.img"
 	cp "$case_dir/image" "$root_dir/after-home-flush.img"
 	dd if="$case_dir/payload" of="$root_dir/partial-home-replay.img" \
-	    bs=4096 seek="$target" count=1 conv=notrunc status=none
+	    bs="$JOURNAL_BLOCK_SIZE" seek="$target" count=1 \
+	    conv=notrunc status=none
 	dd if="$case_dir/payload" of="$root_dir/after-home-flush.img" \
-	    bs=4096 seek="$target" count=3 conv=notrunc status=none
+	    bs="$JOURNAL_BLOCK_SIZE" seek="$target" count=3 \
+	    conv=notrunc status=none
 	cp "$root_dir/after-home-flush.img" \
 	    "$root_dir/after-journal-flush.img"
 	mark_journal_clean "$root_dir/after-journal-flush.img"
@@ -1922,13 +1988,15 @@ test_recovery_boundary_states()
 		read_le32_image "$case_dir/image" "$feature_offset"
 		[ $((IMAGE_WORD & 4)) -eq 0 ] ||
 		    fail "$state retry did not clear RECOVER"
-		compare_blocks "$case_dir/image" 4096 "$target" 3 \
+		compare_blocks "$case_dir/image" \
+		    "$JOURNAL_BLOCK_SIZE" "$target" 3 \
 		    "$root_dir/base/payload"
 		verify_e2fsck "$case_dir/image"
 
 		# A second mount must preserve the completed recovery state.
 		kernel_mount_image "$case_dir/image"
-		compare_blocks "$case_dir/image" 4096 "$target" 3 \
+		compare_blocks "$case_dir/image" \
+		    "$JOURNAL_BLOCK_SIZE" "$target" 3 \
 		    "$root_dir/base/payload"
 		verify_e2fsck "$case_dir/image"
 	done
@@ -1964,7 +2032,7 @@ if [ "$JOURNAL_TEST_MODE" = all ]; then
 	run_test 'bad data checksum is non-mutating' test_bad_data_checksum
 	run_test 'incomplete transaction is non-mutating' test_incomplete_transaction
 	run_test 'validation precedes every home write' test_validation_atomicity
-	run_test '1K, 2K, and 4K filesystem blocks' test_block_sizes
+	run_test 'selected filesystem block size' test_block_sizes
 	run_test 'malformed descriptor tags and sequences' test_malformed_tags
 	run_test 'all journal checksum failure points' test_checksum_failures
 	run_test 'malformed revoke lengths' test_malformed_revoke_lengths
@@ -1999,7 +2067,8 @@ else
 	    test_incomplete_transaction
 	run_test 'kernel: validation precedes every home write' \
 	    test_validation_atomicity
-	run_test 'kernel: filesystem block sizes' test_block_sizes
+	run_test 'kernel: selected filesystem block size' \
+	    test_block_sizes
 	run_test 'kernel: malformed descriptor tags and sequences' \
 	    test_malformed_tags
 	run_test 'kernel: all journal checksum failure points' \

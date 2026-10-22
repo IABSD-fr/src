@@ -740,8 +740,7 @@ ext4fs_block_bitmap_csum_verify (struct m_ext4fs *fs, u_int32_t group,
 	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM))
 		return (0);
 	provided = letoh16(gd->bgd_block_bitmap_checksum_lo);
-	calculated = ext4fs_bitmap_csum(fs, group, bitmap,
-	    fs->m_block_size);
+	calculated = ext4fs_block_bitmap_csum(fs, group, bitmap);
 	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
 		provided |= (u_int32_t)
 		    letoh16(gd->bgd_block_bitmap_checksum_hi) << 16;
@@ -886,8 +885,7 @@ ext4fs_blkalloc_direct (struct inode *ip, u_int64_t goal,
 					gd->bgd_flags = htole16(
 					    letoh16(gd->bgd_flags) &
 					    ~uninit);
-				bcsum = ext4fs_bitmap_csum(fs, g, bbp,
-				    fs->m_block_size);
+				bcsum = ext4fs_block_bitmap_csum(fs, g, bbp);
 				gd->bgd_block_bitmap_checksum_lo =
 				    htole16(bcsum & 0xFFFF);
 				if (fs->m_feature_incompat &
@@ -1095,8 +1093,8 @@ ext4fs_blkalloc_handle (struct inode *ip,
 		if (uninit)
 			gd->bgd_flags = htole16(letoh16(gd->bgd_flags) &
 			    ~EXT4FS_BGD_FLAG_BLOCK_UNINIT);
-		bitmap_csum = ext4fs_bitmap_csum(fs, g, bp->b_data,
-		    fs->m_block_size);
+		bitmap_csum = ext4fs_block_bitmap_csum(fs, g,
+		    bp->b_data);
 		gd->bgd_block_bitmap_checksum_lo =
 		    htole16(bitmap_csum & 0xffff);
 		if (fs->m_feature_incompat &
@@ -1236,8 +1234,9 @@ ext4fs_blkfree_direct (struct inode *ip, u_int64_t bno)
 
 	/* Update block bitmap checksum in BGD */
 	{
-		u_int32_t bcsum = ext4fs_bitmap_csum(fs, group, bbp,
-		    fs->m_block_size);
+		u_int32_t bcsum;
+
+		bcsum = ext4fs_block_bitmap_csum(fs, group, bbp);
 		gd->bgd_block_bitmap_checksum_lo =
 		    htole16(bcsum & 0xFFFF);
 		if (fs->m_feature_incompat &
@@ -1359,8 +1358,8 @@ ext4fs_blkfree_range_handle (struct inode *ip,
 
 	for (k = 0; k < count; k++)
 		clrbit((u_int8_t *)bp->b_data, bit + k);
-	bitmap_csum = ext4fs_bitmap_csum(fs, group, bp->b_data,
-	    fs->m_block_size);
+	bitmap_csum = ext4fs_block_bitmap_csum(fs, group,
+	    bp->b_data);
 	gd->bgd_block_bitmap_checksum_lo =
 	    htole16(bitmap_csum & 0xffff);
 	if (fs->m_feature_incompat & EXT4FS_FEATURE_INCOMPAT_64BIT)
@@ -2328,8 +2327,8 @@ ext4fs_free_extents_direct (struct inode *ip,
 			{
 				u_int32_t bcsum;
 
-				bcsum = ext4fs_bitmap_csum(fs, group,
-				    bbp->b_data, fs->m_block_size);
+				bcsum = ext4fs_block_bitmap_csum(fs,
+				    group, bbp->b_data);
 				gd->bgd_block_bitmap_checksum_lo =
 				    htole16(bcsum & 0xFFFF);
 				if (fs->m_feature_incompat &
