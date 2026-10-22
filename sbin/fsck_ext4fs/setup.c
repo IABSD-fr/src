@@ -57,7 +57,6 @@ void badsb(int, char *);
 static struct disklabel *getdisklabel(char *, int);
 static int readsb(int);
 static int load_group_descriptors(int, int);
-static void copyback_sb(void);
 static char rdevname[PATH_MAX];
 
 static int
@@ -193,6 +192,9 @@ setup(char *dev)
 		secsize = lp->d_secsize;
 	else
 		secsize = DEV_BSIZE;
+	if (secsize < DEV_BSIZE || secsize > MAXBSIZE ||
+	    secsize % DEV_BSIZE != 0)
+		errexit("invalid device sector size: %ld\n", secsize);
 
 	if (!hotroot()) {
 #ifndef SMALL
@@ -434,12 +436,6 @@ readsb(int listerr)
 
 	havesb = 1;
 	return (1);
-}
-
-static void
-copyback_sb(void)
-{
-	memcpy(sblk.b_un.b_buf, &sblock.m_sble, sizeof(struct ext4fs));
 }
 
 void

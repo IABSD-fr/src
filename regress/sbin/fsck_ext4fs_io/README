@@ -1,0 +1,30 @@
+fsck_ext4fs device-sector I/O regressions
+
+run-regress-io builds the production io.c with strict pread/pwrite
+substitutes.  They reject unaligned offsets and lengths, inject errors,
+short transfers and EINTR, and verify buffer bounds and preservation of
+neighboring bytes.  Sector sizes range from 512 through 8192 bytes.
+
+run-regress-images checks disposable 4K-block ext4 images without root.
+It exercises full fsck, journal replay, and an empty journal with
+RECOVER still set.  It checks read-only behavior, surrounding superblock
+bytes, repaired free counts, replayed data, clean flags, and e2fsck.
+
+run-regress-sector-size requires root.  It runs the same fixtures
+through raw virtual disks with 512, 1024, 2048 and 4096-byte sectors.
+Recovery uses preen mode, as during boot.  No filesystem is mounted and
+no existing disk or on-disk disklabel is modified.  vnd permits some
+sub-sector requests, so the strict unit substitutes also remain needed.
+
+The default regress target includes all three, with the virtual-disk
+target declared in REGRESS_ROOT_TARGETS.  regress/run-ext4fs.sh includes
+this directory and builds in an executable temporary directory.
+
+To run just these tests with an executable object directory:
+
+    obj=$(mktemp -d /tmp/fsck_ext4fs_io_obj.XXXXXXXX)
+    MAKEOBJDIR="$obj" make -C /usr/src/regress/sbin/fsck_ext4fs_io
+
+The script builds fsck_ext4fs in its own temporary directory.  Override
+FSCK_EXT4FS to test a specific binary.  KEEP_TMP=1 retains fixtures;
+failures always retain them.  Unprivileged runs skip the device target.

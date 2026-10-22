@@ -33,6 +33,7 @@
 #include "fsck.h"
 #include "extern.h"
 #include "fsutil.h"
+#include "io.h"
 
 #include <ufs/ext4fs/ext4fs_journal.h>
 
@@ -68,22 +69,23 @@ jread(u_int64_t fsblock, char *buf, long size)
 	    fsblock > (u_int64_t)LLONG_MAX / sblock.m_block_size)
 		return (EINVAL);
 	offset = (off_t)(fsblock * sblock.m_block_size);
-	if (pread(fsreadfd, buf, size, offset) != size)
-		return (errno ? errno : EIO);
-	return (0);
+	return (fsck_io_read(fsreadfd, buf, size, offset, secsize));
 }
 
 static int
 jwrite(u_int64_t fsblock, char *buf, long size)
 {
 	off_t offset;
+	int error;
 
 	if (fsblock >= sblock.m_blocks_count ||
 	    fsblock > (u_int64_t)LLONG_MAX / sblock.m_block_size)
 		return (EINVAL);
 	offset = (off_t)(fsblock * sblock.m_block_size);
-	if (pwrite(fswritefd, buf, size, offset) != size)
-		return (errno ? errno : EIO);
+	error = fsck_io_write(fsreadfd, fswritefd, buf, size, offset,
+	    secsize);
+	if (error)
+		return (error);
 	fsmodified = 1;
 	return (0);
 }
@@ -1002,10 +1004,12 @@ jbd2_recovered_super_check(void)
 	struct ext4fs *sble;
 	char buf[EXT4FS_SUPER_BLOCK_SIZE];
 	u_int32_t incompat, ro_compat;
+	int error;
 
-	if (pread(fsreadfd, buf, sizeof(buf), EXT4FS_SUPER_BLOCK_OFFSET) !=
-	    sizeof(buf))
-		return (errno ? errno : EIO);
+	error = fsck_io_read(fsreadfd, buf, sizeof(buf),
+	    EXT4FS_SUPER_BLOCK_OFFSET, secsize);
+	if (error)
+		return (error);
 	sble = (struct ext4fs *)buf;
 	if (letoh16(sble->sb_magic) != EXT4FS_MAGIC ||
 	    memcmp(sble->sb_uuid, sblock.m_sble.sb_uuid,
@@ -1365,9 +1369,10 @@ clear_recover:
 			error = ENOMEM;
 			goto out;
 		}
-		if (pread(fsreadfd, sbbuf, EXT4FS_SUPER_BLOCK_SIZE,
-		    EXT4FS_SUPER_BLOCK_OFFSET) != EXT4FS_SUPER_BLOCK_SIZE) {
-			error = errno ? errno : EIO;
+		error = fsck_io_read(fsreadfd, sbbuf,
+		    EXT4FS_SUPER_BLOCK_SIZE, EXT4FS_SUPER_BLOCK_OFFSET,
+		    secsize);
+		if (error) {
 			free(sbbuf);
 			goto out;
 		}
@@ -1388,9 +1393,10 @@ clear_recover:
 			state |= EXT4FS_STATE_VALID;
 		sble->sb_state = htole16(state);
 		sble->sb_checksum = htole32(ext4fs_sb_csum(sble));
-		if (pwrite(fswritefd, sbbuf, EXT4FS_SUPER_BLOCK_SIZE,
-		    EXT4FS_SUPER_BLOCK_OFFSET) != EXT4FS_SUPER_BLOCK_SIZE) {
-			error = errno ? errno : EIO;
+		error = fsck_io_write(fsreadfd, fswritefd, sbbuf,
+		    EXT4FS_SUPER_BLOCK_SIZE, EXT4FS_SUPER_BLOCK_OFFSET,
+		    secsize);
+		if (error) {
 			free(sbbuf);
 			goto out;
 		}

@@ -96,8 +96,8 @@ run_target()
 	    "$MAKE" -C "$regress_root/$directory" "$target"
 }
 
-for directory in sys/ext4fs sbin/fsck_ext4fs sys/ext4fsops \
-    sys/ext4fs_corrupt sys/ext4fs_crash; do
+for directory in sys/ext4fs sbin/fsck_ext4fs_io sbin/fsck_ext4fs \
+    sys/ext4fsops sys/ext4fs_corrupt sys/ext4fs_crash; do
 	run_directory "$directory"
 done
 

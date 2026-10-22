@@ -39,14 +39,17 @@
 #include <ctype.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
 
 #include "fsutil.h"
 #include "fsck.h"
 #include "extern.h"
+#include "io.h"
 
 long	diskreads, totalreads;
 
-static void rwerror(char *, u_int64_t);
+static void	copyback_sb (void);
+static void	rwerror (char *, u_int64_t, int);
 
 int
 ftypeok(struct ext4fs_dinode *dp)
@@ -180,8 +183,26 @@ getblk(struct bufarea *bp, u_int64_t blk, long size)
 	}
 }
 
+/* Serialize repaired values before writing the superblock buffer. */
+static void
+copyback_sb (void)
+{
+	struct ext4fs *fs = &sblock.m_sble;
+
+	fs->sb_free_blocks_count_lo =
+	    htole32((u_int32_t)sblock.m_free_blocks_count);
+	fs->sb_free_blocks_count_hi =
+	    htole32((u_int32_t)(sblock.m_free_blocks_count >> 32));
+	fs->sb_free_inodes_count = htole32(sblock.m_free_inodes_count);
+	fs->sb_state = htole16(sblock.m_state);
+	if (sblock.m_feature_ro_compat &
+	    EXT4FS_FEATURE_RO_COMPAT_METADATA_CSUM)
+		fs->sb_checksum = htole32(ext4fs_sb_csum(fs));
+	memcpy(sblk.b_un.b_buf, fs, sizeof(*fs));
+}
+
 void
-flush(int fd, struct bufarea *bp)
+flush (int fd, struct bufarea *bp)
 {
 	int i;
 
@@ -193,6 +214,8 @@ flush(int fd, struct bufarea *bp)
 		    (unsigned long long)bp->b_bno);
 	bp->b_dirty = 0;
 	bp->b_errs = 0;
+	if (bp == &sblk)
+		copyback_sb();
 	bwrite(fd, bp->b_un.b_buf, bp->b_bno, (long)bp->b_size);
 	if (bp != &sblk)
 		return;
@@ -206,11 +229,12 @@ flush(int fd, struct bufarea *bp)
 }
 
 static void
-rwerror(char *mesg, u_int64_t blk)
+rwerror (char *mesg, u_int64_t blk, int error)
 {
 	if (preen == 0)
 		printf("\n");
-	pfatal("CANNOT %s: BLK %llu", mesg, (unsigned long long)blk);
+	pfatal("CANNOT %s: BLK %llu: %s", mesg,
+	    (unsigned long long)blk, strerror(error));
 	if (reply("CONTINUE") == 0)
 		errexit("Program terminated\n");
 }
@@ -250,7 +274,6 @@ ckfini(int markclean)
 		if (markclean) {
 			sblock.m_state |= EXT4FS_STATE_VALID;
 			sblock.m_state &= ~EXT4FS_STATE_ERROR;
-			sblock.m_sble.sb_state = htole16(sblock.m_state);
 			sbdirty();
 			flush(fswritefd, &sblk);
 		}
@@ -263,29 +286,38 @@ ckfini(int markclean)
 }
 
 int
-bread(int fd, char *buf, u_int64_t blk, long size)
+bread (int fd, char *buf, u_int64_t blk, long size)
 {
-	char *cp;
-	int i, errs;
+	size_t done, chunk;
+	int error, errs;
 	off_t offset;
 
-	offset = blk;
-	offset *= DEV_BSIZE;
-	if (pread(fd, buf, size, offset) == size)
+	if (size <= 0 || blk > (u_int64_t)LLONG_MAX / DEV_BSIZE ||
+	    (u_int64_t)size > LLONG_MAX - blk * DEV_BSIZE)
+		errexit("invalid read range at block %llu\n",
+		    (unsigned long long)blk);
+	offset = (off_t)(blk * DEV_BSIZE);
+	error = fsck_io_read(fd, buf, size, offset, secsize);
+	if (error == 0)
 		return (0);
-	rwerror("READ", blk);
+	rwerror("READ", blk, error);
 	errs = 0;
 	memset(buf, 0, (size_t)size);
 	printf("THE FOLLOWING DISK SECTORS COULD NOT BE READ:");
-	for (cp = buf, i = 0; i < size; i += secsize, cp += secsize) {
-		if (pread(fd, cp, secsize, offset + i) != secsize) {
+	for (done = 0; done < (size_t)size; done += chunk) {
+		chunk = MIN((size_t)size - done,
+		    secsize - (offset + done) % secsize);
+		error = fsck_io_read(fd, buf + done, chunk,
+		    offset + done, secsize);
+		if (error) {
+			memset(buf + done, 0, chunk);
 			if (secsize != DEV_BSIZE)
 				printf(" %lld (%lld),",
-				    (long long)(offset + i) / secsize,
-				    (long long)blk + i / DEV_BSIZE);
+				    (long long)(offset + done) / secsize,
+				    (long long)(blk + done / DEV_BSIZE));
 			else
-				printf(" %lld,", (long long)blk +
-				    i / DEV_BSIZE);
+				printf(" %lld,",
+				    (long long)(blk + done / DEV_BSIZE));
 			errs++;
 		}
 	}
@@ -294,32 +326,42 @@ bread(int fd, char *buf, u_int64_t blk, long size)
 }
 
 void
-bwrite(int fd, char *buf, u_int64_t blk, long size)
+bwrite (int fd, char *buf, u_int64_t blk, long size)
 {
-	int i;
-	char *cp;
+	size_t done, chunk;
+	int error;
 	off_t offset;
 
 	if (fd < 0)
 		return;
-	offset = blk;
-	offset *= DEV_BSIZE;
-	if (pwrite(fd, buf, size, offset) == size) {
+	if (size <= 0 || blk > (u_int64_t)LLONG_MAX / DEV_BSIZE ||
+	    (u_int64_t)size > LLONG_MAX - blk * DEV_BSIZE)
+		errexit("invalid write range at block %llu\n",
+		    (unsigned long long)blk);
+	offset = (off_t)(blk * DEV_BSIZE);
+	error = fsck_io_write(fsreadfd, fd, buf, size, offset, secsize);
+	if (error == 0) {
 		fsmodified = 1;
 		return;
 	}
-	rwerror("WRITE", blk);
+	rwerror("WRITE", blk, error);
 	printf("THE FOLLOWING SECTORS COULD NOT BE WRITTEN:");
-	for (cp = buf, i = 0; i < size; i += secsize, cp += secsize)
-		if (pwrite(fd, cp, secsize, offset + i) != secsize) {
+	for (done = 0; done < (size_t)size; done += chunk) {
+		chunk = MIN((size_t)size - done,
+		    secsize - (offset + done) % secsize);
+		error = fsck_io_write(fsreadfd, fd, buf + done, chunk,
+		    offset + done, secsize);
+		if (error) {
 			if (secsize != DEV_BSIZE)
 				printf(" %lld (%lld),",
-				    (long long)(offset + i) / secsize,
-				    (long long)blk + i / DEV_BSIZE);
+				    (long long)(offset + done) / secsize,
+				    (long long)(blk + done / DEV_BSIZE));
 			else
-				printf(" %lld,", (long long)blk +
-				    i / DEV_BSIZE);
-		}
+				printf(" %lld,",
+				    (long long)(blk + done / DEV_BSIZE));
+		} else
+			fsmodified = 1;
+	}
 	printf("\n");
 	return;
 }
