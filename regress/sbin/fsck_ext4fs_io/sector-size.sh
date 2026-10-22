@@ -6,7 +6,6 @@
 
 set -eu
 
-MAKE=${MAKE:-make}
 MKE2FS=${MKE2FS:-mke2fs}
 DEBUGFS=${DEBUGFS:-debugfs}
 E2FSCK=${E2FSCK:-e2fsck}
@@ -28,6 +27,14 @@ device)	sectors='512 1024 2048 4096'
 	;;
 esac
 
+script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
+srcroot=$(CDPATH= cd "$script_dir/../../.." && pwd)
+FSCK_EXT4FS=${FSCK_EXT4FS:-$srcroot/sbin/fsck_ext4fs/obj/fsck_ext4fs}
+if [ ! -f "$FSCK_EXT4FS" ] || [ ! -x "$FSCK_EXT4FS" ]; then
+	echo "fsck_ext4fs missing or not executable: $FSCK_EXT4FS" >&2
+	exit 1
+fi
+
 for tool in "$MKE2FS" "$DEBUGFS" "$E2FSCK" "$TIMEOUT" \
     sha256 dd tr cmp awk sed od grep; do
 	command -v "$tool" >/dev/null 2>&1 || {
@@ -38,7 +45,7 @@ done
 
 work=$(mktemp -d /tmp/fsck_ext4fs_io.XXXXXXXX)
 vnd=
-test_name=build
+test_name=setup
 
 fail()
 {
@@ -65,18 +72,6 @@ cleanup()
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
-
-script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
-srcroot=$(CDPATH= cd "$script_dir/../../.." && pwd)
-if [ -z "${FSCK_EXT4FS:-}" ]; then
-	mkdir "$work/obj"
-	if ! MAKEOBJDIR="$work/obj" "$MAKE" -s \
-	    -C "$srcroot/sbin/fsck_ext4fs" >"$work/build.log" 2>&1; then
-		cat "$work/build.log" >&2
-		fail 'could not build fsck_ext4fs'
-	fi
-	FSCK_EXT4FS=$work/obj/fsck_ext4fs
-fi
 
 read_flags()
 {

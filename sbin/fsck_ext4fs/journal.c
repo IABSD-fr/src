@@ -91,21 +91,38 @@ jwrite(u_int64_t fsblock, char *buf, long size)
 }
 
 static int
-fsck_jbd2_flush_device(void)
+fsck_jbd2_flush_device (const char *stage)
 {
 	struct stat st;
-	int force;
+	const char *operation;
+	int error, force;
 
+	operation = "fsync";
 	if (fsync(fswritefd) == -1)
-		return (errno);
+		goto fail;
+	operation = "fstat";
 	if (fstat(fswritefd, &st) == -1)
-		return (errno);
+		goto fail;
 	if (S_ISREG(st.st_mode))
 		return (0);
 	force = 1;
-	if (ioctl(fswritefd, DIOCCACHESYNC, &force) == -1)
-		return (errno);
+	operation = "DIOCCACHESYNC";
+	if (ioctl(fswritefd, DIOCCACHESYNC, &force) == -1) {
+		/*
+		 * Match kernel recovery: virtual devices may lack
+		 * a separate cache synchronization operation.
+		 */
+		if (errno == ENOTTY || errno == EOPNOTSUPP)
+			return (0);
+		goto fail;
+	}
 	return (0);
+
+fail:
+	error = errno;
+	fprintf(stderr, "%s: %s failed during %s: %s (error %d)\n",
+	    cdevname(), operation, stage, strerror(error), error);
+	return (error);
 }
 
 static int
@@ -1332,7 +1349,7 @@ fsck_journal_replay(int apply)
 	error = jbd2_pass_replay(&ctx, buf, 1);
 	if (error)
 		goto out;
-	error = fsck_jbd2_flush_device();
+	error = fsck_jbd2_flush_device("home-block replay");
 	if (error)
 		goto out;
 	error = jbd2_recovered_super_check();
@@ -1353,7 +1370,7 @@ clear:
 	error = jwrite(jblock0, buf, ctx.blocksize);
 	if (error)
 		goto out;
-	error = fsck_jbd2_flush_device();
+	error = fsck_jbd2_flush_device("journal clearing");
 	if (error)
 		goto out;
 
@@ -1402,7 +1419,7 @@ clear_recover:
 		}
 		fsmodified = 1;
 		free(sbbuf);
-		error = fsck_jbd2_flush_device();
+		error = fsck_jbd2_flush_device("RECOVER clearing");
 		if (error)
 			goto out;
 	}

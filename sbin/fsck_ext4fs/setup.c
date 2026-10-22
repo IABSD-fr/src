@@ -145,7 +145,7 @@ setup(char *dev)
 	struct disklabel *lp;
 	struct stat statb;
 	char *realdev;
-	int doskipclean, needs_recovery;
+	int doskipclean, error, needs_recovery;
 
 	havesb = 0;
 	fswritefd = -1;
@@ -247,8 +247,10 @@ setup(char *dev)
 			    "IS NOT SUPPORTED\n");
 			goto badsblabel;
 		}
-		if (fsck_journal_replay(fswritefd >= 0) != 0) {
-			pfatal("JOURNAL REPLAY FAILED\n");
+		error = fsck_journal_replay(fswritefd >= 0);
+		if (error != 0) {
+			pfatal("JOURNAL REPLAY FAILED: %s (error %d)\n",
+			    strerror(error), error);
 			goto badsblabel;
 		}
 		free(sblock.m_gd);

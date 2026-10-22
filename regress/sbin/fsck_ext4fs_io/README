@@ -15,16 +15,22 @@ through raw virtual disks with 512, 1024, 2048 and 4096-byte sectors.
 Recovery uses preen mode, as during boot.  No filesystem is mounted and
 no existing disk or on-disk disklabel is modified.  vnd permits some
 sub-sector requests, so the strict unit substitutes also remain needed.
+vnd uses synchronous backing-file I/O and has no DIOCCACHESYNC ioctl.
+The recovery cases also check that fsck accepts this unsupported
+operation, as kernel recovery does, instead of failing after replay.
 
 The default regress target includes all three, with the virtual-disk
 target declared in REGRESS_ROOT_TARGETS.  regress/run-ext4fs.sh includes
 this directory and builds in an executable temporary directory.
+Only regression helpers are built there, not fsck_ext4fs.
 
 To run just these tests with an executable object directory:
 
     obj=$(mktemp -d /tmp/fsck_ext4fs_io_obj.XXXXXXXX)
     MAKEOBJDIR="$obj" make -C /usr/src/regress/sbin/fsck_ext4fs_io
 
-The script builds fsck_ext4fs in its own temporary directory.  Override
-FSCK_EXT4FS to test a specific binary.  KEEP_TMP=1 retains fixtures;
-failures always retain them.  Unprivileged runs skip the device target.
+The scripts test sbin/fsck_ext4fs/obj/fsck_ext4fs without rebuilding or
+installing it.  A missing or non-executable binary is an error, not a
+request to build a replacement.  Override FSCK_EXT4FS to select another
+existing binary.  KEEP_TMP=1 retains fixtures; failures always retain
+them.  Unprivileged runs skip the device target.

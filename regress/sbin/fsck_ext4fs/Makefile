@@ -8,6 +8,7 @@ JOURNAL_BLOCK_SIZES?=	1024 2048 4096
 RANDOM_CASES?=	6
 MUTATION_CASES?=	18
 FSCK_TIMEOUT?=	20
+FSCK_EXT4FS?=	${.CURDIR}/../../../sbin/fsck_ext4fs/obj/fsck_ext4fs
 
 run-regress-journal:
 	@set -e; block_sizes='${JOURNAL_BLOCK_SIZES}'; \
@@ -16,7 +17,8 @@ run-regress-journal:
 		exit 1; \
 	}; \
 	for block_size in $$block_sizes; do \
-		env MAKE='${MAKE}' JOURNAL_SEED='${JOURNAL_SEED}' \
+		env FSCK_EXT4FS='${FSCK_EXT4FS}' \
+		    JOURNAL_SEED='${JOURNAL_SEED}' \
 		    JOURNAL_BLOCK_SIZE="$$block_size" \
 		    RANDOM_CASES='${RANDOM_CASES}' \
 		    MUTATION_CASES='${MUTATION_CASES}' \
