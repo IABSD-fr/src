@@ -8,7 +8,7 @@ S=	${CURDIR}/../../../..
 # Override normal settings
 #
 
-CLEANFILES=	machine ffs.fth.h \
+CLEANFILES=	machine ffs.fth.h ffs.fth.h.tmp \
 		bootblk bootblk.text bootblk.text.tmp -.d
 
 NOMAN=
@@ -24,30 +24,33 @@ CPPFLAGS=	${INCLUDES} ${IDENT} ${PARAM}
 	@([ -h machine ] || ln -s ${.CURDIR}/../../include machine)
 .endif
 
-all: bootblk.text bootblk
+all: ${.OBJDIR}/bootblk.text ${.OBJDIR}/bootblk
 
-ffs.fth.h: ${.CURDIR}/genassym.sh genfth.cf
+${.OBJDIR}/ffs.fth.h: ${.CURDIR}/genassym.sh \
+	${.CURDIR}/genfth.cf
 	sh ${.CURDIR}/genassym.sh -f ${CC} ${CFLAGS} ${CPPFLAGS} ${PROF} \
-		< ${.CURDIR}/genfth.cf >ffs.fth.h.tmp && \
-		mv -f ffs.fth.h.tmp ffs.fth.h
+		< ${.CURDIR}/genfth.cf >${.TARGET}.tmp && \
+		mv -f ${.TARGET}.tmp ${.TARGET}
 
-bootblk.text: bootblk.fth ffs.fth.h
+${.OBJDIR}/bootblk.text: ${.CURDIR}/bootblk.fth \
+	${.OBJDIR}/ffs.fth.h
 	awk '/fload/ { print "#include \"" $$2 "\"" }; !/fload/' \
-	    ${.CURDIR}/bootblk.fth | /usr/bin/cpp -P > bootblk.text.tmp && \
-	    mv -f bootblk.text.tmp bootblk.text
+	    ${.CURDIR}/bootblk.fth | /usr/bin/cpp -P \
+	    -I${.OBJDIR} > ${.TARGET}.tmp && \
+	    mv -f ${.TARGET}.tmp ${.TARGET}
 
-bootblk: bootblk.fth ffs.fth.h
-	fgen -o bootblk ${.CURDIR}/bootblk.fth
+${.OBJDIR}/bootblk: ${.OBJDIR}/bootblk.text
+	fgen -o ${.TARGET} ${.ALLSRC}
 
-beforeinstall:
+beforeinstall: ${.OBJDIR}/bootblk
 	${INSTALL} ${INSTALL_COPY} -o ${BINOWN} -g ${BINGRP} -m ${BINMODE} \
-	    bootblk ${DESTDIR}/usr/mdec
+	    ${.OBJDIR}/bootblk ${DESTDIR}/usr/mdec
 
 #
 # The following are if you grab the fakeboot program from the Sun website
 #
 
-fake: bootblk bootblk.text
+fake: ${.OBJDIR}/bootblk ${.OBJDIR}/bootblk.text
 	../fakeboot/fakeboot -elf32 <bootblk >/bootblk
 	../fakeboot/fakeboot -elf32 <bootblk.text >/bootblk.text
 
