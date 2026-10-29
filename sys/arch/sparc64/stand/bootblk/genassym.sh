@@ -203,7 +203,9 @@ if [ "$ccode" = 1 ]; then
 elif [ "$fcode" = 1 ]; then
 	# Kill all of the "#" and "$" modifiers; locore.s already
 	# prepends the correct "constant" modifier.
-	"$@" -S "${genassym_temp}/assym.c" -o - | sed -e 's/\$//g' | \
+	"$@" -S "${genassym_temp}/assym.c" -o \
+	    "${genassym_temp}/genassym.out" && \
+	    sed -e 's/\$//g' < "${genassym_temp}/genassym.out" | \
 	    sed -n 's/.*\.ascii[[:space:]]*"XYZZY\([^"]*\)".*/\1/p'
 else
 	# Kill all of the "#" and "$" modifiers; locore.s already
