@@ -32,9 +32,11 @@
 #include <sys/malloc.h>
 #include <sys/mount.h>
 #include <sys/mutex.h>
+#include <sys/proc.h>
 #include <sys/queue.h>
 #include <sys/specdev.h>
 #include <sys/task.h>
+#include <sys/time.h>
 #include <sys/timeout.h>
 #include <sys/tree.h>
 #include <sys/vnode.h>
@@ -166,6 +168,7 @@ RB_GENERATE_STATIC(ext4fs_journal_revoke_block_tree,
 #define EXT4FS_JOURNAL_COMMITTED_BYTES_MAX	(16U * 1024U * 1024U)
 #define EXT4FS_JOURNAL_DIRTY_METADATA_MAX	(4U * 1024U * 1024U)
 #define EXT4FS_JOURNAL_TRANSACTION_AGE_MSEC	100
+#define EXT4FS_JOURNAL_STALL_NSEC	SEC_TO_NSEC(10)
 
 struct ext4fs_journal {
 	struct mutex	 j_lock;
@@ -215,7 +218,10 @@ struct ext4fs_journal_handle {
 	struct ext4fs_journal *jh_journal;
 	struct ext4fs_journal_transaction *jh_transaction;
 	u_int32_t	 jh_credits;
+	pid_t		 jh_owner_pid;
+	pid_t		 jh_owner_tid;
 	int		 jh_ended;
+	int		 jh_stall_reported;
 };
 
 enum ext4fs_journal_fence {
@@ -2375,6 +2381,41 @@ ext4fs_journal_error (struct mount *mp)
 	return (error);
 }
 
+/* Called with j_lock held; returns with it held. */
+static void
+ext4fs_journal_wait_active (struct ext4fs_journal *journal,
+    const char *wmesg)
+{
+	struct ext4fs_journal_handle *handle;
+	struct mount *mp;
+	u_int32_t sequence;
+	pid_t owner_pid, owner_tid, waiter_pid, waiter_tid;
+	int error;
+
+	handle = journal->j_active;
+	error = msleep_nsec(&journal->j_active, &journal->j_lock,
+	    PRIBIO, wmesg, handle != NULL &&
+	    ! handle->jh_stall_reported ?
+	    EXT4FS_JOURNAL_STALL_NSEC : INFSLP);
+	if (error != EWOULDBLOCK || handle == NULL ||
+	    journal->j_active != handle || handle->jh_stall_reported)
+		return;
+
+	handle->jh_stall_reported = 1;
+	mp = journal->j_mp;
+	sequence = handle->jh_transaction->jt_sequence;
+	owner_pid = handle->jh_owner_pid;
+	owner_tid = handle->jh_owner_tid;
+	waiter_pid = curproc->p_p->ps_pid;
+	waiter_tid = curproc->p_tid;
+	mtx_leave(&journal->j_lock);
+	ext4fs_print(mp, "journal active for 10s: owner pid %d "
+	    "tid %d, waiter pid %d tid %d (%s), sequence %u\n",
+	    owner_pid, owner_tid, waiter_pid, waiter_tid, wmesg,
+	    sequence);
+	mtx_enter(&journal->j_lock);
+}
+
 int
 ext4fs_journal_begin (struct mount *mp, unsigned int credits,
     struct ext4fs_journal_handle **handlep)
@@ -2396,6 +2437,8 @@ ext4fs_journal_begin (struct mount *mp, unsigned int credits,
 		return (EOPNOTSUPP);
 
 	handle = malloc(sizeof(*handle), M_UFSMNT, M_WAITOK | M_ZERO);
+	handle->jh_owner_pid = curproc->p_p->ps_pid;
+	handle->jh_owner_tid = curproc->p_tid;
 	candidate = NULL;
 
 	for (;;) {
@@ -2416,9 +2459,8 @@ ext4fs_journal_begin (struct mount *mp, unsigned int credits,
 			    journal->j_aborted, journal->j_error,
 			    journal->j_shutting_down);
 			if (error == EBUSY) {
-				msleep_nsec(&journal->j_active,
-				    &journal->j_lock, PRIBIO,
-				    "e4jbegin", INFSLP);
+				ext4fs_journal_wait_active(journal,
+				    "e4jbegin");
 				continue;
 			}
 			if (error != 0 || journal->j_committing == NULL ||
@@ -2598,9 +2640,8 @@ ext4fs_journal_read_metadata (struct mount *mp, struct vnode *devvp,
 		 * boundary before treating a running buffer as stable.
 		 */
 		if (journal->j_active != NULL) {
-			msleep_nsec(&journal->j_active,
-			    &journal->j_lock, PRIBIO, "e4jread",
-			    INFSLP);
+			ext4fs_journal_wait_active(journal,
+			    "e4jread");
 			mtx_leave(&journal->j_lock);
 			continue;
 		}
@@ -3717,9 +3758,8 @@ ext4fs_journal_commit_internal (struct mount *mp,
 		    journal->j_aborted, journal->j_error,
 		    journal->j_shutting_down);
 		if (error == EBUSY) {
-			msleep_nsec(&journal->j_active,
-			    &journal->j_lock, PRIBIO, "e4jcommit",
-			    INFSLP);
+			ext4fs_journal_wait_active(journal,
+			    "e4jcommit");
 			continue;
 		}
 		if (error != 0)
