@@ -62,6 +62,9 @@
 #define ALLOCATION_ERROR_FILE	"allocation-error"
 #define ALLOCATION_ERROR_BYTES	(4 * MAXBSIZE + 31)
 #define ALLOCATION_ERROR_SEED	0x5eU
+#define ROLLBACK_FILL_BYTES	(1024 * 1024)
+#define ROLLBACK_ATTEMPTS	4
+#define ROLLBACK_FAST_BYTES	60
 
 #define JBD2_MAGIC		UINT32_C(0xc03b3998)
 #define JBD2_COMMIT_BLOCK	2
@@ -147,6 +150,8 @@ static void	verify_allocation_error (const char *);
 static void	verify_journal_exhaustion (const char *);
 static void	verify_workload (const char *);
 static void	verify_unlink (const char *);
+static void	run_create_rollback (const char *);
+static void	verify_create_rollback (const char *);
 static void	selftest (void);
 
 static void
@@ -1597,6 +1602,168 @@ verify_unlink (const char *root)
 }
 
 static void
+rollback_path (char *path, size_t pathlen, const char *root,
+    unsigned int index)
+{
+	char name[32];
+
+	if (snprintf(name, sizeof(name), "failed-%u", index) >=
+	    (int)sizeof(name))
+		errx(1, "rollback name is too long");
+	make_path(path, pathlen, root, name);
+}
+
+static void
+rollback_check_absent (const char *path)
+{
+	struct stat st;
+
+	errno = 0;
+	if (lstat(path, &st) != -1)
+		errx(1, "%s unexpectedly exists", path);
+	if (errno != ENOENT)
+		err(1, "lstat %s", path);
+}
+
+static void
+rollback_check_symlink (const char *path, const char *target,
+    size_t block_size)
+{
+	struct stat st;
+	char buf[PATH_MAX];
+	size_t len;
+	ssize_t n;
+	blkcnt_t blocks;
+
+	len = strlen(target);
+	if (lstat(path, &st) == -1)
+		err(1, "lstat %s", path);
+	blocks = len <= ROLLBACK_FAST_BYTES ? 0 :
+	    (blkcnt_t)(block_size / DEV_BSIZE);
+	if (! S_ISLNK(st.st_mode) || st.st_size != (off_t)len ||
+	    st.st_blocks != blocks)
+		errx(1, "symlink inode shape mismatch: %s", path);
+	n = readlink(path, buf, sizeof(buf));
+	if (n == -1)
+		err(1, "readlink %s", path);
+	if ((size_t)n != len || memcmp(buf, target, len) != 0)
+		errx(1, "symlink target mismatch: %s", path);
+}
+
+/*
+ * A slow symlink needs a data block after inode allocation.  With
+ * no free blocks, initialization fails before the parent changes.
+ * Repeating the failure checks that reclaimed inodes leave ihash.
+ */
+static void
+run_create_rollback (const char *root)
+{
+	struct stat st;
+	struct statfs sfs;
+	char path[PATH_MAX], target[128];
+	void *data;
+	uint64_t free_inodes;
+	size_t block_size, len;
+	ssize_t n;
+	unsigned int i;
+	int fd;
+
+	if (mkdir(root, 0755) == -1)
+		err(1, "mkdir %s", root);
+	block_size = filesystem_block_size(root);
+	memset(target, 'x', sizeof(target) - 1);
+	target[sizeof(target) - 1] = '\0';
+	data = calloc(1, ROLLBACK_FILL_BYTES);
+	if (data == NULL)
+		err(1, "allocate rollback filler");
+	make_path(path, sizeof(path), root, "filler");
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (statfs(root, &sfs) == -1)
+		err(1, "statfs before rollback fill");
+	if (sfs.f_bfree == 0 || sfs.f_ffree < ROLLBACK_ATTEMPTS)
+		errx(1, "rollback fixture lacks free space");
+	while (sfs.f_bfree != 0) {
+		len = sfs.f_bfree >=
+		    ROLLBACK_FILL_BYTES / block_size ?
+		    ROLLBACK_FILL_BYTES : block_size;
+		n = write(fd, data, len);
+		if (n <= 0)
+			err(1, "fill rollback filesystem");
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs during rollback fill");
+	}
+	free(data);
+	if (fsync(fd) == -1)
+		err(1, "fsync rollback filler");
+	make_path(path, sizeof(path), root, "fast");
+	if (symlink("fast", path) == -1)
+		err(1, "fast symlink on full filesystem");
+	rollback_check_symlink(path, "fast", block_size);
+	if (statfs(root, &sfs) == -1)
+		err(1, "statfs after fast symlink");
+	if (sfs.f_bfree != 0)
+		errx(1, "fast symlink changed free block count");
+	free_inodes = sfs.f_ffree;
+	for (i = 0; i < ROLLBACK_ATTEMPTS; i++) {
+		rollback_path(path, sizeof(path), root, i);
+		errno = 0;
+		if (symlink(target, path) != -1)
+			errx(1, "failed create %u unexpectedly succeeded",
+			    i);
+		if (errno != ENOSPC)
+			err(1, "failed create %u", i);
+		rollback_check_absent(path);
+		if (statfs(root, &sfs) == -1)
+			err(1, "statfs after failed create");
+		if (sfs.f_bfree != 0 || sfs.f_ffree != free_inodes)
+			errx(1, "failed create changed free counts");
+	}
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat rollback filler");
+	if (st.st_size < (off_t)(4 * block_size))
+		errx(1, "rollback filler is too small");
+	if (ftruncate(fd, st.st_size - 4 * block_size) == -1)
+		err(1, "shrink rollback filler");
+	if (fsync(fd) == -1)
+		err(1, "fsync shrunk rollback filler");
+	if (close(fd) == -1)
+		err(1, "close rollback filler");
+	if (statfs(root, &sfs) == -1)
+		err(1, "statfs after rollback shrink");
+	if (sfs.f_bfree == 0)
+		errx(1, "rollback shrink did not free a block");
+	make_path(path, sizeof(path), root, "success");
+	if (symlink(target, path) == -1)
+		err(1, "symlink after failed creates");
+	rollback_check_symlink(path, target, block_size);
+	sync_directory(root);
+	printf("state=create-rollback\n");
+}
+
+static void
+verify_create_rollback (const char *root)
+{
+	char path[PATH_MAX], target[128];
+	size_t block_size;
+	unsigned int i;
+
+	block_size = filesystem_block_size(root);
+	memset(target, 'x', sizeof(target) - 1);
+	target[sizeof(target) - 1] = '\0';
+	for (i = 0; i < ROLLBACK_ATTEMPTS; i++) {
+		rollback_path(path, sizeof(path), root, i);
+		rollback_check_absent(path);
+	}
+	make_path(path, sizeof(path), root, "fast");
+	rollback_check_symlink(path, "fast", block_size);
+	make_path(path, sizeof(path), root, "success");
+	rollback_check_symlink(path, target, block_size);
+	printf("state=create-rollback\n");
+}
+
+static void
 selftest (void)
 {
 	unsigned char journal[JBD2_SUPER_BYTES];
@@ -1781,6 +1948,11 @@ main (int argc, char **argv)
 	else if (argc == 3 &&
 	    strcmp(argv[1], "verify-journal-exhaustion") == 0)
 		verify_journal_exhaustion(argv[2]);
+	else if (argc == 3 && strcmp(argv[1], "create-rollback") == 0)
+		run_create_rollback(argv[2]);
+	else if (argc == 3 &&
+	    strcmp(argv[1], "verify-create-rollback") == 0)
+		verify_create_rollback(argv[2]);
 	else
 		errx(1, "usage: ext4fs_crash pattern-old path | "
 		    "pattern-new path | "
@@ -1797,6 +1969,8 @@ main (int argc, char **argv)
 		    "verify-truncate-prune root | "
 		    "verify-block-reuse root | "
 		    "verify-allocation-error root | "
-		    "verify-journal-exhaustion root");
+		    "verify-journal-exhaustion root | "
+		    "create-rollback root | "
+		    "verify-create-rollback root");
 	return (0);
 }

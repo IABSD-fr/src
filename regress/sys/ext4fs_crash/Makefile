@@ -17,6 +17,7 @@ REGRESS_VMM_TARGETS= \
 		run-regress-ext4fs-crash-journal-vmm \
 		run-regress-ext4fs-crash-queue-vmm \
 		run-regress-ext4fs-crash-errors-vmm \
+		run-regress-ext4fs-crash-create-rollback-vmm \
 		run-regress-ext4fs-crash-allocation-error-vmm \
 		run-regress-ext4fs-crash-allocation-error-all-vmm
 
@@ -211,6 +212,19 @@ run-regress-ext4fs-crash-allocation-error-all-vmm: ${PROG}
 	    EXT4FS_CRASH_WRITE_COUNTS='all' \
 	    EXT4FS_CRASH_SSH_KEY='${EXT4FS_CRASH_SSH_KEY}' \
 	    EXT4FS_CRASH_MODE='allocation-error' \
+	    sh ${.CURDIR}/crash-vmm.sh
+
+# Explicit only: a failed create can panic an unfixed guest kernel.
+run-regress-ext4fs-crash-create-rollback-vmm: ${PROG}
+	env EXT4FS_CRASH='${.OBJDIR}/${PROG}' \
+	    EXT4FS_CRASH_VMM_BASE='${EXT4FS_CRASH_VMM_BASE}' \
+	    EXT4FS_CRASH_VMM_KERNEL='${EXT4FS_CRASH_VMM_KERNEL}' \
+	    EXT4FS_CRASH_VMM_DIR='${EXT4FS_CRASH_VMM_DIR}' \
+	    EXT4FS_CRASH_BOOT_TIMEOUT='${EXT4FS_CRASH_BOOT_TIMEOUT}' \
+	    EXT4FS_CRASH_STEP_TIMEOUT='${EXT4FS_CRASH_STEP_TIMEOUT}' \
+	    EXT4FS_CRASH_BLOCK_SIZES='${EXT4FS_CRASH_BLOCK_SIZES}' \
+	    EXT4FS_CRASH_SSH_KEY='${EXT4FS_CRASH_SSH_KEY}' \
+	    EXT4FS_CRASH_MODE='create-rollback' \
 	    sh ${.CURDIR}/crash-vmm.sh
 
 .include <bsd.regress.mk>

@@ -4112,7 +4112,7 @@ fail:
 		memset(ip->i_e4din, 0,
 		    sizeof(struct ext4fs_dinode_256));
 		ip->i_effnlink = 0;
-		ip->i_flag = IN_CHANGE | IN_UPDATE;
+		ip->i_flag |= IN_CHANGE | IN_UPDATE;
 		rollback_error = ext4fs_update_handle(ip, handle);
 		if (rollback_error == 0)
 			rollback_error = ext4fs_inode_free_handle(pdir,

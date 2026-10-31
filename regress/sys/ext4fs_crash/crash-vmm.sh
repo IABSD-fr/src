@@ -114,7 +114,7 @@ for stage in $EXT4FS_CRASH_STAGES; do
 done
 case "$EXT4FS_CRASH_MODE" in
 timed|flush|orphan|directory|extent|truncate|reuse|journal|errors|\
-allocation-error|queue) ;;
+allocation-error|queue|create-rollback) ;;
 *)	fail "unsupported crash mode: $EXT4FS_CRASH_MODE" ;;
 esac
 if [ "$EXT4FS_CRASH_MODE" != timed ]; then
@@ -314,9 +314,14 @@ start_guest()
 	ssh_run "root@$guest" sysctl -n kern.version \
 	    >"$work/guest-version-$serial.log" 2>&1 ||
 	    fail "could not query guest kernel version"
-	cmp -s "$work/host-version.log" \
-	    "$work/guest-version-$serial.log" ||
-	    fail "guest did not boot the running production kernel"
+	if ! cmp -s "$work/host-version.log" \
+	    "$work/guest-version-$serial.log"; then
+		echo "host kernel version:" >&2
+		cat "$work/host-version.log" >&2
+		echo "guest kernel version:" >&2
+		cat "$work/guest-version-$serial.log" >&2
+		fail "guest did not boot the running production kernel"
+	fi
 	copy_helper || fail "could not copy workload helper"
 }
 
@@ -764,6 +769,69 @@ run_allocation_error_case()
 		cat "$case_dir/recovery.log" >&2
 		fail "failed allocation recovered non-empty data"
 	}
+	echo ' ok'
+}
+
+run_create_rollback_case()
+{
+	rollback_block_size=$1
+	test_name="create rollback, "
+	test_name="$test_name$rollback_block_size-byte blocks"
+	printf '%-64s' "vmm: $test_name"
+	case_dir=$work/create-rollback-$rollback_block_size
+	mkdir "$case_dir"
+	image=$case_dir/ext4.img
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek=64 status=none
+	"$MKE2FS" -q -F -t ext4 -I 256 \
+	    -b "$rollback_block_size" -J size=4 -m 0 \
+	    -O 'metadata_csum,^orphan_file' "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1 || {
+		cat "$case_dir/mke2fs.log" >&2
+		fail "could not create rollback fixture"
+	}
+	"$E2FSCK" -fn "$image" >"$case_dir/baseline.log" \
+	    2>&1 || fail "e2fsck rejected rollback fixture"
+
+	start_guest "$image"
+	workload="set -e
+mkdir -p /mnt/ext4
+mount_ext4fs /dev/sd1c /mnt/ext4
+/tmp/ext4fs_crash create-rollback /mnt/ext4/rollback
+umount /mnt/ext4"
+	if ! ssh_step "root@$guest" "$workload" \
+	    >"$case_dir/workload.log" 2>&1; then
+		cat "$case_dir/workload.log" >&2
+		fail "guest did not complete create rollback"
+	fi
+	grep -qx 'state=create-rollback' \
+	    "$case_dir/workload.log" ||
+	    fail "guest did not report completed rollback"
+	stop_guest
+	"$SYNC"
+	"$E2FSCK" -fn "$image" >"$case_dir/e2fsck.log" \
+	    2>&1 || fail "e2fsck rejected rollback image"
+	readonly_hash=$($SHA256 -q "$image")
+
+	start_guest "$image"
+	verify="set -e
+mkdir -p /mnt/ext4
+mount_ext4fs -o ro /dev/sd1c /mnt/ext4
+/tmp/ext4fs_crash verify-create-rollback /mnt/ext4/rollback
+umount /mnt/ext4"
+	if ! ssh_step "root@$guest" "$verify" \
+	    >"$case_dir/verify.log" 2>&1; then
+		cat "$case_dir/verify.log" >&2
+		fail "rollback verification failed"
+	fi
+	grep -qx 'state=create-rollback' "$case_dir/verify.log" ||
+	    fail "guest did not verify rollback state"
+	stop_guest
+	"$SYNC"
+	[ "$readonly_hash" = "$($SHA256 -q "$image")" ] ||
+	    fail "read-only rollback verification changed the image"
+	"$E2FSCK" -fn "$image" >"$case_dir/verify-e2fsck.log" \
+	    2>&1 || fail "e2fsck rejected verified image"
 	echo ' ok'
 }
 
@@ -1455,6 +1523,10 @@ if [ "$EXT4FS_CRASH_MODE" = journal ]; then
 fi
 
 for block_size in $EXT4FS_CRASH_BLOCK_SIZES; do
+	if [ "$EXT4FS_CRASH_MODE" = create-rollback ]; then
+		run_create_rollback_case "$block_size"
+		continue
+	fi
 	if [ "$EXT4FS_CRASH_MODE" = queue ]; then
 		extent_capacity=$(((block_size - 12) / 12))
 		queue_base=$work/base-queue-$block_size.img
