@@ -19,6 +19,7 @@
 #include <sys/disklabel.h>
 #include <sys/dkio.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -49,6 +50,7 @@
 #define ALLOCATION_RUN_BYTES	(1024 * 1024)
 #define ALLOCATION_TOTAL_BYTES	(3 * ALLOCATION_RUN_BYTES)
 #define ALLOCATION_PARTIAL_BYTES	31
+#define MAPPED_EXTENTS	6
 #define DIR_TAIL_BYTES	12
 #define FAST_SYMLINK_BYTES	60
 #define ORPHAN_INODE_BYTES	256
@@ -136,6 +138,8 @@ static void	create_allocation_probe (void);
 static void	verify_allocation_probe (void);
 static void	write_allocation_run (void);
 static void	verify_allocation_run (void);
+static void	write_mapped_allocation_run (void);
+static void	verify_mapped_allocation_run (void);
 static void	create_extent_file (const char *);
 static size_t	extent_leaf_capacity (void);
 static off_t	extent_lbn_offset (size_t);
@@ -2605,6 +2609,83 @@ verify_allocation_run (void)
 		err(1, "close %s", path);
 }
 
+/* Fault an extent leaf on this filesystem during an allocated write. */
+static void
+write_mapped_allocation_run (void)
+{
+	char source[PATH_MAX], target[PATH_MAX];
+	unsigned char *mapping;
+	size_t length, i;
+	ssize_t n;
+	int source_fd, target_fd;
+
+	make_path(source, sizeof(source), "mapped-run-source");
+	make_path(target, sizeof(target), "mapped-run-target");
+	source_fd = open(source, O_CREAT | O_EXCL | O_RDWR, 0644);
+	if (source_fd == -1)
+		err(1, "open %s", source);
+	for (i = 0; i < MAPPED_EXTENTS; i++)
+		write_pattern_once_fd(source_fd,
+		    (off_t)(2 * i * block_size), block_size,
+		    ALLOCATION_RUN_SEED);
+	if (fsync(source_fd) == -1)
+		err(1, "fsync %s", source);
+	length = (2 * MAPPED_EXTENTS - 1) * block_size;
+	mapping = mmap(NULL, length, PROT_READ, MAP_PRIVATE,
+	    source_fd, 0);
+	if (mapping == MAP_FAILED)
+		err(1, "mmap %s", source);
+	target_fd = open(target, O_CREAT | O_EXCL | O_WRONLY, 0644);
+	if (target_fd == -1)
+		err(1, "open %s", target);
+	n = write(target_fd, mapping, length);
+	if (n == -1)
+		err(1, "write mapped source to %s", target);
+	if ((size_t)n != length)
+		errx(1, "short mapped write: %zd of %zu", n, length);
+	if (fsync(target_fd) == -1)
+		err(1, "fsync %s", target);
+	if (close(target_fd) == -1)
+		err(1, "close %s", target);
+	if (munmap(mapping, length) == -1)
+		err(1, "munmap %s", source);
+	if (close(source_fd) == -1)
+		err(1, "close %s", source);
+}
+
+static void
+verify_mapped_allocation_run (void)
+{
+	char path[PATH_MAX];
+	struct stat st;
+	size_t i;
+	int fd, which;
+
+	for (which = 0; which < 2; which++) {
+		make_path(path, sizeof(path), which == 0 ?
+		    "mapped-run-source" : "mapped-run-target");
+		fd = open(path, O_RDONLY);
+		if (fd == -1)
+			err(1, "open %s", path);
+		if (fstat(fd, &st) == -1)
+			err(1, "fstat %s", path);
+		if (! S_ISREG(st.st_mode) || st.st_size !=
+		    (off_t)((2 * MAPPED_EXTENTS - 1) * block_size))
+			errx(1, "%s has wrong inode shape", path);
+		for (i = 0; i < 2 * MAPPED_EXTENTS - 1; i++) {
+			if ((i & 1) == 0)
+				check_pattern_fd(fd,
+				    (off_t)(i * block_size), block_size,
+				    ALLOCATION_RUN_SEED);
+			else
+				check_zero_fd(fd,
+				    (off_t)(i * block_size), block_size);
+		}
+		if (close(fd) == -1)
+			err(1, "close %s", path);
+	}
+}
+
 static void
 allocate_bitmap_probe (void)
 {
@@ -4177,6 +4258,10 @@ main (int argc, char **argv)
 			write_allocation_run();
 		else if (strcmp(argv[1], "allocation-run-verify") == 0)
 			verify_allocation_run();
+		else if (strcmp(argv[1], "allocation-mmap-write") == 0)
+			write_mapped_allocation_run();
+		else if (strcmp(argv[1], "allocation-mmap-verify") == 0)
+			verify_mapped_allocation_run();
 		else if (strcmp(argv[1], "bitmap-verify") == 0)
 			verify_bitmap_probe(1);
 		else if (strcmp(argv[1], "bitmap-free") == 0)

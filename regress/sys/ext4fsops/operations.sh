@@ -2014,10 +2014,18 @@ run_allocation_run_case()
 	    fail "allocation runs used $sequence_distance transactions"
 	check_image allocation-run-write
 
+	attach_image
+	mount_image noatime
+	run_step allocation-mmap-write "$mountpoint"
+	unmount_image allocation-mmap-write
+	detach_image
+	check_image allocation-mmap-write
+
 	before=$(sha256 -q "$image")
 	attach_image
 	mount_image ro
 	run_step allocation-run-verify "$mountpoint"
+	run_step allocation-mmap-verify "$mountpoint"
 	unmount_image allocation-run-verify
 	detach_image
 	after=$(sha256 -q "$image")

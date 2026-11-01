@@ -2405,9 +2405,9 @@ ext4fs_journal_wait_active (struct ext4fs_journal *journal,
 	mp = journal->j_mp;
 	sequence = handle->jh_transaction->jt_sequence;
 	owner_pid = handle->jh_owner_pid;
-	owner_tid = handle->jh_owner_tid;
+	owner_tid = handle->jh_owner_tid + THREAD_PID_OFFSET;
 	waiter_pid = curproc->p_p->ps_pid;
-	waiter_tid = curproc->p_tid;
+	waiter_tid = curproc->p_tid + THREAD_PID_OFFSET;
 	mtx_leave(&journal->j_lock);
 	ext4fs_print(mp, "journal active for 10s: owner pid %d "
 	    "tid %d, waiter pid %d tid %d (%s), sequence %u\n",
@@ -2459,6 +2459,13 @@ ext4fs_journal_begin (struct mount *mp, unsigned int credits,
 			    journal->j_aborted, journal->j_error,
 			    journal->j_shutting_down);
 			if (error == EBUSY) {
+				/* A nested handle cannot release its owner. */
+				if (journal->j_active != NULL &&
+				    journal->j_active->jh_owner_tid ==
+				    curproc->p_tid) {
+					error = EDEADLK;
+					break;
+				}
 				ext4fs_journal_wait_active(journal,
 				    "e4jbegin");
 				continue;
@@ -2640,6 +2647,12 @@ ext4fs_journal_read_metadata (struct mount *mp, struct vnode *devvp,
 		 * boundary before treating a running buffer as stable.
 		 */
 		if (journal->j_active != NULL) {
+			/* A self-read must use the active handle. */
+			if (journal->j_active->jh_owner_tid ==
+			    curproc->p_tid) {
+				error = EDEADLK;
+				goto out;
+			}
 			ext4fs_journal_wait_active(journal,
 			    "e4jread");
 			mtx_leave(&journal->j_lock);

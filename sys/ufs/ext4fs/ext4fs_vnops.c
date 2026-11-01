@@ -54,6 +54,7 @@
 #include <sys/lockf.h>
 #include <sys/specdev.h>
 #include <sys/unistd.h>
+#include <sys/uio.h>
 #include <sys/resourcevar.h>
 #include <sys/signalvar.h>
 
@@ -4649,11 +4650,15 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 	struct ext4fs_dinode_256 saved_inode;
 	struct ext4fs_journal_handle *handle;
 	struct buf *bp;
+	struct iovec small_iov[UIO_SMALLIOV];
+	struct iovec *copied_iov, *iov;
+	struct uio copied_uio;
+	char *staged;
 	off_t saved_filesize, saved_offset;
 	u_int64_t goal, pblk, previous, ncontig;
 	u_int32_t chunk, chunk_limit, got, i, j;
 	int changed, end_error, error, saved_flags;
-	size_t bytes, offset, remaining, saved_resid, size;
+	size_t bytes, completed, offset, remaining, size;
 
 	if (fs->m_journal == NULL)
 		return (EOPNOTSUPP);
@@ -4672,13 +4677,36 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 	saved_flags = ip->i_flag;
 	saved_filesize = *filesizep;
 	saved_offset = uio->uio_offset;
-	saved_resid = uio->uio_resid;
 	handle = NULL;
 	bp = NULL;
 	changed = 0;
+	/*
+	 * Copying a file-backed user mapping can fault into ext4fs.
+	 * Stage the input before owning the journal handle, or that
+	 * fault may wait for this handle in journal_read_metadata.
+	 */
+	if (uio->uio_iovcnt <= 0)
+		return (EINVAL);
+	copied_iov = small_iov;
+	if ((size_t)uio->uio_iovcnt > nitems(small_iov))
+		copied_iov = mallocarray(uio->uio_iovcnt,
+		    sizeof(*copied_iov), M_UFSMNT, M_WAITOK);
+	memcpy(copied_iov, uio->uio_iov,
+	    uio->uio_iovcnt * sizeof(*copied_iov));
+	copied_uio = *uio;
+	copied_uio.uio_iov = copied_iov;
+	staged = malloc(run_bytes, M_UFSMNT, M_WAITOK);
+	error = uiomove(staged, run_bytes, &copied_uio);
+	if (copied_iov != small_iov)
+		free(copied_iov, M_UFSMNT,
+		    uio->uio_iovcnt * sizeof(*copied_iov));
+	if (error) {
+		free(staged, M_UFSMNT, run_bytes);
+		return (error);
+	}
 	error = ext4fs_journal_begin(vp->v_mount, 9, &handle);
 	if (error)
-		return (error);
+		goto out;
 	error = ext4fs_extent_pblk(ip, handle, lbn, &pblk,
 	    &ncontig);
 	if (error)
@@ -4732,6 +4760,7 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 		goto fail;
 	}
 	remaining = run_bytes;
+	completed = 0;
 	for (i = 0; i < got && remaining != 0; i += chunk) {
 		chunk = got - i;
 		if (chunk > chunk_limit)
@@ -4750,22 +4779,22 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 			size = remaining;
 		bp = geteblk(bytes);
 		clrbuf(bp);
-		error = uiomove((char *)bp->b_data + offset, size, uio);
-		if (error)
-			goto fail;
+		memcpy((char *)bp->b_data + offset,
+		    staged + completed, size);
 		error = ext4fs_journal_submit_data(handle,
 		    ip->i_devvp, bp, pblk + i);
 		if (error)
 			goto fail;
 		bp = NULL;
 		remaining -= size;
+		completed += size;
 	}
 	KASSERT(remaining == 0 || got < count);
 	(void)uvm_vnp_uncache(vp);
 
-	if (uio->uio_offset > *filesizep) {
-		ext4fs_setsize(ip, uio->uio_offset);
-		*filesizep = uio->uio_offset;
+	if (saved_offset + (off_t)completed > *filesizep) {
+		ext4fs_setsize(ip, saved_offset + (off_t)completed);
+		*filesizep = saved_offset + (off_t)completed;
 		uvm_vnp_setsize(vp, *filesizep);
 	}
 	ip->i_flag |= IN_CHANGE | IN_UPDATE;
@@ -4781,7 +4810,24 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 		goto restore;
 	}
 	ip->i_flag &= ~IN_MODIFIED;
-	return (0);
+	remaining = completed;
+	while (remaining != 0) {
+		KASSERT(uio->uio_iovcnt > 0);
+		iov = uio->uio_iov;
+		size = MIN(iov->iov_len, remaining);
+		if (size == 0) {
+			uio->uio_iov++;
+			uio->uio_iovcnt--;
+			continue;
+		}
+		iov->iov_base = (char *)iov->iov_base + size;
+		iov->iov_len -= size;
+		uio->uio_resid -= size;
+		uio->uio_offset += size;
+		remaining -= size;
+	}
+	error = 0;
+	goto out;
 
 fail:
 	if (bp != NULL) {
@@ -4802,14 +4848,15 @@ restore:
 	 * convention: do not report bytes whose new mapping was restored
 	 * from the inode snapshot.
 	 */
-	uio->uio_offset = saved_offset;
-	uio->uio_resid = saved_resid;
 	memcpy(ip->i_e4din, &saved_inode, sizeof(saved_inode));
 	ip->i_flag = saved_flags;
 	*filesizep = saved_filesize;
 	uvm_vnp_setsize(vp, saved_filesize);
 	if (changed)
 		vinvalbuf(vp, 0, NOCRED, curproc, 0, INFSLP);
+
+out:
+	free(staged, M_UFSMNT, run_bytes);
 	return (error);
 }
 
