@@ -2017,6 +2017,7 @@ run_allocation_run_case()
 	attach_image
 	mount_image noatime
 	run_step allocation-mmap-write "$mountpoint"
+	run_step allocation-vmcache-write "$mountpoint"
 	unmount_image allocation-mmap-write
 	detach_image
 	check_image allocation-mmap-write
@@ -2026,6 +2027,7 @@ run_allocation_run_case()
 	mount_image ro
 	run_step allocation-run-verify "$mountpoint"
 	run_step allocation-mmap-verify "$mountpoint"
+	run_step allocation-vmcache-verify "$mountpoint"
 	unmount_image allocation-run-verify
 	detach_image
 	after=$(sha256 -q "$image")

@@ -4673,9 +4673,6 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 	    (count > 1 && (u_int64_t)run_bytes <=
 	    (u_int64_t)(count - 1) * fs->m_block_size))
 		return (EINVAL);
-	memcpy(&saved_inode, ip->i_e4din, sizeof(saved_inode));
-	saved_flags = ip->i_flag;
-	saved_filesize = *filesizep;
 	saved_offset = uio->uio_offset;
 	handle = NULL;
 	bp = NULL;
@@ -4704,6 +4701,17 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 		free(staged, M_UFSMNT, run_bytes);
 		return (error);
 	}
+	/*
+	 * Evict persistent VM pages before owning a handle.  Uncache may
+	 * write dirty pages through VOP_WRITE and re-enter this filesystem.
+	 * It drops the vnode lock, so snapshot the inode after it returns.
+	 */
+	(void)uvm_vnp_uncache(vp);
+	memcpy(&saved_inode, ip->i_e4din, sizeof(saved_inode));
+	saved_flags = ip->i_flag;
+	saved_filesize = (off_t)letoh32(din->i_size_lo) |
+	    ((off_t)letoh32(din->i_size_hi) << 32);
+	*filesizep = saved_filesize;
 	error = ext4fs_journal_begin(vp->v_mount, 9, &handle);
 	if (error)
 		goto out;
@@ -4790,7 +4798,6 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 		completed += size;
 	}
 	KASSERT(remaining == 0 || got < count);
-	(void)uvm_vnp_uncache(vp);
 
 	if (saved_offset + (off_t)completed > *filesizep) {
 		ext4fs_setsize(ip, saved_offset + (off_t)completed);

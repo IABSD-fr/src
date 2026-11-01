@@ -74,6 +74,8 @@
 #define EXTENT_APPEND_SEED	0x79U
 #define EXTENT_BATCH_SEED	0xadU
 #define ALLOCATION_RUN_SEED	0x5eU
+#define MAPPED_DIRTY_SEED	0x71U
+#define MAPPED_APPEND_SEED	0xc3U
 #define BITMAP_SEED	0xc7U
 #define FSYNC_INITIAL_SEED	0x2dU
 #define FSYNC_UPDATE_SEED	0xe1U
@@ -140,6 +142,8 @@ static void	write_allocation_run (void);
 static void	verify_allocation_run (void);
 static void	write_mapped_allocation_run (void);
 static void	verify_mapped_allocation_run (void);
+static void	write_vmcache_allocation_run (void);
+static void	verify_vmcache_allocation_run (void);
 static void	create_extent_file (const char *);
 static size_t	extent_leaf_capacity (void);
 static off_t	extent_lbn_offset (size_t);
@@ -2686,6 +2690,60 @@ verify_mapped_allocation_run (void)
 	}
 }
 
+/* Append after a shared mapping leaves dirty persistent VM pages. */
+static void
+write_vmcache_allocation_run (void)
+{
+	char path[PATH_MAX];
+	unsigned char *mapping;
+	int fd;
+
+	make_path(path, sizeof(path), "mapped-dirty-run");
+	fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	write_pattern_once_fd(fd, 0, block_size,
+	    ALLOCATION_RUN_SEED);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	mapping = mmap(NULL, block_size, PROT_READ | PROT_WRITE,
+	    MAP_SHARED, fd, 0);
+	if (mapping == MAP_FAILED)
+		err(1, "mmap %s", path);
+	fill_pattern(mapping, block_size, 0, MAPPED_DIRTY_SEED);
+	if (munmap(mapping, block_size) == -1)
+		err(1, "munmap %s", path);
+	write_pattern_once_fd(fd, block_size, block_size,
+	    MAPPED_APPEND_SEED);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+verify_vmcache_allocation_run (void)
+{
+	char path[PATH_MAX];
+	struct stat st;
+	int fd;
+
+	make_path(path, sizeof(path), "mapped-dirty-run");
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (! S_ISREG(st.st_mode) ||
+	    st.st_size != (off_t)(2 * block_size))
+		errx(1, "dirty mapped run has wrong inode shape");
+	check_pattern_fd(fd, 0, block_size, MAPPED_DIRTY_SEED);
+	check_pattern_fd(fd, block_size, block_size,
+	    MAPPED_APPEND_SEED);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
 static void
 allocate_bitmap_probe (void)
 {
@@ -4262,6 +4320,10 @@ main (int argc, char **argv)
 			write_mapped_allocation_run();
 		else if (strcmp(argv[1], "allocation-mmap-verify") == 0)
 			verify_mapped_allocation_run();
+		else if (strcmp(argv[1], "allocation-vmcache-write") == 0)
+			write_vmcache_allocation_run();
+		else if (strcmp(argv[1], "allocation-vmcache-verify") == 0)
+			verify_vmcache_allocation_run();
 		else if (strcmp(argv[1], "bitmap-verify") == 0)
 			verify_bitmap_probe(1);
 		else if (strcmp(argv[1], "bitmap-free") == 0)
