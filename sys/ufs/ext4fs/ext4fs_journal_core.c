@@ -2610,7 +2610,7 @@ ext4fs_journal_read_metadata (struct mount *mp, struct vnode *devvp,
 	struct ext4fs_journal_transaction *committing;
 	struct m_ext4fs *fs;
 	struct ufsmount *ump;
-	struct buf *copy;
+	struct buf *bp, *copy;
 	const void *data;
 	int error;
 
@@ -2723,33 +2723,39 @@ ext4fs_journal_read_metadata (struct mount *mp, struct vnode *devvp,
 				data = metadata->jm_snapshot;
 			}
 		}
-		if (metadata == NULL) {
-			mtx_leave(&journal->j_lock);
-			if (copy != NULL)
-				brelse(copy);
-			return (bread(devvp,
-			    (daddr_t)EXT4FS_FSBTODB(fs, fsblock),
-			    fs->m_block_size, bpp));
-		}
-		if (data == NULL) {
-			mtx_leave(&journal->j_lock);
-			if (copy != NULL)
-				brelse(copy);
-			return (bread(devvp,
-			    (daddr_t)EXT4FS_FSBTODB(fs, fsblock),
-			    fs->m_block_size, bpp));
-		}
 		if (copy == NULL) {
-			/*
-			 * Buffer allocation may sleep.  Revalidate the selected
-			 * transaction image after reacquiring j_lock.
-			 */
+			/* Allocation may sleep; recheck the transaction. */
 			mtx_leave(&journal->j_lock);
 			copy = geteblk(fs->m_block_size);
 			continue;
 		}
-		/* j_lock keeps the selected transaction image stable. */
-		memcpy(copy->b_data, data, fs->m_block_size);
+		if (data == NULL) {
+			/*
+			 * A reader may read another metadata block while it
+			 * holds this one.  Return an anonymous copy so a writer
+			 * cannot wait on its busy home buffer while the reader
+			 * waits for the writer's active handle.
+			 */
+			mtx_leave(&journal->j_lock);
+			bp = NULL;
+			error = bread(devvp,
+			    (daddr_t)EXT4FS_FSBTODB(fs, fsblock),
+			    fs->m_block_size, &bp);
+			if (error) {
+				if (bp != NULL)
+					brelse(bp);
+				brelse(copy);
+				return (error);
+			}
+			memcpy(copy->b_data, bp->b_data,
+			    fs->m_block_size);
+			brelse(bp);
+		} else {
+			/* j_lock keeps the transaction image stable. */
+			memcpy(copy->b_data, data,
+			    fs->m_block_size);
+			mtx_leave(&journal->j_lock);
+		}
 		copy->b_blkno = (daddr_t)EXT4FS_FSBTODB(fs,
 		    fsblock);
 		copy->b_lblkno = copy->b_blkno;
@@ -2759,7 +2765,6 @@ ext4fs_journal_read_metadata (struct mount *mp, struct vnode *devvp,
 		    B_READ);
 		SET(copy->b_flags, B_DONE | B_NOCACHE);
 		*bpp = copy;
-		mtx_leave(&journal->j_lock);
 		return (0);
 	}
 

@@ -64,6 +64,9 @@ struct ext4fs_orphan_extent_ctx {
 };
 
 #define EXT4FS_ORPHAN_XATTR_MAGIC	0xea020000
+#define EXT4FS_ORPHAN_RECOVERY_BATCH	1024
+#define EXT4FS_ORPHAN_RECOVERY_WINDOW	\
+	(EXT4FS_ORPHAN_RECOVERY_BATCH + 1)
 
 struct ext4fs_orphan_xattr_header {
 	u_int32_t	h_magic;
@@ -743,6 +746,7 @@ ext4fs_recovery_recount (struct mount *mp, int64_t dir_group)
 	struct ufsmount *ump = VFSTOUFS(mp);
 	struct m_ext4fs *fs = ump->um_e4fs;
 	struct ext4fs_block_group_descriptor *gd;
+	struct ext4fs_block_group_descriptor old_gd;
 	struct buf *bp = NULL;
 	u_int64_t free_blocks, group_start, bitmap_block;
 	u_int64_t inode_start, free_inodes64;
@@ -756,6 +760,7 @@ ext4fs_recovery_recount (struct mount *mp, int64_t dir_group)
 	free_inodes64 = 0;
 	for (group = 0; group < fs->m_block_group_count; group++) {
 		gd = &fs->m_gd[group];
+		old_gd = *gd;
 		flags = letoh16(gd->bgd_flags);
 
 		group_start = fs->m_first_data_block +
@@ -859,10 +864,15 @@ ext4fs_recovery_recount (struct mount *mp, int64_t dir_group)
 		}
 		free_inodes64 += free_count;
 
-		error = ext4fs_recovery_bgd_write(fs, ump->um_devvp,
-		    group);
-		if (error)
-			return (error);
+		gd->bgd_checksum = htole16(ext4fs_bgd_csum(fs,
+		    gd, group));
+		if (memcmp(&old_gd, gd,
+		    fs->m_block_group_descriptor_size) != 0) {
+			error = ext4fs_recovery_bgd_write(fs,
+			    ump->um_devvp, group);
+			if (error)
+				return (error);
+		}
 	}
 	if (free_inodes64 > UINT32_MAX)
 		return (EOVERFLOW);
@@ -2722,66 +2732,100 @@ ext4fs_recovery_classic_orphans (struct mount *mp, int *count)
 	struct ufsmount *ump = VFSTOUFS(mp);
 	struct m_ext4fs *fs = ump->um_e4fs;
 	struct ext4fs_dinode_256 dp;
+	u_int32_t *recent;
 	u_int32_t ino, next, previous, tail;
 	u_int64_t seen;
+	u_int32_t batch, i;
 	int error;
+
+	/*
+	 * Tail-first retirement keeps each orphan reachable until its
+	 * cleanup is durable.  Remember a bounded suffix so that a long
+	 * chain needs one scan per batch, not one scan per inode.
+	 */
+	recent = mallocarray(EXT4FS_ORPHAN_RECOVERY_WINDOW,
+	    sizeof(*recent), M_UFSMNT,
+	    M_WAITOK);
+	error = 0;
 
 	while (fs->m_last_orphan != 0) {
 		ino = fs->m_last_orphan;
-		previous = 0;
 		seen = 0;
 		for (;;) {
 			if (ino < fs->m_first_non_reserved_inode ||
 			    ino > fs->m_inodes_count ||
 			    ino == fs->m_orphan_file_inode ||
 			    ino == fs->m_journal_inode_number ||
-			    ++seen > fs->m_inodes_count) {
+			    seen >= fs->m_inodes_count) {
 				ext4fs_print(mp, "corrupt classic "
 				    "orphan list\n");
-				return (EINVAL);
+				error = EINVAL;
+				goto out;
 			}
 			error = ext4fs_orphan_inode_read(fs,
 			    ump->um_devvp,
 			    ino, &dp);
 			if (error)
-				return (error);
+				goto out;
+			recent[seen %
+			    EXT4FS_ORPHAN_RECOVERY_WINDOW] = ino;
+			seen++;
 			next = letoh32(dp.dinode.i_dtime);
 			if (next == 0)
 				break;
-			previous = ino;
 			ino = next;
 		}
-		tail = ino;
-		error = ext4fs_recovery_inode_cleanup(mp, tail, &dp,
-		    count);
-		if (error)
-			return (error);
-
-		if (previous == 0) {
-			fs->m_last_orphan = 0;
-			fs->m_sble.sb_last_orphan = 0;
-			fs->m_fs_was_modified = 1;
-			error = ext4fs_sbwrite_direct(mp);
-		} else {
+		batch = seen < EXT4FS_ORPHAN_RECOVERY_BATCH ?
+		    (u_int32_t)seen : EXT4FS_ORPHAN_RECOVERY_BATCH;
+		for (i = 0; i < batch; i++) {
+			tail = recent[(seen - i - 1) %
+			    EXT4FS_ORPHAN_RECOVERY_WINDOW];
+			previous = seen - i > 1 ?
+			    recent[(seen - i - 2) %
+			    EXT4FS_ORPHAN_RECOVERY_WINDOW] : 0;
 			error = ext4fs_orphan_inode_read(fs,
-			    ump->um_devvp,
-			    previous, &dp);
+			    ump->um_devvp, tail, &dp);
 			if (error)
-				return (error);
-			if (letoh32(dp.dinode.i_dtime) != tail)
-				return (EINVAL);
-			dp.dinode.i_dtime = 0;
-			error = ext4fs_recovery_inode_write(fs,
-			    ump->um_devvp,
-			    previous, &dp);
+				goto out;
+			if (letoh32(dp.dinode.i_dtime) != 0) {
+				error = EINVAL;
+				goto out;
+			}
+			error = ext4fs_recovery_inode_cleanup(mp,
+			    tail, &dp, count);
+			if (error)
+				goto out;
+
+			if (previous == 0) {
+				fs->m_last_orphan = 0;
+				fs->m_sble.sb_last_orphan = 0;
+				fs->m_fs_was_modified = 1;
+				error = ext4fs_sbwrite_direct(mp);
+			} else {
+				error = ext4fs_orphan_inode_read(fs,
+				    ump->um_devvp, previous, &dp);
+				if (error)
+					goto out;
+				if (letoh32(dp.dinode.i_dtime) !=
+				    tail) {
+					error = EINVAL;
+					goto out;
+				}
+				dp.dinode.i_dtime = 0;
+				error = ext4fs_recovery_inode_write(fs,
+				    ump->um_devvp, previous, &dp);
+			}
+			if (error)
+				goto out;
+			error = ext4fs_recovery_flush(mp);
+			if (error)
+				goto out;
 		}
-		if (error)
-			return (error);
-		error = ext4fs_recovery_flush(mp);
-		if (error)
-			return (error);
 	}
-	return (0);
+out:
+	free(recent, M_UFSMNT,
+	    EXT4FS_ORPHAN_RECOVERY_WINDOW * sizeof(*recent));
+	return (error);
 }
 
 int

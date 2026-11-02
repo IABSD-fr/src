@@ -1670,12 +1670,16 @@ test_classic_orphan_recovery()
 	    "$JOURNAL_BLOCK_SIZE" 3 T
 	make_payload "$case_dir/deleted-payload" \
 	    "$JOURNAL_BLOCK_SIZE" 2 D
+	make_payload "$case_dir/deleted2-payload" \
+	    "$JOURNAL_BLOCK_SIZE" 1 E
 	xattr_size=$((JOURNAL_BLOCK_SIZE / 2))
 	dd if=/dev/zero bs="$xattr_size" count=1 status=none |
 	    tr '\000' X >"$case_dir/xattr-value"
 	{
 		printf 'write %s /kept\n' "$case_dir/kept-payload"
 		printf 'write %s /deleted\n' "$case_dir/deleted-payload"
+		printf 'write %s /deleted2\n' \
+		    "$case_dir/deleted2-payload"
 		printf 'ea_set -f %s /deleted user.large\n' \
 		    "$case_dir/xattr-value"
 	} >"$case_dir/debugfs.cmd"
@@ -1684,9 +1688,12 @@ test_classic_orphan_recovery()
 	    2>/dev/null | awk '/^Inode:/ { print $2; exit }')
 	deleted_ino=$("$DEBUGFS" -R 'stat /deleted' "$case_dir/image" \
 	    2>/dev/null | awk '/^Inode:/ { print $2; exit }')
+	deleted2_ino=$("$DEBUGFS" -R 'stat /deleted2' \
+	    "$case_dir/image" 2>/dev/null |
+	    awk '/^Inode:/ { print $2; exit }')
 	deleted_xattr=$("$DEBUGFS" -R 'stat /deleted' "$case_dir/image" \
 	    2>/dev/null | awk '/^File ACL:/ { print $3; exit }')
-	case "$kept_ino:$deleted_ino" in
+	case "$kept_ino:$deleted_ino:$deleted2_ino" in
 	*[!0-9:]*) fail "could not resolve classic orphan inodes" ;;
 	esac
 	case "$deleted_xattr" in
@@ -1694,8 +1701,13 @@ test_classic_orphan_recovery()
 	esac
 	{
 		printf 'unlink /deleted\n'
+		printf 'unlink /deleted2\n'
 		printf 'set_inode_field <%s> links_count 0\n' "$deleted_ino"
-		printf 'set_inode_field <%s> dtime 0\n' "$deleted_ino"
+		printf 'set_inode_field <%s> links_count 0\n' \
+		    "$deleted2_ino"
+		printf 'set_inode_field <%s> dtime %s\n' \
+		    "$deleted_ino" "$deleted2_ino"
+		printf 'set_inode_field <%s> dtime 0\n' "$deleted2_ino"
 		printf 'set_inode_field <%s> size %s\n' \
 		    "$kept_ino" "$JOURNAL_BLOCK_SIZE"
 		printf 'set_inode_field <%s> dtime %s\n' \
@@ -1704,12 +1716,16 @@ test_classic_orphan_recovery()
 	} >"$case_dir/debugfs.cmd"
 	run_debugfs "$case_dir/image" "$case_dir/debugfs.cmd"
 	"$DEBUGFS" -R orphan_inodes "$case_dir/image" 2>&1 |
-	    grep -q "ino $deleted_ino" ||
+	    grep -q "ino $deleted2_ino" ||
 	    fail "classic orphan fixture does not contain its tail"
 
 	kernel_mount_image "$case_dir/image"
 	"$DEBUGFS" -R "testi <$deleted_ino>" "$case_dir/image" 2>&1 |
 	    grep -q 'not in use' || fail "deleted classic orphan remains allocated"
+	"$DEBUGFS" -R "testi <$deleted2_ino>" \
+	    "$case_dir/image" 2>&1 |
+	    grep -q 'not in use' ||
+	    fail "second deleted classic orphan remains allocated"
 	set -- $("$DEBUGFS" -R "blocks <$kept_ino>" "$case_dir/image" \
 	    2>/dev/null)
 	[ "$#" -eq 1 ] || fail "linked classic orphan was not truncated"
