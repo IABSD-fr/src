@@ -169,6 +169,40 @@ RB_GENERATE_STATIC(ext4fs_journal_revoke_block_tree,
 #define EXT4FS_JOURNAL_DIRTY_METADATA_MAX	(4U * 1024U * 1024U)
 #define EXT4FS_JOURNAL_TRANSACTION_AGE_MSEC	100
 #define EXT4FS_JOURNAL_STALL_NSEC	SEC_TO_NSEC(10)
+#define EXT4FS_JOURNAL_STALL_QUEUE_MAX	\
+	(EXT4FS_JOURNAL_COMMITTED_MAX + 1)
+
+struct ext4fs_journal_stall_entry {
+	u_int32_t	 sequence;
+	u_int32_t	 start;
+	u_int32_t	 end;
+	u_int32_t	 blocks;
+	u_int32_t	 used;
+	u_int32_t	 reserved;
+	enum ext4fs_journal_transaction_state state;
+};
+
+struct ext4fs_journal_stall_info {
+	struct ext4fs_journal_stall_entry
+			 queue[EXT4FS_JOURNAL_STALL_QUEUE_MAX];
+	struct ext4fs_journal_stall_entry running;
+	struct ext4fs_journal_stall_entry committing;
+	u_int32_t	 head;
+	u_int32_t	 tail;
+	u_int32_t	 free;
+	u_int32_t	 count;
+	u_int32_t	 committed_count;
+	u_int32_t	 committed_blocks;
+	enum ext4fs_journal_stage stage;
+	pid_t		 owner_pid;
+	pid_t		 owner_tid;
+	pid_t		 handoff_pid;
+	pid_t		 handoff_tid;
+	int		 has_running;
+	int		 has_committing;
+	int		 has_active;
+	int		 has_handoff;
+};
 
 struct ext4fs_journal {
 	struct mutex	 j_lock;
@@ -200,13 +234,17 @@ struct ext4fs_journal {
 	u_int32_t	 j_committed_blocks;
 	u_int32_t	 j_max_transaction_credits;
 	u_int32_t	 j_expired_sequence;
+	u_int32_t	 j_stall_sequence;
 	u_int32_t	 j_features_compat;
 	u_int32_t	 j_features_incompat;
 	u_int32_t	 j_features_ro_compat;
 	u_int32_t	 j_checksum_seed;
 	u_int8_t	 j_uuid[16];
 	enum ext4fs_journal_stage j_stage;
+	enum ext4fs_journal_stage j_stall_stage;
 	int		 j_aborted;
+	int		 j_stall_reported;
+	int		 j_handoff_stall_reported;
 	int		 j_error;
 	int		 j_commit_busy;
 	int		 j_scratch_busy;
@@ -2381,18 +2419,136 @@ ext4fs_journal_error (struct mount *mp)
 	return (error);
 }
 
+static void
+ext4fs_journal_stall_copy (
+    struct ext4fs_journal_stall_entry *entry,
+    struct ext4fs_journal_transaction *tx)
+{
+	entry->sequence = tx->jt_sequence;
+	entry->start = tx->jt_log_start;
+	entry->end = tx->jt_log_end;
+	entry->blocks = tx->jt_log_blocks;
+	entry->used = tx->jt_credits_used;
+	entry->reserved = tx->jt_credits_reserved;
+	entry->state = tx->jt_state;
+}
+
+/* Called with j_lock held; returns with it held. */
+static void
+ext4fs_journal_stall_report (struct ext4fs_journal *journal,
+    const char *wmesg)
+{
+	struct ext4fs_journal_stall_info info;
+	struct ext4fs_journal_transaction *tx;
+	struct mount *mp;
+	u_int32_t i;
+	pid_t waiter_pid, waiter_tid;
+
+	memset(&info, 0, sizeof(info));
+	info.stage = journal->j_stage;
+	info.head = journal->j_head;
+	info.tail = journal->j_tail;
+	info.free = journal->j_free;
+	info.committed_count = journal->j_committed_count;
+	info.committed_blocks = journal->j_committed_blocks;
+	if (journal->j_active != NULL) {
+		info.has_active = 1;
+		info.owner_pid = journal->j_active->jh_owner_pid;
+		info.owner_tid = journal->j_active->jh_owner_tid +
+		    THREAD_PID_OFFSET;
+	}
+	if (journal->j_handoff != NULL) {
+		info.has_handoff = 1;
+		info.handoff_pid = journal->j_handoff->p_p->ps_pid;
+		info.handoff_tid = journal->j_handoff->p_tid +
+		    THREAD_PID_OFFSET;
+	}
+	if (journal->j_running != NULL) {
+		info.has_running = 1;
+		ext4fs_journal_stall_copy(&info.running,
+		    journal->j_running);
+	}
+	if (journal->j_committing != NULL) {
+		info.has_committing = 1;
+		ext4fs_journal_stall_copy(&info.committing,
+		    journal->j_committing);
+	}
+	TAILQ_FOREACH(tx, &journal->j_committed, jt_entry) {
+		if (info.count < EXT4FS_JOURNAL_STALL_QUEUE_MAX)
+			ext4fs_journal_stall_copy(
+			    &info.queue[info.count], tx);
+		info.count++;
+	}
+	mp = journal->j_mp;
+	waiter_pid = curproc->p_p->ps_pid;
+	waiter_tid = curproc->p_tid + THREAD_PID_OFFSET;
+	mtx_leave(&journal->j_lock);
+	ext4fs_print(mp, "journal stall (%s): waiter pid %d tid %d, "
+	    "stage %s, head %u, tail %u, free %u, queued %u\n",
+	    wmesg, waiter_pid, waiter_tid,
+	    ext4fs_journal_stage_name(info.stage), info.head,
+	    info.tail, info.free, info.count);
+	ext4fs_print(mp, "committed accounting: %u transactions, "
+	    "%u blocks\n", info.committed_count,
+	    info.committed_blocks);
+	if (info.has_active)
+		ext4fs_print(mp, "active owner pid %d tid %d\n",
+		    info.owner_pid, info.owner_tid);
+	if (info.has_handoff)
+		ext4fs_print(mp, "handoff owner pid %d tid %d\n",
+		    info.handoff_pid, info.handoff_tid);
+	if (info.has_running)
+		ext4fs_print(mp, "running sequence %u, used %u, "
+		    "reserved %u\n", info.running.sequence,
+		    info.running.used, info.running.reserved);
+	if (info.has_committing)
+		ext4fs_print(mp, "committing sequence %u, state %s, "
+		    "log %u..%u (%u blocks), used %u, reserved %u\n",
+		    info.committing.sequence,
+		    ext4fs_journal_transaction_state_name(
+		    info.committing.state), info.committing.start,
+		    info.committing.end, info.committing.blocks,
+		    info.committing.used, info.committing.reserved);
+	for (i = 0; i < info.count &&
+	    i < EXT4FS_JOURNAL_STALL_QUEUE_MAX; i++)
+		ext4fs_print(mp, "queued[%u] sequence %u, state %s, "
+		    "log %u..%u (%u blocks), used %u, reserved %u\n", i,
+		    info.queue[i].sequence,
+		    ext4fs_journal_transaction_state_name(
+		    info.queue[i].state), info.queue[i].start,
+		    info.queue[i].end, info.queue[i].blocks,
+		    info.queue[i].used, info.queue[i].reserved);
+	if (info.count > EXT4FS_JOURNAL_STALL_QUEUE_MAX)
+		ext4fs_print(mp, "%u queued transactions exceed "
+		    "the committed queue limit\n",
+		    info.count - EXT4FS_JOURNAL_STALL_QUEUE_MAX);
+	mtx_enter(&journal->j_lock);
+}
+
 /* Called with j_lock held; returns with it held. */
 static void
 ext4fs_journal_wait_active (struct ext4fs_journal *journal,
     const char *wmesg)
 {
 	struct ext4fs_journal_handle *handle;
-	struct mount *mp;
-	u_int32_t sequence;
-	pid_t owner_pid, owner_tid, waiter_pid, waiter_tid;
+	struct proc *handoff;
 	int error;
 
 	handle = journal->j_active;
+	handoff = journal->j_handoff;
+	if (handle == NULL && handoff != NULL) {
+		error = msleep_nsec(&journal->j_active,
+		    &journal->j_lock, PRIBIO, wmesg,
+		    journal->j_handoff_stall_reported ? INFSLP :
+		    EXT4FS_JOURNAL_STALL_NSEC);
+		if (error == EWOULDBLOCK &&
+		    journal->j_handoff == handoff &&
+		    ! journal->j_handoff_stall_reported) {
+			journal->j_handoff_stall_reported = 1;
+			ext4fs_journal_stall_report(journal, wmesg);
+		}
+		return;
+	}
 	error = msleep_nsec(&journal->j_active, &journal->j_lock,
 	    PRIBIO, wmesg, handle != NULL &&
 	    ! handle->jh_stall_reported ?
@@ -2400,20 +2556,33 @@ ext4fs_journal_wait_active (struct ext4fs_journal *journal,
 	if (error != EWOULDBLOCK || handle == NULL ||
 	    journal->j_active != handle || handle->jh_stall_reported)
 		return;
-
 	handle->jh_stall_reported = 1;
-	mp = journal->j_mp;
-	sequence = handle->jh_transaction->jt_sequence;
-	owner_pid = handle->jh_owner_pid;
-	owner_tid = handle->jh_owner_tid + THREAD_PID_OFFSET;
-	waiter_pid = curproc->p_p->ps_pid;
-	waiter_tid = curproc->p_tid + THREAD_PID_OFFSET;
-	mtx_leave(&journal->j_lock);
-	ext4fs_print(mp, "journal active for 10s: owner pid %d "
-	    "tid %d, waiter pid %d tid %d (%s), sequence %u\n",
-	    owner_pid, owner_tid, waiter_pid, waiter_tid, wmesg,
-	    sequence);
-	mtx_enter(&journal->j_lock);
+	ext4fs_journal_stall_report(journal, wmesg);
+}
+
+/* Called with j_lock held; returns with it held. */
+static void
+ext4fs_journal_wait_committing (struct ext4fs_journal *journal,
+    const char *wmesg)
+{
+	struct ext4fs_journal_transaction *tx;
+	int error, reported;
+
+	tx = journal->j_committing;
+	KASSERT(tx != NULL);
+	reported = journal->j_stall_reported &&
+	    journal->j_stall_sequence == tx->jt_sequence &&
+	    journal->j_stall_stage == journal->j_stage;
+	error = msleep_nsec(&journal->j_committing, &journal->j_lock,
+	    PRIBIO, wmesg, reported ? INFSLP :
+	    EXT4FS_JOURNAL_STALL_NSEC);
+	if (error != EWOULDBLOCK || journal->j_committing != tx ||
+	    reported)
+		return;
+	journal->j_stall_reported = 1;
+	journal->j_stall_sequence = tx->jt_sequence;
+	journal->j_stall_stage = journal->j_stage;
+	ext4fs_journal_stall_report(journal, wmesg);
 }
 
 int
@@ -2476,9 +2645,8 @@ ext4fs_journal_begin (struct mount *mp, unsigned int credits,
 			    ! TAILQ_EMPTY(
 			    &journal->j_committing->jt_revokes)))
 				break;
-			msleep_nsec(&journal->j_committing,
-			    &journal->j_lock, PRIBIO, "e4jwait",
-			    INFSLP);
+			ext4fs_journal_wait_committing(journal,
+			    "e4jwait");
 		}
 		if (error == 0 && journal->j_running != NULL) {
 			tx = journal->j_running;
@@ -2700,9 +2868,8 @@ ext4fs_journal_read_metadata (struct mount *mp, struct vnode *devvp,
 			    committing, fsblock);
 			if (metadata != NULL && committing->jt_state ==
 			    EXT4FS_JOURNAL_TRANSACTION_COMMITTING) {
-				msleep_nsec(&journal->j_committing,
-				    &journal->j_lock, PRIBIO, "e4jread",
-				    INFSLP);
+				ext4fs_journal_wait_committing(journal,
+				    "e4jread");
 				mtx_leave(&journal->j_lock);
 				continue;
 			}
@@ -3377,8 +3544,8 @@ ext4fs_journal_revoke (struct ext4fs_journal_handle *handle,
 		if (journal->j_committing == NULL)
 			break;
 		/* Do not race reuse against an older commit or home write. */
-		msleep_nsec(&journal->j_committing, &journal->j_lock,
-		    PRIBIO, "e4jrevoke", INFSLP);
+		ext4fs_journal_wait_committing(journal,
+		    "e4jrevoke");
 	}
 	revoke = ext4fs_journal_revoke_block_find(
 	    handle->jh_transaction, fsblock);
@@ -3557,6 +3724,7 @@ ext4fs_journal_end_internal (struct ext4fs_journal_handle *handle,
 		 */
 		KASSERT(journal->j_handoff == NULL);
 		journal->j_handoff = curproc;
+		journal->j_handoff_stall_reported = 0;
 	}
 	wakeup(&journal->j_active);
 	mtx_leave(&journal->j_lock);
@@ -3714,9 +3882,8 @@ ext4fs_journal_commit_internal (struct mount *mp,
 			    sequence);
 			if (drain && checkpoint_last != NULL) {
 				if (journal->j_committing != NULL) {
-					msleep_nsec(&journal->j_committing,
-					    &journal->j_lock, PRIBIO,
-					    "e4jwait", INFSLP);
+					ext4fs_journal_wait_committing(
+					    journal, "e4jwait");
 					continue;
 				}
 				tx = TAILQ_FIRST(&journal->j_committed);
@@ -3730,9 +3897,8 @@ ext4fs_journal_commit_internal (struct mount *mp,
 			    ext4fs_journal_state_sequence_before(
 			    journal->j_committing->jt_sequence,
 			    sequence)) {
-				msleep_nsec(&journal->j_committing,
-				    &journal->j_lock, PRIBIO,
-				    "e4jwait", INFSLP);
+				ext4fs_journal_wait_committing(journal,
+				    "e4jwait");
 				continue;
 			}
 			satisfied = 1;
@@ -3744,9 +3910,8 @@ ext4fs_journal_commit_internal (struct mount *mp,
 			if (journal->j_committing != NULL &&
 			    journal->j_committing->jt_sequence ==
 			    sequence) {
-				msleep_nsec(&journal->j_committing,
-				    &journal->j_lock, PRIBIO,
-				    "e4jwait", INFSLP);
+				ext4fs_journal_wait_committing(journal,
+				    "e4jwait");
 				continue;
 			}
 			checkpoint_last =
@@ -3754,9 +3919,8 @@ ext4fs_journal_commit_internal (struct mount *mp,
 			    sequence);
 			if (drain && checkpoint_last != NULL) {
 				if (journal->j_committing != NULL) {
-					msleep_nsec(&journal->j_committing,
-					    &journal->j_lock, PRIBIO,
-					    "e4jwait", INFSLP);
+					ext4fs_journal_wait_committing(
+					    journal, "e4jwait");
 					continue;
 				}
 				tx = TAILQ_FIRST(&journal->j_committed);
@@ -3783,9 +3947,8 @@ ext4fs_journal_commit_internal (struct mount *mp,
 		if (error != 0)
 			break;
 		if (journal->j_committing != NULL) {
-			msleep_nsec(&journal->j_committing,
-			    &journal->j_lock, PRIBIO, "e4jwait",
-			    INFSLP);
+			ext4fs_journal_wait_committing(journal,
+			    "e4jwait");
 			continue;
 		}
 		break;

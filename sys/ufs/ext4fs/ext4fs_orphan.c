@@ -54,9 +54,16 @@ struct ext4fs_orphan_remove_state {
 	u_int32_t	 ors_seed;
 };
 
+struct ext4fs_recovery_state {
+	u_int8_t	*rs_dirty_groups;
+	size_t		 rs_dirty_size;
+	int		 rs_recount_ready;
+};
+
 struct ext4fs_orphan_extent_ctx {
 	struct m_ext4fs	*fs;
 	struct vnode	*devvp;
+	struct ext4fs_recovery_state *recovery;
 	u_int32_t	 ino;
 	u_int32_t	 generation;
 	u_int64_t	 cutoff;
@@ -83,7 +90,8 @@ static int	ext4fs_orphan_inode_read (struct m_ext4fs *,
 static int	ext4fs_recovery_inode_write (struct m_ext4fs *,
 		    struct vnode *, u_int32_t,
 		    struct ext4fs_dinode_256 *);
-static int	ext4fs_recovery_recount (struct mount *, int64_t);
+static int	ext4fs_recovery_recount (struct mount *,
+		    struct ext4fs_recovery_state *, int64_t);
 static int	ext4fs_orphan_file_add_handle (struct inode *,
 		    const struct ext4fs_orphan_add_state *,
 		    struct ext4fs_journal_handle *);
@@ -735,13 +743,14 @@ ext4fs_orphan_count_dirs (struct m_ext4fs *fs, struct vnode *devvp,
 }
 
 /*
- * Rebuild counters and bitmap checksums from the durable bitmaps.
- * Recovery calls this before dropping an orphan reference, so a crash
- * during the recount merely causes the still-reachable orphan to be
- * retried.
+ * First rebuild all counters in case an earlier recovery stopped
+ * between a bitmap write and its descriptor update.  After a durable
+ * recount, only groups changed by this mount's recovery need scanning.
+ * The orphan reference remains until the recount and flush complete.
  */
 static int
-ext4fs_recovery_recount (struct mount *mp, int64_t dir_group)
+ext4fs_recovery_recount (struct mount *mp,
+    struct ext4fs_recovery_state *state, int64_t dir_group)
 {
 	struct ufsmount *ump = VFSTOUFS(mp);
 	struct m_ext4fs *fs = ump->um_e4fs;
@@ -751,16 +760,30 @@ ext4fs_recovery_recount (struct mount *mp, int64_t dir_group)
 	u_int64_t free_blocks, group_start, bitmap_block;
 	u_int64_t inode_start, free_inodes64;
 	u_int32_t group, valid, free_count, checksum, i, dirs;
+	u_int32_t old_free_blocks, old_free_inodes;
 	u_int16_t flags;
 	int error;
 
 	if (fs->m_block_group_count > UINT32_MAX)
 		return (EFBIG);
-	free_blocks = 0;
-	free_inodes64 = 0;
+	if (state->rs_recount_ready) {
+		free_blocks = fs->m_free_blocks_count;
+		free_inodes64 = fs->m_free_inodes_count;
+	} else {
+		free_blocks = 0;
+		free_inodes64 = 0;
+	}
 	for (group = 0; group < fs->m_block_group_count; group++) {
+		if (state->rs_recount_ready &&
+		    ! isset(state->rs_dirty_groups, group) &&
+		    (int64_t)group != dir_group)
+			continue;
 		gd = &fs->m_gd[group];
 		old_gd = *gd;
+		old_free_blocks = ext4fs_bgd_get_count(fs, gd,
+		    EXT4FS_BGD_FREE_BLOCKS);
+		old_free_inodes = ext4fs_bgd_get_count(fs, gd,
+		    EXT4FS_BGD_FREE_INODES);
 		flags = letoh16(gd->bgd_flags);
 
 		group_start = fs->m_first_data_block +
@@ -805,7 +828,12 @@ ext4fs_recovery_recount (struct mount *mp, int64_t dir_group)
 			ext4fs_bgd_set_count(fs, gd,
 			    EXT4FS_BGD_FREE_BLOCKS, free_count);
 		}
-		free_blocks += free_count;
+		if (state->rs_recount_ready) {
+			if (free_count < old_free_blocks)
+				return (EINVAL);
+			free_blocks += free_count - old_free_blocks;
+		} else
+			free_blocks += free_count;
 
 		inode_start = (u_int64_t)group * fs->m_inodes_per_group;
 		valid = 0;
@@ -862,7 +890,12 @@ ext4fs_recovery_recount (struct mount *mp, int64_t dir_group)
 			ext4fs_bgd_set_count(fs, gd,
 			    EXT4FS_BGD_FREE_INODES, free_count);
 		}
-		free_inodes64 += free_count;
+		if (state->rs_recount_ready) {
+			if (free_count < old_free_inodes)
+				return (EINVAL);
+			free_inodes64 += free_count - old_free_inodes;
+		} else
+			free_inodes64 += free_count;
 
 		gd->bgd_checksum = htole16(ext4fs_bgd_csum(fs,
 		    gd, group));
@@ -882,12 +915,17 @@ ext4fs_recovery_recount (struct mount *mp, int64_t dir_group)
 	error = ext4fs_sbwrite_direct(mp);
 	if (error)
 		return (error);
-	return (ext4fs_recovery_flush(mp));
+	error = ext4fs_recovery_flush(mp);
+	if (error)
+		return (error);
+	memset(state->rs_dirty_groups, 0, state->rs_dirty_size);
+	state->rs_recount_ready = 1;
+	return (0);
 }
 
 static int
-ext4fs_recovery_bitmap_clear (struct m_ext4fs *fs,
-    struct vnode *devvp,
+ext4fs_recovery_bitmap_clear (struct ext4fs_recovery_state *state,
+    struct m_ext4fs *fs, struct vnode *devvp,
     u_int64_t block, int inode)
 {
 	struct ext4fs_block_group_descriptor *gd;
@@ -925,7 +963,10 @@ ext4fs_recovery_bitmap_clear (struct m_ext4fs *fs,
 		return (error);
 	}
 	clrbit((u_int8_t *)bp->b_data, bit);
-	return (bwrite(bp));
+	error = bwrite(bp);
+	if (error == 0)
+		setbit(state->rs_dirty_groups, group);
+	return (error);
 }
 
 static u_int64_t
@@ -1300,11 +1341,12 @@ ext4fs_recovery_xattr_release (struct mount *mp,
 	}
 	if (references == 0) {
 		brelse(bp);
-		error = ext4fs_recovery_bitmap_clear(ctx->fs,
-		    ctx->devvp, block, 0);
+		error = ext4fs_recovery_bitmap_clear(
+		    ctx->recovery, ctx->fs, ctx->devvp, block, 0);
 		if (error)
 			return (error);
-		error = ext4fs_recovery_recount(mp, -1);
+		error = ext4fs_recovery_recount(mp,
+		    ctx->recovery, -1);
 		if (error)
 			return (error);
 	} else {
@@ -1592,7 +1634,7 @@ ext4fs_recovery_extent_clear_data (
 			physical += start - first;
 			while (start++ < end) {
 				error = ext4fs_recovery_bitmap_clear(
-				    ctx->fs,
+				    ctx->recovery, ctx->fs,
 				    ctx->devvp, physical++, 0);
 				if (error)
 					return (error);
@@ -1647,8 +1689,8 @@ ext4fs_recovery_extent_clear_tree (
 		brelse(bp);
 		if (error)
 			return (error);
-		error = ext4fs_recovery_bitmap_clear(ctx->fs,
-		    ctx->devvp, child, 0);
+		error = ext4fs_recovery_bitmap_clear(
+		    ctx->recovery, ctx->fs, ctx->devvp, child, 0);
 		if (error)
 			return (error);
 	}
@@ -1750,8 +1792,9 @@ ext4fs_recovery_extent_prune_node (
 		if (error)
 			return (error);
 		if (child_empty) {
-			error = ext4fs_recovery_bitmap_clear(ctx->fs,
-			    ctx->devvp, child, 0);
+			error = ext4fs_recovery_bitmap_clear(
+			    ctx->recovery, ctx->fs, ctx->devvp,
+			    child, 0);
 			if (error)
 				return (error);
 			continue;
@@ -1792,7 +1835,8 @@ ext4fs_orphan_inode_blocks_set (struct ext4fs_orphan_extent_ctx *ctx,
 }
 
 static int
-ext4fs_recovery_inode_cleanup (struct mount *mp, u_int32_t ino,
+ext4fs_recovery_inode_cleanup (struct mount *mp,
+    struct ext4fs_recovery_state *state, u_int32_t ino,
     struct ext4fs_dinode_256 *dp, int *count)
 {
 	struct ufsmount *ump = VFSTOUFS(mp);
@@ -1821,6 +1865,7 @@ ext4fs_recovery_inode_cleanup (struct mount *mp, u_int32_t ino,
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.fs = fs;
 	ctx.devvp = ump->um_devvp;
+	ctx.recovery = state;
 	ctx.ino = ino;
 	ctx.generation = din->i_nfs_generation;
 	ctx.cutoff = nlink == 0 ? 0 : cutoff;
@@ -1881,7 +1926,8 @@ ext4fs_recovery_inode_cleanup (struct mount *mp, u_int32_t ino,
 			    &ctx, eh, letoh16(eh->eh_depth));
 			if (error)
 				return (error);
-			error = ext4fs_recovery_recount(mp, -1);
+			error = ext4fs_recovery_recount(mp, state,
+			    -1);
 			if (error)
 				return (error);
 			memset(din->i_extent, 0,
@@ -1894,7 +1940,8 @@ ext4fs_recovery_inode_cleanup (struct mount *mp, u_int32_t ino,
 			eh->eh_generation = 0;
 			blocks = 0;
 		} else {
-			error = ext4fs_recovery_recount(mp, -1);
+			error = ext4fs_recovery_recount(mp, state,
+			    -1);
 			if (error)
 				return (error);
 			error = ext4fs_recovery_extent_prune_node(
@@ -1931,16 +1978,16 @@ ext4fs_recovery_inode_cleanup (struct mount *mp, u_int32_t ino,
 		return (error);
 
 	/* Persist index-block bitmap changes made while pruning. */
-	error = ext4fs_recovery_recount(mp, -1);
+	error = ext4fs_recovery_recount(mp, state, -1);
 	if (error)
 		return (error);
 	if (nlink == 0) {
-		error = ext4fs_recovery_bitmap_clear(fs, ump->um_devvp,
-		    ino, 1);
+		error = ext4fs_recovery_bitmap_clear(state, fs,
+		    ump->um_devvp, ino, 1);
 		if (error)
 			return (error);
 		group = (ino - 1) / fs->m_inodes_per_group;
-		error = ext4fs_recovery_recount(mp,
+		error = ext4fs_recovery_recount(mp, state,
 		    (mode & S_IFMT) == S_IFDIR ? group : -1);
 		if (error)
 			return (error);
@@ -2625,7 +2672,8 @@ ext4fs_orphan_file_remove_handle (struct inode *ip,
 }
 
 static int
-ext4fs_recovery_orphan_file (struct mount *mp, int *count)
+ext4fs_recovery_orphan_file (struct mount *mp,
+    struct ext4fs_recovery_state *state, int *count)
 {
 	struct ufsmount *ump = VFSTOUFS(mp);
 	struct m_ext4fs *fs = ump->um_e4fs;
@@ -2686,8 +2734,8 @@ ext4fs_recovery_orphan_file (struct mount *mp, int *count)
 			    ino, &dp);
 			if (error)
 				return (error);
-			error = ext4fs_recovery_inode_cleanup(mp, ino,
-			    &dp, count);
+			error = ext4fs_recovery_inode_cleanup(mp, state,
+			    ino, &dp, count);
 			if (error)
 				return (error);
 
@@ -2727,7 +2775,8 @@ ext4fs_recovery_orphan_file (struct mount *mp, int *count)
 }
 
 static int
-ext4fs_recovery_classic_orphans (struct mount *mp, int *count)
+ext4fs_recovery_classic_orphans (struct mount *mp,
+    struct ext4fs_recovery_state *state, int *count)
 {
 	struct ufsmount *ump = VFSTOUFS(mp);
 	struct m_ext4fs *fs = ump->um_e4fs;
@@ -2792,7 +2841,7 @@ ext4fs_recovery_classic_orphans (struct mount *mp, int *count)
 				goto out;
 			}
 			error = ext4fs_recovery_inode_cleanup(mp,
-			    tail, &dp, count);
+			    state, tail, &dp, count);
 			if (error)
 				goto out;
 
@@ -2833,6 +2882,7 @@ ext4fs_orphan_cleanup (struct mount *mp)
 {
 	struct ufsmount *ump = VFSTOUFS(mp);
 	struct m_ext4fs *fs = ump->um_e4fs;
+	struct ext4fs_recovery_state state;
 	u_int32_t ro;
 	int count, error;
 
@@ -2850,16 +2900,22 @@ ext4fs_orphan_cleanup (struct mount *mp)
 	if (fs->m_read_only)
 		return (EROFS);
 
+	memset(&state, 0, sizeof(state));
+	state.rs_dirty_size = howmany(fs->m_block_group_count, NBBY);
+	state.rs_dirty_groups = malloc(state.rs_dirty_size,
+	    M_UFSMNT, M_WAITOK | M_ZERO);
 	ext4fs_print(mp, "cleaning up orphan inodes\n");
 	count = 0;
-	error = ext4fs_recovery_classic_orphans(mp, &count);
+	error = ext4fs_recovery_classic_orphans(mp, &state,
+	    &count);
 	if (error)
-		return (error);
+		goto out;
 	if (fs->m_feature_ro_compat &
 	    EXT4FS_FEATURE_RO_COMPAT_ORPHAN_PRESENT) {
-		error = ext4fs_recovery_orphan_file(mp, &count);
+		error = ext4fs_recovery_orphan_file(mp, &state,
+		    &count);
 		if (error)
-			return (error);
+			goto out;
 		ro = fs->m_feature_ro_compat &
 		    ~EXT4FS_FEATURE_RO_COMPAT_ORPHAN_PRESENT;
 		fs->m_feature_ro_compat = ro;
@@ -2867,12 +2923,15 @@ ext4fs_orphan_cleanup (struct mount *mp)
 		fs->m_fs_was_modified = 1;
 		error = ext4fs_sbwrite_direct(mp);
 		if (error)
-			return (error);
+			goto out;
 		error = ext4fs_recovery_flush(mp);
 		if (error)
-			return (error);
+			goto out;
 	}
 	ext4fs_print(mp, "orphan cleanup: %d inode%s\n", count,
 	    count == 1 ? "" : "s");
-	return (0);
+out:
+	free(state.rs_dirty_groups, M_UFSMNT,
+	    state.rs_dirty_size);
+	return (error);
 }

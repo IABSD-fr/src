@@ -115,6 +115,12 @@ cleanup()
 }
 trap cleanup EXIT HUP INT TERM
 
+# The object directory may be mounted noexec.  Run a copy of the
+# built helper from the executable test work directory.
+cp "$EXT4FSOPS" "$work/ext4fsops"
+chmod 700 "$work/ext4fsops"
+EXT4FSOPS=$work/ext4fsops
+
 test_name=
 fail()
 {
@@ -2037,6 +2043,123 @@ run_allocation_run_case()
 	echo " ok"
 }
 
+run_mmap_hole_case()
+{
+	block_size=$1
+	case_dir=$work/mmap-hole-$block_size
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	test_name="mapped hole write ($block_size byte blocks)"
+	print_test_name "$test_name"
+
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O 'metadata_csum,^orphan_file' "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs failed"
+	fi
+	check_image fixture
+
+	attach_image
+	mount_image noatime
+	run_step mmap-hole-write "$mountpoint"
+	unmount_image mmap-hole-write
+	detach_image
+	check_image mmap-hole-write
+
+	attach_image
+	mount_image ro
+	run_step mmap-hole-verify "$mountpoint"
+	unmount_image mmap-hole-verify
+	detach_image
+	check_image mmap-hole-verify
+	echo " ok"
+}
+
+run_mmap_truncate_case()
+{
+	block_size=$1
+	variant=$2
+	case "$variant" in
+	active)
+		write_mode=mmap-truncate-write
+		test_name="mapped partial truncate"
+		;;
+	unmapped)
+		write_mode=mmap-truncate-unmapped-write
+		test_name="unmapped partial truncate"
+		;;
+	reader)
+		write_mode=mmap-truncate-reader-write
+		test_name="held-reader partial truncate"
+		;;
+	reader-sync)
+		write_mode=mmap-truncate-reader-sync-write
+		test_name="synced reader partial truncate"
+		;;
+	esac
+	case_dir=$work/mmap-truncate-$variant-$block_size
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	test_name="$test_name ($block_size byte blocks)"
+	print_test_name "$test_name"
+
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O 'metadata_csum,^orphan_file' "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs failed"
+	fi
+	check_image fixture
+
+	attach_image
+	mount_image noatime
+	run_step "$write_mode" "$mountpoint"
+	unmount_image "$write_mode"
+	detach_image
+	check_image "$write_mode"
+
+	attach_image
+	mount_image ro
+	run_step mmap-truncate-verify "$mountpoint"
+	unmount_image mmap-truncate-verify
+	detach_image
+	check_image mmap-truncate-verify
+	echo " ok"
+}
+
+run_mapped_append_race_case()
+{
+	block_size=$1
+	case_dir=$work/mapped-append-race-$block_size
+	image=$case_dir/ext4.img
+	mkdir "$case_dir"
+	test_name="concurrent mapped append ($block_size bytes)"
+	print_test_name "$test_name"
+
+	dd if=/dev/zero of="$image" bs=1m count=0 \
+	    seek="$EXT4FS_IMAGE_MB" status=none
+	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
+	    -O 'metadata_csum,^orphan_file' "$image" \
+	    >"$case_dir/mke2fs.log" 2>&1; then
+		cat "$case_dir/mke2fs.log" >&2
+		fail "mke2fs failed"
+	fi
+	check_image fixture
+
+	attach_image
+	mount_image noatime
+	run_step mapped-append-race "$mountpoint"
+	unmount_image mapped-append-race
+	detach_image
+	check_image mapped-append-race
+	echo " ok"
+}
+
 run_extent_case()
 {
 	block_size=$1
@@ -3004,6 +3127,42 @@ allocation-run)
 			;;
 		esac
 		run_allocation_run_case "$block_size"
+	done
+	exit 0
+	;;
+mmap-hole)
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		run_mmap_hole_case "$block_size"
+	done
+	exit 0
+	;;
+mmap-truncate)
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		run_mmap_truncate_case "$block_size" active
+	done
+	exit 0
+	;;
+mmap-truncate-unmapped)
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		run_mmap_truncate_case "$block_size" unmapped
+	done
+	exit 0
+	;;
+mmap-truncate-reader)
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		run_mmap_truncate_case "$block_size" reader
+	done
+	exit 0
+	;;
+mmap-truncate-reader-sync)
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		run_mmap_truncate_case "$block_size" reader-sync
+	done
+	exit 0
+	;;
+mapped-append-race)
+	for block_size in $EXT4FS_BLOCK_SIZES; do
+		run_mapped_append_race_case "$block_size"
 	done
 	exit 0
 	;;

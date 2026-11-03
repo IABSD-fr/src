@@ -27,6 +27,10 @@ REGRESS_TARGETS=	run-regress-ext4fsops \
 			run-regress-ext4fsops-rename-growth \
 			run-regress-ext4fsops-directory-churn \
 			run-regress-ext4fsops-allocation-run \
+			run-regress-ext4fsops-mmap-hole \
+			run-regress-ext4fsops-mmap-truncate-unmapped \
+			run-regress-ext4fsops-mmap-truncate-reader-sync \
+			run-regress-ext4fsops-mapped-append-race \
 			run-regress-ext4fsops-extents \
 			run-regress-ext4fsops-directory \
 			run-regress-ext4fsops-orphan \
@@ -186,6 +190,57 @@ run-regress-ext4fsops-allocation-run: ${PROG}
 	    EXT4FS_IMAGE_MB='${EXT4FS_IMAGE_MB}' \
 	    EXT4FS_BLOCK_SIZES='${EXT4FS_BLOCK_SIZES}' \
 	    EXT4FSOPS_MODE='allocation-run' \
+	    sh ${.CURDIR}/operations.sh
+
+run-regress-ext4fsops-mmap-hole: ${PROG}
+	env EXT4FSOPS='${.OBJDIR}/${PROG}' \
+	    EXT4FS_TIMEOUT='${EXT4FS_TIMEOUT}' \
+	    EXT4FS_IMAGE_MB='${EXT4FS_IMAGE_MB}' \
+	    EXT4FS_BLOCK_SIZES='${EXT4FS_BLOCK_SIZES}' \
+	    EXT4FSOPS_MODE='mmap-hole' \
+	    sh ${.CURDIR}/operations.sh
+
+# Diagnostic only: unsynchronized shared mappings have no specified
+# truncate behavior and this probe also fails on FFS.
+run-regress-ext4fsops-mmap-truncate: ${PROG}
+	env EXT4FSOPS='${.OBJDIR}/${PROG}' \
+	    EXT4FS_TIMEOUT='${EXT4FS_TIMEOUT}' \
+	    EXT4FS_IMAGE_MB='${EXT4FS_IMAGE_MB}' \
+	    EXT4FS_BLOCK_SIZES='${EXT4FS_BLOCK_SIZES}' \
+	    EXT4FSOPS_MODE='mmap-truncate' \
+	    sh ${.CURDIR}/operations.sh
+
+run-regress-ext4fsops-mmap-truncate-unmapped: ${PROG}
+	env EXT4FSOPS='${.OBJDIR}/${PROG}' \
+	    EXT4FS_TIMEOUT='${EXT4FS_TIMEOUT}' \
+	    EXT4FS_IMAGE_MB='${EXT4FS_IMAGE_MB}' \
+	    EXT4FS_BLOCK_SIZES='${EXT4FS_BLOCK_SIZES}' \
+	    EXT4FSOPS_MODE='mmap-truncate-unmapped' \
+	    sh ${.CURDIR}/operations.sh
+
+# Diagnostic only: a read-only mapping keeps the vnode pager active.
+run-regress-ext4fsops-mmap-truncate-reader: ${PROG}
+	env EXT4FSOPS='${.OBJDIR}/${PROG}' \
+	    EXT4FS_TIMEOUT='${EXT4FS_TIMEOUT}' \
+	    EXT4FS_IMAGE_MB='${EXT4FS_IMAGE_MB}' \
+	    EXT4FS_BLOCK_SIZES='${EXT4FS_BLOCK_SIZES}' \
+	    EXT4FSOPS_MODE='mmap-truncate-reader' \
+	    sh ${.CURDIR}/operations.sh
+
+run-regress-ext4fsops-mmap-truncate-reader-sync: ${PROG}
+	env EXT4FSOPS='${.OBJDIR}/${PROG}' \
+	    EXT4FS_TIMEOUT='${EXT4FS_TIMEOUT}' \
+	    EXT4FS_IMAGE_MB='${EXT4FS_IMAGE_MB}' \
+	    EXT4FS_BLOCK_SIZES='${EXT4FS_BLOCK_SIZES}' \
+	    EXT4FSOPS_MODE='mmap-truncate-reader-sync' \
+	    sh ${.CURDIR}/operations.sh
+
+run-regress-ext4fsops-mapped-append-race: ${PROG}
+	env EXT4FSOPS='${.OBJDIR}/${PROG}' \
+	    EXT4FS_TIMEOUT='${EXT4FS_TIMEOUT}' \
+	    EXT4FS_IMAGE_MB='${EXT4FS_IMAGE_MB}' \
+	    EXT4FS_BLOCK_SIZES='${EXT4FS_BLOCK_SIZES}' \
+	    EXT4FSOPS_MODE='mapped-append-race' \
 	    sh ${.CURDIR}/operations.sh
 
 run-regress-ext4fsops-directory: ${PROG}

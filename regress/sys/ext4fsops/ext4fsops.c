@@ -65,6 +65,8 @@
 #define EXT4_DIRENT_HEADER	8
 #define DIRECTORY_CHURN_TARGETS	12
 #define DIRECTORY_CHURN_RENAMES	64
+#define MAPPED_APPEND_RACE_ROUNDS	64
+#define MAPPED_APPEND_RACE_BYTES	(2 * 1024 * 1024)
 
 #define DATA_SEED	0x31U
 #define APPEND_SEED	0x52U
@@ -76,6 +78,12 @@
 #define ALLOCATION_RUN_SEED	0x5eU
 #define MAPPED_DIRTY_SEED	0x71U
 #define MAPPED_APPEND_SEED	0xc3U
+#define MAPPED_HOLE_SEED	0xa6U
+#define MAPPED_TRUNCATE_SEED	0xd7U
+#define MAPPED_TRUNCATE_UNMAPPED	0
+#define MAPPED_TRUNCATE_ACTIVE	1
+#define MAPPED_TRUNCATE_READER	2
+#define MAPPED_TRUNCATE_READER_SYNC	3
 #define BITMAP_SEED	0xc7U
 #define FSYNC_INITIAL_SEED	0x2dU
 #define FSYNC_UPDATE_SEED	0xe1U
@@ -2744,6 +2752,312 @@ verify_vmcache_allocation_run (void)
 		err(1, "close %s", path);
 }
 
+/* Write a hole while a synchronized shared mapping remains active. */
+static void
+write_mapped_hole (void)
+{
+	char path[PATH_MAX];
+	unsigned char *mapping;
+	size_t page_size;
+	off_t hole;
+	int fd;
+
+	page_size = (size_t)getpagesize();
+	if (page_size < block_size || page_size % block_size != 0)
+		errx(1, "unsupported page and block sizes");
+	hole = (off_t)page_size;
+	make_path(path, sizeof(path), "mapped-hole");
+	fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	write_pattern_once_fd(fd, 0, page_size,
+	    ALLOCATION_RUN_SEED);
+	if (ftruncate(fd, 2 * hole) == -1)
+		err(1, "ftruncate %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	check_zero_fd(fd, hole, page_size);
+
+	mapping = mmap(NULL, 2 * page_size, PROT_READ | PROT_WRITE,
+	    MAP_SHARED, fd, 0);
+	if (mapping == MAP_FAILED)
+		err(1, "mmap %s", path);
+	fill_pattern(mapping, page_size, 0, MAPPED_DIRTY_SEED);
+	if (mapping[page_size] != 0)
+		errx(1, "mapped hole was not zero-filled");
+	if (msync(mapping, 2 * page_size, MS_SYNC) == -1)
+		err(1, "msync %s before pwrite", path);
+	write_pattern_once_fd(fd, hole, 1, MAPPED_HOLE_SEED);
+	check_pattern_fd(fd, hole, 1, MAPPED_HOLE_SEED);
+	if (msync(mapping + page_size, page_size,
+	    MS_SYNC | MS_INVALIDATE) == -1)
+		err(1, "invalidate mapped hole in %s", path);
+	if (mapping[page_size] !=
+	    pattern_byte(hole, MAPPED_HOLE_SEED))
+		errx(1, "mapped hole did not observe pwrite");
+	if (munmap(mapping, 2 * page_size) == -1)
+		err(1, "munmap %s", path);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s after munmap", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+verify_mapped_hole (void)
+{
+	char path[PATH_MAX];
+	struct stat st;
+	size_t page_size;
+	off_t hole;
+	int fd;
+
+	page_size = (size_t)getpagesize();
+	hole = (off_t)page_size;
+	make_path(path, sizeof(path), "mapped-hole");
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (! S_ISREG(st.st_mode) || st.st_size != 2 * hole)
+		errx(1, "mapped hole has wrong inode shape");
+	check_pattern_fd(fd, 0, page_size, MAPPED_DIRTY_SEED);
+	check_pattern_fd(fd, hole, 1, MAPPED_HOLE_SEED);
+	check_zero_fd(fd, hole + 1, page_size - 1);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+/* Compare active, removed, and read-only-held mappings. */
+static void
+write_mapped_truncate (int mode)
+{
+	char path[PATH_MAX];
+	unsigned char *mapping, *reader;
+	unsigned char actual, expected;
+	size_t page_size;
+	off_t boundary;
+	int fd;
+
+	page_size = (size_t)getpagesize();
+	if (page_size < block_size || page_size % block_size != 0)
+		errx(1, "unsupported page and block sizes");
+	boundary = (off_t)page_size;
+	make_path(path, sizeof(path), "mapped-truncate");
+	fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0644);
+	if (fd == -1)
+		err(1, "open %s", path);
+	write_pattern_once_fd(fd, 0, 2 * page_size,
+	    ALLOCATION_RUN_SEED);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s before mmap", path);
+
+	reader = NULL;
+	if (mode == MAPPED_TRUNCATE_READER ||
+	    mode == MAPPED_TRUNCATE_READER_SYNC) {
+		reader = mmap(NULL, 2 * page_size, PROT_READ,
+		    MAP_SHARED, fd, 0);
+		if (reader == MAP_FAILED)
+			err(1, "read-only mmap %s", path);
+		if (reader[page_size] !=
+		    pattern_byte(boundary, ALLOCATION_RUN_SEED))
+			errx(1, "read-only mapping has wrong initial byte");
+	}
+	mapping = mmap(NULL, 2 * page_size, PROT_READ | PROT_WRITE,
+	    MAP_SHARED, fd, 0);
+	if (mapping == MAP_FAILED)
+		err(1, "mmap %s", path);
+	fill_pattern(mapping + page_size, page_size, boundary,
+	    MAPPED_TRUNCATE_SEED);
+	expected = pattern_byte(boundary, MAPPED_TRUNCATE_SEED);
+	if (reader != NULL && reader[page_size] != expected)
+		errx(1, "read-only mapping missed shared write");
+	/* Synchronize the writer while the reader stays mapped. */
+	if (mode == MAPPED_TRUNCATE_READER_SYNC &&
+	    msync(mapping + page_size, page_size, MS_SYNC) == -1)
+		err(1, "msync %s before truncate", path);
+	if (mode != MAPPED_TRUNCATE_ACTIVE) {
+		if (munmap(mapping, 2 * page_size) == -1)
+			err(1, "munmap %s before truncate", path);
+		if (reader != NULL && reader[page_size] != expected)
+			errx(1, "read-only mapping lost shared write");
+	}
+	if (ftruncate(fd, boundary + 1) == -1)
+		err(1, "shrink %s", path);
+	if (mode != MAPPED_TRUNCATE_UNMAPPED) {
+		actual = mode == MAPPED_TRUNCATE_ACTIVE ?
+		    mapping[page_size] : reader[page_size];
+		if (actual != expected)
+			errx(1, "retained byte changed: got 0x%02x, "
+			    "expected 0x%02x", actual, expected);
+		if (mode == MAPPED_TRUNCATE_ACTIVE &&
+		    munmap(mapping, 2 * page_size) == -1)
+			err(1, "munmap %s", path);
+		if (reader != NULL &&
+		    munmap(reader, 2 * page_size) == -1)
+			err(1, "munmap read-only %s", path);
+	}
+	check_pattern_fd(fd, boundary, 1, MAPPED_TRUNCATE_SEED);
+	if (ftruncate(fd, 2 * boundary) == -1)
+		err(1, "regrow %s", path);
+	check_pattern_fd(fd, boundary, 1, MAPPED_TRUNCATE_SEED);
+	check_zero_fd(fd, boundary + 1, page_size - 1);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s after regrowth", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+static void
+verify_mapped_truncate (void)
+{
+	char path[PATH_MAX];
+	struct stat st;
+	size_t page_size;
+	off_t boundary;
+	int fd;
+
+	page_size = (size_t)getpagesize();
+	boundary = (off_t)page_size;
+	make_path(path, sizeof(path), "mapped-truncate");
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (! S_ISREG(st.st_mode) || st.st_size != 2 * boundary)
+		errx(1, "mapped truncate has wrong inode shape");
+	check_pattern_fd(fd, 0, page_size, ALLOCATION_RUN_SEED);
+	check_pattern_fd(fd, boundary, 1, MAPPED_TRUNCATE_SEED);
+	check_zero_fd(fd, boundary + 1, page_size - 1);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+/* Both concurrent O_APPEND records must survive exactly once. */
+static void
+mapped_append_race (void)
+{
+	static const unsigned char marker[2] = {0x59, 0xa7};
+	char path[PATH_MAX], token;
+	unsigned char *mapping, *record;
+	volatile unsigned char touched;
+	struct stat st;
+	pid_t child[2], waited;
+	size_t page_size, i;
+	ssize_t n;
+	unsigned int round;
+	int fd, append_fd, ready[2], gate[2], status, j;
+
+	page_size = (size_t)getpagesize();
+	if (MAPPED_APPEND_RACE_BYTES % page_size != 0 ||
+	    block_size > page_size)
+		errx(1, "unsupported page and block sizes");
+	record = malloc(block_size);
+	if (record == NULL)
+		err(1, "malloc append race record");
+	make_path(path, sizeof(path), "mapped-append-race");
+	fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+	if (fd == -1)
+		err(1, "open %s", path);
+	for (round = 0; round < MAPPED_APPEND_RACE_ROUNDS;
+	    round++) {
+		if (ftruncate(fd, 0) == -1 ||
+		    ftruncate(fd, MAPPED_APPEND_RACE_BYTES) == -1)
+			err(1, "prepare %s", path);
+		mapping = mmap(NULL, MAPPED_APPEND_RACE_BYTES,
+		    PROT_READ, MAP_SHARED, fd, 0);
+		if (mapping == MAP_FAILED)
+			err(1, "mmap %s", path);
+		touched = 0;
+		for (i = 0; i < MAPPED_APPEND_RACE_BYTES;
+		    i += page_size)
+			touched ^= mapping[i];
+		if (touched != 0)
+			errx(1, "mapped sparse file is not zeroed");
+		if (munmap(mapping, MAPPED_APPEND_RACE_BYTES) == -1)
+			err(1, "munmap %s", path);
+		if (pipe(ready) == -1 || pipe(gate) == -1)
+			err(1, "pipe append race");
+		for (j = 0; j < 2; j++) {
+			child[j] = fork();
+			if (child[j] == -1)
+				err(1, "fork append race");
+			if (child[j] != 0)
+				continue;
+			if (close(ready[0]) == -1 ||
+			    close(gate[1]) == -1)
+				err(1, "close append race child pipes");
+			append_fd = open(path, O_WRONLY | O_APPEND);
+			if (append_fd == -1)
+				err(1, "open append %s", path);
+			token = 'x';
+			if (write(ready[1], &token, 1) != 1 ||
+			    read(gate[0], &token, 1) != 0)
+				err(1, "append race child gate");
+			memset(record, marker[j], block_size);
+			n = write(append_fd, record, block_size);
+			if (n == -1)
+				err(1, "append race write");
+			if (n != (ssize_t)block_size)
+				errx(1, "short append race write");
+			if (close(append_fd) == -1)
+				err(1, "close append race writer");
+			_exit(0);
+		}
+		if (close(ready[1]) == -1 || close(gate[0]) == -1)
+			err(1, "close append race parent pipes");
+		for (j = 0; j < 2; j++) {
+			if (read(ready[0], &token, 1) != 1)
+				err(1, "append race ready gate");
+		}
+		if (close(ready[0]) == -1 || close(gate[1]) == -1)
+			err(1, "release append race writers");
+		for (j = 0; j < 2; j++) {
+			do {
+				waited = waitpid(child[j], &status, 0);
+			} while (waited == -1 && errno == EINTR);
+			if (waited != child[j] || ! WIFEXITED(status) ||
+			    WEXITSTATUS(status) != 0)
+				errx(1, "append race writer %d failed in "
+				    "round %u", j, round);
+		}
+		if (fstat(fd, &st) == -1)
+			err(1, "fstat %s", path);
+		if (st.st_size != (off_t)(MAPPED_APPEND_RACE_BYTES +
+		    2 * block_size))
+			errx(1, "round %u: lost append, size %lld",
+			    round, (long long)st.st_size);
+		for (j = 0; j < 2; j++) {
+			n = pread(fd, record, block_size,
+			    MAPPED_APPEND_RACE_BYTES +
+			    (off_t)j * block_size);
+			if (n != (ssize_t)block_size)
+				errx(1, "round %u: short append read",
+				    round);
+			for (i = 1; i < block_size; i++) {
+				if (record[i] != record[0])
+					errx(1, "round %u: torn append",
+					    round);
+			}
+			if (record[0] != marker[0] &&
+			    record[0] != marker[1])
+				errx(1, "round %u: wrong append",
+				    round);
+			if (j == 0)
+				token = record[0];
+			else if (record[0] == (unsigned char)token)
+				errx(1, "round %u: duplicate append",
+				    round);
+		}
+	}
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	free(record);
+}
+
+
 static void
 allocate_bitmap_probe (void)
 {
@@ -4324,6 +4638,26 @@ main (int argc, char **argv)
 			write_vmcache_allocation_run();
 		else if (strcmp(argv[1], "allocation-vmcache-verify") == 0)
 			verify_vmcache_allocation_run();
+		else if (strcmp(argv[1], "mmap-hole-write") == 0)
+			write_mapped_hole();
+		else if (strcmp(argv[1], "mmap-hole-verify") == 0)
+			verify_mapped_hole();
+		else if (strcmp(argv[1], "mmap-truncate-write") == 0)
+			write_mapped_truncate(MAPPED_TRUNCATE_ACTIVE);
+		else if (strcmp(argv[1],
+		    "mmap-truncate-unmapped-write") == 0)
+			write_mapped_truncate(MAPPED_TRUNCATE_UNMAPPED);
+		else if (strcmp(argv[1],
+		    "mmap-truncate-reader-write") == 0)
+			write_mapped_truncate(MAPPED_TRUNCATE_READER);
+		else if (strcmp(argv[1],
+		    "mmap-truncate-reader-sync-write") == 0)
+			write_mapped_truncate(
+			    MAPPED_TRUNCATE_READER_SYNC);
+		else if (strcmp(argv[1], "mmap-truncate-verify") == 0)
+			verify_mapped_truncate();
+		else if (strcmp(argv[1], "mapped-append-race") == 0)
+			mapped_append_race();
 		else if (strcmp(argv[1], "bitmap-verify") == 0)
 			verify_bitmap_probe(1);
 		else if (strcmp(argv[1], "bitmap-free") == 0)
