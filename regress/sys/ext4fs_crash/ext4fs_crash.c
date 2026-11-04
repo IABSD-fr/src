@@ -110,8 +110,13 @@ static void	check_extent_zero (const unsigned char *, size_t,
     const char *);
 static void	check_sparse_extents (int, unsigned char *, size_t,
     size_t, int);
+static void	make_sparse_extents (const char *, size_t, size_t);
+static void	make_extent_source (const char *, const char *,
+    const char *);
 static int	check_extent_growth (const char *, size_t, size_t,
     size_t);
+static void	check_deep_extent (const char *, const char *);
+static void	run_deep_extent (const char *, const char *);
 static int	check_truncate_prune (const char *);
 static void	check_block_reuse_source (const char *);
 static int	check_block_reuse (const char *);
@@ -132,6 +137,7 @@ static void	journal_revoke_count (const char *);
 static void	run_dir_growth (const char *, const char *, int);
 static void	run_rmdir_open (const char *, const char *, int);
 static void	run_extent_growth (const char *, const char *, int);
+static void	run_deep_unlink (const char *, const char *, int);
 static void	run_truncate_prune (const char *, const char *, int);
 static void	run_block_reuse (const char *, const char *, int);
 static void	run_rename_wrap (const char *, const char *, int);
@@ -144,6 +150,8 @@ static void	verify_dir_growth (const char *);
 static void	verify_rmdir (const char *);
 static void	verify_extent_promote (const char *);
 static void	verify_extent_split (const char *);
+static void	verify_extent_deep (const char *);
+static void	verify_deep_unlink (const char *);
 static void	verify_truncate_prune (const char *);
 static void	verify_block_reuse (const char *);
 static void	verify_allocation_error (const char *);
@@ -444,6 +452,196 @@ check_extent_growth (const char *root, size_t entries,
 	if (close(fd) == -1)
 		err(1, "close %s", path);
 	return (state);
+}
+
+/* One allocated block per extent, with a hole between neighbours. */
+static void
+make_sparse_extents (const char *path, size_t block_size,
+    size_t entries)
+{
+	unsigned char buf[IO_BYTES];
+	off_t offset;
+	size_t i;
+	ssize_t n;
+	int fd;
+
+	fd = open_output(path, 1);
+	memset(buf, 0, block_size);
+	buf[0] = 'x';
+	for (i = 0; i < entries; i++) {
+		offset = extent_lbn_offset(block_size, 2 * i);
+		n = pwrite(fd, buf, block_size, offset);
+		if (n == -1)
+			err(1, "write sparse source %s", path);
+		if ((size_t)n != block_size)
+			errx(1, "short sparse source write: %s", path);
+	}
+	if (close(fd) == -1)
+		err(1, "close sparse source %s", path);
+}
+
+static void
+make_extent_source (const char *path, const char *size,
+    const char *count)
+{
+	const char *error;
+	size_t block_size, entries;
+
+	block_size = strtonum(size, 1024, 4096, &error);
+	if (error != NULL || (block_size != 1024 &&
+	    block_size != 2048 && block_size != 4096))
+		errx(1, "invalid extent block size: %s", size);
+	entries = strtonum(count, 1, UINT32_MAX / 2, &error);
+	if (error != NULL)
+		errx(1, "invalid extent count: %s", count);
+	make_sparse_extents(path, block_size, entries);
+}
+
+static void
+check_deep_extent (const char *root, const char *state)
+{
+	unsigned char buf[IO_BYTES];
+	struct stat st;
+	char path[PATH_MAX];
+	blkcnt_t sectors;
+	size_t block_size, capacity, entries, retained;
+	int fd;
+
+	block_size = filesystem_block_size(root);
+	capacity = extent_leaf_capacity(block_size);
+	entries = 4 * capacity - 3;
+	retained = capacity / 2;
+	make_path(path, sizeof(path), root, EXTENT_FILE);
+	if (strcmp(state, "absent") == 0) {
+		if (lstat(path, &st) != -1 || errno != ENOENT)
+			errx(1, "deep extent file was not removed");
+		return;
+	}
+	if (strcmp(state, "grown") == 0) {
+		if (check_extent_growth(root, entries, 4, 6) != 1)
+			errx(1, "deep extent file did not grow");
+		return;
+	}
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (fstat(fd, &st) == -1)
+		err(1, "fstat %s", path);
+	if (! S_ISREG(st.st_mode) || st.st_nlink != 1)
+		errx(1, "deep extent inode shape mismatch");
+	if (strcmp(state, "shrunk") == 0) {
+		if (st.st_size != extent_lbn_offset(block_size,
+		    2 * retained))
+			errx(1, "deep extent shrink size mismatch");
+		/* Allow retaining or collapsing the one-entry index. */
+		sectors = (blkcnt_t)(block_size / DEV_BSIZE);
+		if (st.st_blocks != (blkcnt_t)(retained + 1) *
+		    sectors && st.st_blocks !=
+		    (blkcnt_t)(retained + 2) * sectors)
+			errx(1, "deep shrink block count mismatch");
+		check_sparse_extents(fd, buf, block_size, retained, 1);
+	} else if (strcmp(state, "empty") == 0) {
+		if (st.st_size != 0 || st.st_blocks != 0)
+			errx(1, "deep truncate left allocated blocks");
+	} else
+		errx(1, "unknown deep extent state: %s", state);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+}
+
+/* Exercise growth and retirement only in a disposable guest. */
+static void
+run_deep_extent (const char *action, const char *root)
+{
+	unsigned char buf[IO_BYTES];
+	struct stat st;
+	char path[PATH_MAX], replacement[PATH_MAX];
+	const char *state;
+	off_t offset;
+	size_t block_size, capacity, entries, i;
+	int fd;
+
+	if (strncmp(action, "verify-", 7) == 0) {
+		state = action + 7;
+		check_deep_extent(root, state);
+		printf("state=extent-deep-%s\n", state);
+		return;
+	}
+	block_size = filesystem_block_size(root);
+	capacity = extent_leaf_capacity(block_size);
+	entries = 4 * capacity - 3;
+	offset = extent_lbn_offset(block_size, 2 * entries);
+	if (strcmp(action, "grow") == 0) {
+		if (check_extent_growth(root, entries, 4, 6) != 0)
+			errx(1, "deep fixture has already grown");
+	} else
+		check_deep_extent(root, "grown");
+	make_path(path, sizeof(path), root, EXTENT_FILE);
+	fd = open(path, O_RDWR | O_CLOEXEC);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (strcmp(action, "grow") == 0) {
+		/* The hole prevents merging the new extent. */
+		write_extent_block(fd, block_size, offset);
+		state = "grown";
+	} else if (strcmp(action, "shrink") == 0) {
+		if (ftruncate(fd, offset + block_size / 2) == -1)
+			err(1, "partial deep extent truncate");
+		if (ftruncate(fd, offset + block_size) == -1)
+			err(1, "regrow deep extent tail");
+		read_extent_block(fd, buf, block_size, offset);
+		for (i = 0; i < block_size / 2; i++) {
+			if (buf[i] != pattern_byte(offset + (off_t)i,
+			    EXTENT_SPLIT_SEED))
+				errx(1, "retained deep data changed");
+		}
+		check_extent_zero(buf + block_size / 2,
+		    block_size / 2, "deep truncate regrown tail");
+		if (ftruncate(fd, extent_lbn_offset(block_size,
+		    2 * (capacity / 2))) == -1)
+			err(1, "prune deep extent leaves");
+		state = "shrunk";
+	} else if (strcmp(action, "zero") == 0) {
+		if (ftruncate(fd, 0) == -1)
+			err(1, "truncate deep extent file to zero");
+		state = "empty";
+	} else if (strcmp(action, "unlink") == 0 ||
+	    strcmp(action, "replace") == 0) {
+		if (strcmp(action, "replace") == 0) {
+			make_path(replacement, sizeof(replacement),
+			    root, "extent-replacement");
+			create_empty(replacement);
+			if (rename(replacement, path) == -1)
+				err(1, "replace deep extent file");
+			state = "empty";
+		} else {
+			if (unlink(path) == -1)
+				err(1, "unlink deep extent file");
+			state = "absent";
+		}
+		if (fstat(fd, &st) == -1)
+			err(1, "fstat unlinked deep extent file");
+		if (st.st_nlink != 0 ||
+		    st.st_size != offset + (off_t)block_size ||
+		    st.st_blocks != (blkcnt_t)(entries + 7) *
+		    (blkcnt_t)(block_size / DEV_BSIZE))
+			errx(1, "open unlink changed inode shape");
+		check_sparse_extents(fd, buf, block_size, entries, 1);
+		read_extent_block(fd, buf, block_size, offset);
+		for (i = 0; i < block_size; i++) {
+			if (buf[i] != pattern_byte(offset + (off_t)i,
+			    EXTENT_SPLIT_SEED))
+				errx(1, "open unlink changed data");
+		}
+	} else
+		errx(1, "unknown deep extent action: %s", action);
+	if (fsync(fd) == -1)
+		err(1, "fsync %s", path);
+	if (close(fd) == -1)
+		err(1, "close %s", path);
+	sync_directory(root);
+	check_deep_extent(root, state);
+	printf("state=extent-deep-%s\n", state);
 }
 
 static int
@@ -985,6 +1183,10 @@ run_extent_growth (const char *stage, const char *root, int boundary)
 		entries = extent_leaf_capacity(block_size);
 		old_metadata = 1;
 		new_metadata = 2;
+	} else if (strcmp(stage, "extent-deep") == 0) {
+		entries = 4 * extent_leaf_capacity(block_size) - 3;
+		old_metadata = 4;
+		new_metadata = 6;
 	} else
 		errx(1, "unknown extent stage: %s", stage);
 	if (check_extent_growth(root, entries, old_metadata,
@@ -1002,6 +1204,27 @@ run_extent_growth (const char *stage, const char *root, int boundary)
 	write_extent_block(fd, block_size, offset);
 	if (close(fd) == -1)
 		err(1, "close %s", path);
+	finish_workload(stage, root, boundary);
+}
+
+static void
+run_deep_unlink (const char *stage, const char *root, int boundary)
+{
+	char path[PATH_MAX];
+	int fd;
+
+	check_deep_extent(root, "grown");
+	make_path(path, sizeof(path), root, EXTENT_FILE);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd == -1)
+		err(1, "open %s", path);
+	if (boundary)
+		arm_boundary(stage, root);
+	else
+		arm_cut(stage);
+	if (unlink(path) == -1)
+		err(1, "unlink %s", path);
+	/* Keep the inode open: recovery must release the whole tree. */
 	finish_workload(stage, root, boundary);
 }
 
@@ -1297,8 +1520,13 @@ run_workload (const char *stage, const char *root, int boundary)
 		run_truncate_prune(stage, root, boundary);
 		return;
 	}
+	if (strcmp(stage, "extent-deep-unlink") == 0) {
+		run_deep_unlink(stage, root, boundary);
+		return;
+	}
 	if (strcmp(stage, "extent-promote") == 0 ||
-	    strcmp(stage, "extent-split") == 0) {
+	    strcmp(stage, "extent-split") == 0 ||
+	    strcmp(stage, "extent-deep") == 0) {
 		run_extent_growth(stage, root, boundary);
 		return;
 	}
@@ -1458,6 +1686,39 @@ verify_extent_split (const char *root)
 	    state ? "two-leaves" : "one-leaf");
 	if (fflush(stdout) == EOF)
 		err(1, "publish extent-split state");
+}
+
+static void
+verify_extent_deep (const char *root)
+{
+	size_t entries;
+	int state;
+
+	entries = 4 *
+	    extent_leaf_capacity(filesystem_block_size(root)) - 3;
+	state = check_extent_growth(root, entries, 4, 6);
+	printf("state=extent-%s\n", state ? "deep" : "four-leaves");
+	if (fflush(stdout) == EOF)
+		err(1, "publish deep extent state");
+}
+
+static void
+verify_deep_unlink (const char *root)
+{
+	struct stat st;
+	char path[PATH_MAX];
+
+	make_path(path, sizeof(path), root, EXTENT_FILE);
+	if (lstat(path, &st) == -1) {
+		if (errno != ENOENT)
+			err(1, "lstat %s", path);
+		printf("state=extent-deep-absent\n");
+	} else {
+		check_deep_extent(root, "grown");
+		printf("state=extent-deep-linked\n");
+	}
+	if (fflush(stdout) == EOF)
+		err(1, "publish deep extent unlink state");
 }
 
 static void
@@ -1767,12 +2028,14 @@ static void
 selftest (void)
 {
 	unsigned char journal[JBD2_SUPER_BYTES];
+	unsigned char extent_buf[IO_BYTES];
 	struct stat st;
 	char current[PATH_MAX], entry[PATH_MAX], grow[PATH_MAX];
 	char journal_path[PATH_MAX];
 	char marker[PATH_MAX], next[PATH_MAX], removed[PATH_MAX];
 	char root[] = "/tmp/ext4fs_crash.XXXXXXXX";
 	off_t grown, initial;
+	size_t block_size, entries;
 	int fd;
 
 	if (mkdtemp(root) == NULL)
@@ -1889,6 +2152,27 @@ selftest (void)
 	if (unlink(current) == -1)
 		err(1, "unlink %s", current);
 	verify_unlink(root);
+	make_path(entry, sizeof(entry), root, EXTENT_FILE);
+	for (block_size = 1024; block_size <= 4096; block_size *= 2) {
+		entries = 4 * extent_leaf_capacity(block_size) - 3;
+		make_sparse_extents(entry, block_size, entries);
+		fd = open(entry, O_RDONLY | O_CLOEXEC);
+		if (fd == -1)
+			err(1, "open extent source");
+		if (fstat(fd, &st) == -1)
+			err(1, "fstat extent source");
+		if (st.st_size != extent_lbn_offset(block_size,
+		    2 * entries - 1))
+			errx(1, "extent source size mismatch");
+		check_sparse_extents(fd, extent_buf, block_size,
+		    entries, 0);
+		if (close(fd) == -1)
+			err(1, "close extent source");
+		if (unlink(entry) == -1)
+			err(1, "unlink extent source");
+		printf("extent-source=%zu entries=%zu\n", block_size,
+		    entries);
+	}
 	if (rmdir(root) == -1)
 		err(1, "rmdir %s", root);
 }
@@ -1902,6 +2186,10 @@ main (int argc, char **argv)
 		make_old_pattern(argv[2]);
 	else if (argc == 3 && strcmp(argv[1], "pattern-new") == 0)
 		make_new_pattern(argv[2]);
+	else if (argc == 5 && strcmp(argv[1], "extent-source") == 0)
+		make_extent_source(argv[2], argv[3], argv[4]);
+	else if (argc == 4 && strcmp(argv[1], "extent-deep") == 0)
+		run_deep_extent(argv[2], argv[3]);
 	else if (argc == 3 && strcmp(argv[1], "journal-state") == 0)
 		classify_journal(argv[2]);
 	else if (argc == 3 && strcmp(argv[1], "journal-revokes") == 0)
@@ -1934,6 +2222,12 @@ main (int argc, char **argv)
 	    strcmp(argv[1], "verify-extent-split") == 0)
 		verify_extent_split(argv[2]);
 	else if (argc == 3 &&
+	    strcmp(argv[1], "verify-extent-deep") == 0)
+		verify_extent_deep(argv[2]);
+	else if (argc == 3 &&
+	    strcmp(argv[1], "verify-extent-deep-unlink") == 0)
+		verify_deep_unlink(argv[2]);
+	else if (argc == 3 &&
 	    strcmp(argv[1], "verify-truncate-prune") == 0)
 		verify_truncate_prune(argv[2]);
 	else if (argc == 3 &&
@@ -1956,6 +2250,8 @@ main (int argc, char **argv)
 	else
 		errx(1, "usage: ext4fs_crash pattern-old path | "
 		    "pattern-new path | "
+		    "extent-source path block-size entries | "
+		    "extent-deep action root | "
 		    "journal-state path | journal-revokes path | "
 		    "journal-exhaustion root | "
 		    "retained-revoke root | "
@@ -1966,6 +2262,8 @@ main (int argc, char **argv)
 		    "verify-dir-growth root | verify-rmdir root | "
 		    "verify-extent-promote root | "
 		    "verify-extent-split root | "
+		    "verify-extent-deep root | "
+		    "verify-extent-deep-unlink root | "
 		    "verify-truncate-prune root | "
 		    "verify-block-reuse root | "
 		    "verify-allocation-error root | "

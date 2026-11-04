@@ -1522,8 +1522,8 @@ ext4fs_extent_metadata_release (struct ext4fs_journal_handle *handle,
 }
 
 /*
- * Reject an insertion which would require an unsupported external
- * index block before allocation changes enter a transaction.
+ * Reject an insertion which would need a third external level before
+ * allocation changes enter a transaction.
  */
 static int
 ext4fs_extent_insert_check (struct inode *ip,
@@ -1531,21 +1531,23 @@ ext4fs_extent_insert_check (struct inode *ip,
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
-	struct ext4fs_extent_header *eh, *leaf_eh;
+	struct ext4fs_extent_header *eh, *index_eh, *leaf_eh;
 	struct ext4fs_extent_idx *idx;
-	struct buf *bp = NULL;
-	u_int64_t leaf_block;
-	u_int16_t depth, entries, leaf_entries, leaf_max;
-	u_int16_t root_max;
+	struct buf *index_bp, *leaf_bp;
+	u_int64_t child_block, leaf_block;
+	u_int16_t depth, entries, index_entries, index_max;
+	u_int16_t leaf_entries, leaf_max, root_max;
 	int error, found, i;
 
+	index_bp = NULL;
+	leaf_bp = NULL;
 	eh = &din->i_extent_header;
 	error = ext4fs_extent_header_check(eh,
 	    sizeof(din->i_block), -1);
 	if (error)
 		return (error);
 	depth = letoh16(eh->eh_depth);
-	if (depth > 1)
+	if (depth > 2)
 		return (EOPNOTSUPP);
 	if (depth == 0)
 		return (ext4fs_extent_leaf_check(fs, eh));
@@ -1565,40 +1567,68 @@ ext4fs_extent_insert_check (struct inode *ip,
 		else
 			break;
 	}
-	leaf_block = letoh32(idx[found].ei_leaf_lo) |
+	child_block = letoh32(idx[found].ei_leaf_lo) |
 	    ((u_int64_t)letoh16(idx[found].ei_leaf_hi) << 32);
-	if (handle != NULL)
-		error = ext4fs_journal_get_metadata(handle,
-		    ip->i_devvp, leaf_block, &bp);
-	else
-		error = bread(ip->i_devvp,
-		    (daddr_t)EXT4FS_FSBTODB(fs, leaf_block),
-		    fs->m_block_size, &bp);
-	if (error) {
-		if (bp != NULL && handle == NULL)
-			brelse(bp);
-		return (error);
+	if (depth == 2) {
+		error = ext4fs_extent_metadata_get(ip, handle,
+		    child_block, &index_bp);
+		if (error)
+			return (error);
+		index_eh = (struct ext4fs_extent_header *)
+		    index_bp->b_data;
+		error = ext4fs_extent_header_check(index_eh,
+		    fs->m_block_size, 1);
+		if (error == 0)
+			error = ext4fs_extent_block_csum_verify(fs,
+			    ip->i_number, din->i_nfs_generation,
+			    index_bp->b_data);
+		if (error == 0)
+			error = ext4fs_extent_index_check(fs, index_eh);
+		if (error)
+			goto out;
+		index_entries = letoh16(index_eh->eh_entries);
+		index_max = letoh16(index_eh->eh_max);
+		idx = (struct ext4fs_extent_idx *)(index_eh + 1);
+		found = 0;
+		for (i = 0; i < index_entries; i++) {
+			if (letoh32(idx[i].ei_block) <= lbn)
+				found = i;
+			else
+				break;
+		}
+		leaf_block = letoh32(idx[found].ei_leaf_lo) |
+		    ((u_int64_t)letoh16(idx[found].ei_leaf_hi) << 32);
+	} else {
+		index_entries = entries;
+		index_max = root_max;
+		leaf_block = child_block;
 	}
-	leaf_eh = (struct ext4fs_extent_header *)bp->b_data;
+
+	error = ext4fs_extent_metadata_get(ip, handle, leaf_block,
+	    &leaf_bp);
+	if (error)
+		goto out;
+	leaf_eh = (struct ext4fs_extent_header *)leaf_bp->b_data;
 	error = ext4fs_extent_header_check(leaf_eh,
 	    fs->m_block_size, 0);
 	if (error == 0)
 		error = ext4fs_extent_block_csum_verify(fs,
 		    ip->i_number, din->i_nfs_generation,
-		    bp->b_data);
+		    leaf_bp->b_data);
 	if (error == 0)
 		error = ext4fs_extent_leaf_check(fs, leaf_eh);
 	if (error)
 		goto out;
 	leaf_entries = letoh16(leaf_eh->eh_entries);
 	leaf_max = letoh16(leaf_eh->eh_max);
-	if (leaf_entries < leaf_max || entries < root_max)
+	if (leaf_entries < leaf_max || index_entries < index_max ||
+	    (depth == 1 && handle != NULL) || entries < root_max)
 		goto out;
 	error = EOPNOTSUPP;
 
 out:
-	if (handle == NULL)
-		brelse(bp);
+	ext4fs_extent_metadata_release(handle, leaf_bp);
+	ext4fs_extent_metadata_release(handle, index_bp);
 	return (error);
 }
 
@@ -1693,28 +1723,96 @@ ext4fs_extent_grow_tree (struct inode *ip,
 	return (0);
 }
 
-/*
- * Split a full leaf block into two.
- * The old leaf keeps the first half, a new leaf gets the second half.
- * A new index entry is added to the parent (the inode root).
- * Returns EOPNOTSUPP if the parent is full (depth 2+ needed).
- */
+/* Move a full depth-1 root into an external depth-1 index node. */
 static int
-ext4fs_leaf_split (struct inode *ip,
-    struct ext4fs_journal_handle *handle, struct buf *old_bp,
-    struct ext4fs_extent_header *old_eh)
+ext4fs_extent_promote_root (struct inode *ip,
+    struct ext4fs_journal_handle *handle)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
-	struct ext4fs_extent_header *root_eh = &din->i_extent_header;
-	struct ext4fs_extent_idx *root_idx = din->i_extent_idx;
+	struct ext4fs_extent_header *eh = &din->i_extent_header;
+	struct ext4fs_extent_header *index_eh;
+	struct ext4fs_extent_idx *index, *root_idx;
+	struct buf *bp;
+	u_int64_t block, i_blocks;
+	u_int32_t first, got;
+	u_int16_t entries, maximum;
+	int error;
+
+	if (letoh16(eh->eh_depth) != 1)
+		return (EIO);
+	entries = letoh16(eh->eh_entries);
+	if (entries == 0 || entries != letoh16(eh->eh_max))
+		return (EIO);
+	root_idx = din->i_extent_idx;
+	first = letoh32(root_idx[0].ei_block);
+	if (handle != NULL)
+		error = ext4fs_blkalloc_handle(ip, handle, 0, 1,
+		    &block, &got);
+	else
+		error = ext4fs_blkalloc(ip, 0, 1, &block, &got);
+	if (error)
+		return (error);
+	if (got != 1)
+		return (EIO);
+	error = ext4fs_extent_metadata_new(ip, handle, block, &bp);
+	if (error)
+		return (error);
+
+	maximum = (fs->m_block_size - sizeof(*index_eh)) /
+	    sizeof(*index);
+	index_eh = (struct ext4fs_extent_header *)bp->b_data;
+	index_eh->eh_magic = htole16(EXT4FS_EXTENT_HEADER_MAGIC);
+	index_eh->eh_entries = htole16(entries);
+	index_eh->eh_max = htole16(maximum);
+	index_eh->eh_depth = htole16(1);
+	index_eh->eh_generation = 0;
+	index = (struct ext4fs_extent_idx *)(index_eh + 1);
+	memcpy(index, root_idx, entries * sizeof(*index));
+	ext4fs_extent_block_csum_set(fs, ip->i_number,
+	    din->i_nfs_generation, bp->b_data);
+	error = ext4fs_extent_metadata_dirty(ip, handle, bp);
+	if (error)
+		return (error);
+
+	memset(root_idx, 0, 4 * sizeof(*root_idx));
+	eh->eh_entries = htole16(1);
+	eh->eh_depth = htole16(2);
+	root_idx[0].ei_block = htole32(first);
+	root_idx[0].ei_leaf_lo = htole32((u_int32_t)block);
+	root_idx[0].ei_leaf_hi = htole16((u_int16_t)(block >> 32));
+
+	i_blocks = letoh32(din->i_blocks_lo) |
+	    ((u_int64_t)letoh16(din->i_blocks_hi) << 32);
+	i_blocks += fs->m_block_size / DEV_BSIZE;
+	din->i_blocks_lo = htole32((u_int32_t)i_blocks);
+	din->i_blocks_hi = htole16((u_int16_t)(i_blocks >> 32));
+	ip->i_flag |= IN_CHANGE | IN_MODIFIED;
+	return (0);
+}
+
+/*
+ * Split a full leaf block into two.
+ * The old leaf keeps the first half, a new leaf gets the second half.
+ * A new index entry is added to either the inode root or an external
+ * index node.  The function consumes both supplied buffers.
+ */
+static int
+ext4fs_leaf_split (struct inode *ip,
+    struct ext4fs_journal_handle *handle,
+    struct ext4fs_extent_header *parent_eh, struct buf *parent_bp,
+    struct buf *old_bp, struct ext4fs_extent_header *old_eh)
+{
+	struct m_ext4fs *fs = ip->i_e4fs;
+	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
+	struct ext4fs_extent_idx *parent_idx;
 	struct ext4fs_extent_header *new_eh;
 	struct ext4fs_extent *old_ext, *new_ext;
 	struct buf *new_bp;
 	u_int64_t new_blk;
 	u_int32_t new_first_block;
 	u_int16_t old_entries, new_entries, maxleaf;
-	u_int16_t root_entries, root_max;
+	u_int16_t parent_entries, parent_max;
 	u_int64_t i_blocks;
 	u_int32_t got;
 	int error, i;
@@ -1722,12 +1820,12 @@ ext4fs_leaf_split (struct inode *ip,
 	old_entries = letoh16(old_eh->eh_entries);
 	maxleaf = letoh16(old_eh->eh_max);
 	old_ext = (struct ext4fs_extent *)(old_eh + 1);
-	/* Check parent has room for new index entry */
-	root_entries = letoh16(root_eh->eh_entries);
-	root_max = letoh16(root_eh->eh_max);
-	if (root_entries >= root_max) {
+	parent_idx = (struct ext4fs_extent_idx *)(parent_eh + 1);
+	parent_entries = letoh16(parent_eh->eh_entries);
+	parent_max = letoh16(parent_eh->eh_max);
+	if (parent_entries >= parent_max) {
 		ext4fs_extent_metadata_release(handle, old_bp);
-		/* Depth two or greater is not implemented yet. */
+		ext4fs_extent_metadata_release(handle, parent_bp);
 		return (EOPNOTSUPP);
 	}
 
@@ -1739,7 +1837,13 @@ ext4fs_leaf_split (struct inode *ip,
 		error = ext4fs_blkalloc(ip, 0, 1, &new_blk, &got);
 	if (error) {
 		ext4fs_extent_metadata_release(handle, old_bp);
+		ext4fs_extent_metadata_release(handle, parent_bp);
 		return (error);
+	}
+	if (got != 1) {
+		ext4fs_extent_metadata_release(handle, old_bp);
+		ext4fs_extent_metadata_release(handle, parent_bp);
+		return (EIO);
 	}
 
 	/* Split ~50/50 */
@@ -1757,6 +1861,7 @@ ext4fs_leaf_split (struct inode *ip,
 	    &new_bp);
 	if (error) {
 		ext4fs_extent_metadata_release(handle, old_bp);
+		ext4fs_extent_metadata_release(handle, parent_bp);
 		return (error);
 	}
 
@@ -1777,6 +1882,7 @@ ext4fs_leaf_split (struct inode *ip,
 	error = ext4fs_extent_metadata_dirty(ip, handle, new_bp);
 	if (error) {
 		ext4fs_extent_metadata_release(handle, old_bp);
+		ext4fs_extent_metadata_release(handle, parent_bp);
 		return (error);
 	}
 
@@ -1788,7 +1894,7 @@ ext4fs_leaf_split (struct inode *ip,
 	if (error)
 		return (error);
 
-	/* Add a sorted index entry to the parent root. */
+	/* Add a sorted index entry to the parent. */
 	{
 		struct ext4fs_extent_idx entry;
 
@@ -1798,17 +1904,25 @@ ext4fs_leaf_split (struct inode *ip,
 		entry.ei_unused = 0;
 
 		/* Find insertion point */
-		for (i = 0; i < root_entries; i++) {
-			if (letoh32(root_idx[i].ei_block) >
+		for (i = 0; i < parent_entries; i++) {
+			if (letoh32(parent_idx[i].ei_block) >
 			    new_first_block)
 				break;
 		}
-		if (i < root_entries)
-			memmove(&root_idx[i + 1], &root_idx[i],
-			    (root_entries - i) *
+		if (i < parent_entries)
+			memmove(&parent_idx[i + 1], &parent_idx[i],
+			    (parent_entries - i) *
 			    sizeof(struct ext4fs_extent_idx));
-		root_idx[i] = entry;
-		root_eh->eh_entries = htole16(root_entries + 1);
+		parent_idx[i] = entry;
+		parent_eh->eh_entries = htole16(parent_entries + 1);
+	}
+	if (parent_bp != NULL) {
+		ext4fs_extent_block_csum_set(fs, ip->i_number,
+		    din->i_nfs_generation, parent_bp->b_data);
+		error = ext4fs_extent_metadata_dirty(ip, handle,
+		    parent_bp);
+		if (error)
+			return (error);
 	}
 
 	/* Update inode block count for the new leaf block */
@@ -1818,6 +1932,109 @@ ext4fs_leaf_split (struct inode *ip,
 	din->i_blocks_lo = htole32((u_int32_t)i_blocks);
 	din->i_blocks_hi = htole16((u_int16_t)(i_blocks >> 32));
 
+	ip->i_flag |= IN_CHANGE | IN_MODIFIED;
+	return (0);
+}
+
+/* Split a full external index and add its right half to the root. */
+static int
+ext4fs_index_split (struct inode *ip,
+    struct ext4fs_journal_handle *handle, struct buf *old_bp,
+    struct ext4fs_extent_header *old_eh)
+{
+	struct m_ext4fs *fs = ip->i_e4fs;
+	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
+	struct ext4fs_extent_header *root_eh = &din->i_extent_header;
+	struct ext4fs_extent_header *new_eh;
+	struct ext4fs_extent_idx *old_idx, *new_idx, *root_idx;
+	struct ext4fs_extent_idx entry;
+	struct buf *new_bp;
+	u_int64_t i_blocks, new_block;
+	u_int32_t first, got;
+	u_int16_t entries, maximum, moved, root_entries, root_max;
+	int error, i;
+
+	if (letoh16(root_eh->eh_depth) != 2 ||
+	    letoh16(old_eh->eh_depth) != 1) {
+		ext4fs_extent_metadata_release(handle, old_bp);
+		return (EIO);
+	}
+	root_entries = letoh16(root_eh->eh_entries);
+	root_max = letoh16(root_eh->eh_max);
+	entries = letoh16(old_eh->eh_entries);
+	maximum = letoh16(old_eh->eh_max);
+	if (root_entries >= root_max || entries != maximum) {
+		ext4fs_extent_metadata_release(handle, old_bp);
+		return (EOPNOTSUPP);
+	}
+	old_idx = (struct ext4fs_extent_idx *)(old_eh + 1);
+	moved = entries / 2;
+	entries -= moved;
+	first = letoh32(old_idx[entries].ei_block);
+	if (handle != NULL)
+		error = ext4fs_blkalloc_handle(ip, handle, 0, 1,
+		    &new_block, &got);
+	else
+		error = ext4fs_blkalloc(ip, 0, 1, &new_block, &got);
+	if (error) {
+		ext4fs_extent_metadata_release(handle, old_bp);
+		return (error);
+	}
+	if (got != 1) {
+		ext4fs_extent_metadata_release(handle, old_bp);
+		return (EIO);
+	}
+	error = ext4fs_extent_metadata_new(ip, handle, new_block,
+	    &new_bp);
+	if (error) {
+		ext4fs_extent_metadata_release(handle, old_bp);
+		return (error);
+	}
+
+	new_eh = (struct ext4fs_extent_header *)new_bp->b_data;
+	new_eh->eh_magic = htole16(EXT4FS_EXTENT_HEADER_MAGIC);
+	new_eh->eh_entries = htole16(moved);
+	new_eh->eh_max = htole16(maximum);
+	new_eh->eh_depth = htole16(1);
+	new_eh->eh_generation = 0;
+	new_idx = (struct ext4fs_extent_idx *)(new_eh + 1);
+	memcpy(new_idx, &old_idx[entries], moved * sizeof(*new_idx));
+	ext4fs_extent_block_csum_set(fs, ip->i_number,
+	    din->i_nfs_generation, new_bp->b_data);
+	error = ext4fs_extent_metadata_dirty(ip, handle, new_bp);
+	if (error) {
+		ext4fs_extent_metadata_release(handle, old_bp);
+		return (error);
+	}
+
+	memset(&old_idx[entries], 0, moved * sizeof(*old_idx));
+	old_eh->eh_entries = htole16(entries);
+	ext4fs_extent_block_csum_set(fs, ip->i_number,
+	    din->i_nfs_generation, old_bp->b_data);
+	error = ext4fs_extent_metadata_dirty(ip, handle, old_bp);
+	if (error)
+		return (error);
+
+	entry.ei_block = htole32(first);
+	entry.ei_leaf_lo = htole32((u_int32_t)new_block);
+	entry.ei_leaf_hi = htole16((u_int16_t)(new_block >> 32));
+	entry.ei_unused = 0;
+	root_idx = din->i_extent_idx;
+	for (i = 0; i < root_entries; i++) {
+		if (letoh32(root_idx[i].ei_block) > first)
+			break;
+	}
+	if (i < root_entries)
+		memmove(&root_idx[i + 1], &root_idx[i],
+		    (root_entries - i) * sizeof(*root_idx));
+	root_idx[i] = entry;
+	root_eh->eh_entries = htole16(root_entries + 1);
+
+	i_blocks = letoh32(din->i_blocks_lo) |
+	    ((u_int64_t)letoh16(din->i_blocks_hi) << 32);
+	i_blocks += fs->m_block_size / DEV_BSIZE;
+	din->i_blocks_lo = htole32((u_int32_t)i_blocks);
+	din->i_blocks_hi = htole16((u_int16_t)(i_blocks >> 32));
 	ip->i_flag |= IN_CHANGE | IN_MODIFIED;
 	return (0);
 }
@@ -1835,19 +2052,27 @@ ext4fs_extent_insert_depth (struct inode *ip,
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
 	struct ext4fs_extent_header *root_eh = &din->i_extent_header;
-	struct ext4fs_extent_idx *idx;
-	struct ext4fs_extent_header *leaf_eh;
+	struct ext4fs_extent_header *leaf_eh, *parent_eh;
+	struct ext4fs_extent_idx *idx, *parent_idx;
 	struct ext4fs_extent *ext;
-	struct buf *bp;
-	u_int64_t leaf_blk;
-	u_int16_t root_entries, leaf_entries, leaf_max;
+	struct buf *leaf_bp, *parent_bp;
+	u_int64_t child_blk, leaf_blk;
+	u_int16_t depth, leaf_entries, leaf_max;
+	u_int16_t parent_entries, parent_max;
+	u_int16_t root_entries, root_max;
 	int error, found, i;
 
+	parent_bp = NULL;
+	leaf_bp = NULL;
+	depth = letoh16(root_eh->eh_depth);
 	root_entries = letoh16(root_eh->eh_entries);
-	if (root_entries == 0)
+	root_max = letoh16(root_eh->eh_max);
+	if (depth == 0 || depth > 2 || root_entries == 0)
 		return (EIO);
+	error = ext4fs_extent_index_check(fs, root_eh);
+	if (error)
+		return (error);
 
-	/* Find the index entry whose subtree covers lbn */
 	idx = din->i_extent_idx;
 	found = 0;
 	for (i = 0; i < root_entries; i++) {
@@ -1856,27 +2081,61 @@ ext4fs_extent_insert_depth (struct inode *ip,
 		else
 			break;
 	}
-
-	/* Read the leaf block */
-	leaf_blk = letoh32(idx[found].ei_leaf_lo) |
+	child_blk = letoh32(idx[found].ei_leaf_lo) |
 	    ((u_int64_t)letoh16(idx[found].ei_leaf_hi) << 32);
 
-	error = ext4fs_extent_metadata_get(ip, handle, leaf_blk, &bp);
-	if (error)
-		return (error);
+	if (depth == 2) {
+		error = ext4fs_extent_metadata_get(ip, handle,
+		    child_blk, &parent_bp);
+		if (error)
+			return (error);
+		parent_eh = (struct ext4fs_extent_header *)
+		    parent_bp->b_data;
+		error = ext4fs_extent_header_check(parent_eh,
+		    fs->m_block_size, 1);
+		if (error == 0)
+			error = ext4fs_extent_block_csum_verify(fs,
+			    ip->i_number, din->i_nfs_generation,
+			    parent_bp->b_data);
+		if (error == 0)
+			error = ext4fs_extent_index_check(fs,
+			    parent_eh);
+		if (error) {
+			ext4fs_extent_metadata_release(handle,
+			    parent_bp);
+			return (error);
+		}
+	} else
+		parent_eh = root_eh;
 
-	leaf_eh = (struct ext4fs_extent_header *)bp->b_data;
+	parent_entries = letoh16(parent_eh->eh_entries);
+	parent_max = letoh16(parent_eh->eh_max);
+	parent_idx = (struct ext4fs_extent_idx *)(parent_eh + 1);
+	found = 0;
+	for (i = 0; i < parent_entries; i++) {
+		if (letoh32(parent_idx[i].ei_block) <= lbn)
+			found = i;
+		else
+			break;
+	}
+	leaf_blk = letoh32(parent_idx[found].ei_leaf_lo) |
+	    ((u_int64_t)letoh16(parent_idx[found].ei_leaf_hi) << 32);
+	error = ext4fs_extent_metadata_get(ip, handle, leaf_blk,
+	    &leaf_bp);
+	if (error)
+		goto out;
+
+	leaf_eh = (struct ext4fs_extent_header *)leaf_bp->b_data;
 	error = ext4fs_extent_header_check(leaf_eh,
 	    fs->m_block_size, 0);
 	if (error == 0)
 		error = ext4fs_extent_block_csum_verify(fs,
-		    ip->i_number, din->i_nfs_generation, bp->b_data);
+		    ip->i_number, din->i_nfs_generation,
+		    leaf_bp->b_data);
 	if (error == 0)
 		error = ext4fs_extent_leaf_check(fs, leaf_eh);
-	if (error) {
-		ext4fs_extent_metadata_release(handle, bp);
-		return (error);
-	}
+	if (error)
+		goto out;
 
 	leaf_entries = letoh16(leaf_eh->eh_entries);
 	leaf_max = letoh16(leaf_eh->eh_max);
@@ -1895,9 +2154,12 @@ ext4fs_extent_insert_depth (struct inode *ip,
 		    last_len + len <= 32768) {
 			last->e_len = htole16(last_len + len);
 			ext4fs_extent_block_csum_set(fs, ip->i_number,
-			    din->i_nfs_generation, bp->b_data);
+			    din->i_nfs_generation, leaf_bp->b_data);
 			error = ext4fs_extent_metadata_dirty(ip, handle,
-			    bp);
+			    leaf_bp);
+			leaf_bp = NULL;
+			ext4fs_extent_metadata_release(handle,
+			    parent_bp);
 			if (error)
 				return (error);
 			ip->i_flag |= IN_CHANGE | IN_MODIFIED;
@@ -1924,21 +2186,51 @@ ext4fs_extent_insert_depth (struct inode *ip,
 
 		leaf_eh->eh_entries = htole16(leaf_entries + 1);
 		ext4fs_extent_block_csum_set(fs, ip->i_number,
-		    din->i_nfs_generation, bp->b_data);
-		error = ext4fs_extent_metadata_dirty(ip, handle, bp);
+		    din->i_nfs_generation, leaf_bp->b_data);
+		error = ext4fs_extent_metadata_dirty(ip, handle,
+		    leaf_bp);
+		leaf_bp = NULL;
+		ext4fs_extent_metadata_release(handle, parent_bp);
 		if (error)
 			return (error);
 		ip->i_flag |= IN_CHANGE | IN_MODIFIED;
 		return (0);
 	}
 
-	/* Leaf is full - need to split */
-	error = ext4fs_leaf_split(ip, handle, bp, leaf_eh);
-	if (error)
-		return (error);
+	if (parent_entries < parent_max) {
+		error = ext4fs_leaf_split(ip, handle, parent_eh,
+		    parent_bp, leaf_bp, leaf_eh);
+		if (error)
+			return (error);
+		return (ext4fs_extent_insert_depth(ip, handle, lbn,
+		    pblk, len));
+	}
 
-	/* The write path owns the old leaf.  Retry the insert. */
+	ext4fs_extent_metadata_release(handle, leaf_bp);
+	leaf_bp = NULL;
+	if (depth == 1) {
+		error = ext4fs_extent_promote_root(ip, handle);
+		if (error)
+			return (error);
+	} else {
+		if (root_entries >= root_max) {
+			ext4fs_extent_metadata_release(handle,
+			    parent_bp);
+			return (EOPNOTSUPP);
+		}
+		error = ext4fs_index_split(ip, handle, parent_bp,
+		    parent_eh);
+		if (error)
+			return (error);
+		parent_bp = NULL;
+	}
+
 	return (ext4fs_extent_insert_depth(ip, handle, lbn, pblk, len));
+
+out:
+	ext4fs_extent_metadata_release(handle, leaf_bp);
+	ext4fs_extent_metadata_release(handle, parent_bp);
+	return (error);
 }
 
 /*
@@ -1968,7 +2260,9 @@ ext4fs_extent_insert_handle (struct inode *ip,
 
 	/* Depth > 0: delegate to tree insert */
 	if (depth > 0) {
-		if (depth != 1)
+		if (depth > 2)
+			return (EOPNOTSUPP);
+		if (depth == 2 && handle == NULL)
 			return (EOPNOTSUPP);
 		error = ext4fs_extent_index_check(ip->i_e4fs, eh);
 		if (error)
@@ -2615,150 +2909,369 @@ ext4fs_extent_plan_shrink (const struct ext4fs_extent *source,
 	return (0);
 }
 
+struct ext4fs_extent_leaf_state {
+	u_int64_t	 els_block;
+	size_t		 els_offset;
+	u_int32_t	 els_logical;
+	u_int16_t	 els_entries;
+	u_int16_t	 els_parent;
+};
+
+struct ext4fs_extent_index_state {
+	u_int64_t	 eis_block;
+	u_int16_t	 eis_entries;
+	u_int16_t	 eis_first_leaf;
+};
+
+struct ext4fs_extent_tree_state {
+	struct ext4fs_extent		 *ets_extents;
+	struct ext4fs_extent_leaf_state *ets_leaves;
+	struct ext4fs_extent_index_state *ets_indexes;
+	u_int64_t			 *ets_nodes;
+	size_t			 ets_extent_count;
+	u_int16_t			 ets_leaf_count;
+	u_int16_t			 ets_index_count;
+	u_int16_t			 ets_node_count;
+	u_int16_t			 ets_depth;
+};
+
+static void
+ext4fs_extent_tree_release (struct ext4fs_extent_tree_state *tree)
+{
+	if (tree->ets_extents != NULL)
+		free(tree->ets_extents, M_UFSMNT,
+		    MAX(tree->ets_extent_count, 1) *
+		    sizeof(*tree->ets_extents));
+	if (tree->ets_leaves != NULL)
+		free(tree->ets_leaves, M_UFSMNT,
+		    MAX(tree->ets_leaf_count, 1) *
+		    sizeof(*tree->ets_leaves));
+	if (tree->ets_indexes != NULL)
+		free(tree->ets_indexes, M_UFSMNT,
+		    MAX(tree->ets_index_count, 1) *
+		    sizeof(*tree->ets_indexes));
+	if (tree->ets_nodes != NULL)
+		free(tree->ets_nodes, M_UFSMNT,
+		    MAX(tree->ets_node_count, 1) *
+		    sizeof(*tree->ets_nodes));
+	memset(tree, 0, sizeof(*tree));
+}
+
+static int
+ext4fs_extent_tree_read (struct inode *ip, u_int64_t block,
+    u_int16_t depth, struct buf **bpp)
+{
+	struct m_ext4fs *fs = ip->i_e4fs;
+	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
+	struct ext4fs_extent_header *eh;
+	int error;
+
+	*bpp = NULL;
+	error = ext4fs_journal_read_metadata(fs->m_mountp,
+	    ip->i_devvp, block, bpp);
+	if (error)
+		return (error);
+	eh = (struct ext4fs_extent_header *)(*bpp)->b_data;
+	error = ext4fs_extent_header_check(eh, fs->m_block_size,
+	    depth);
+	if (error == 0)
+		error = ext4fs_extent_block_csum_verify(fs,
+		    ip->i_number, din->i_nfs_generation,
+		    (*bpp)->b_data);
+	if (error) {
+		brelse(*bpp);
+		*bpp = NULL;
+	}
+	return (error);
+}
+
+/*
+ * Snapshot and validate a live extent tree before starting a freeing
+ * transaction.  The writer currently creates at most depth two.
+ */
+static int
+ext4fs_extent_tree_collect (struct inode *ip,
+    struct ext4fs_extent_tree_state *tree)
+{
+	struct m_ext4fs *fs = ip->i_e4fs;
+	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
+	struct ext4fs_extent_header *eh, *node_eh;
+	struct ext4fs_extent_idx *idx, *node_idx;
+	struct ext4fs_extent *ext;
+	struct buf *bp = NULL;
+	u_int64_t block, end, previous_end;
+	u_int32_t length, logical;
+	size_t extent_count;
+	u_int16_t entries, i, j, leaf, node_count;
+	int error;
+
+	memset(tree, 0, sizeof(*tree));
+	eh = &din->i_extent_header;
+	error = ext4fs_extent_header_check(eh,
+	    sizeof(din->i_block), -1);
+	if (error)
+		return (error);
+	tree->ets_depth = letoh16(eh->eh_depth);
+	entries = letoh16(eh->eh_entries);
+	if (tree->ets_depth > 2)
+		return (EOPNOTSUPP);
+	if (tree->ets_depth == 0) {
+		error = ext4fs_extent_leaf_check(fs, eh);
+		if (error)
+			return (error);
+		tree->ets_extent_count = entries;
+		tree->ets_extents = mallocarray(MAX(entries, 1),
+		    sizeof(*tree->ets_extents), M_UFSMNT, M_WAITOK);
+		memcpy(tree->ets_extents, din->i_extent,
+		    entries * sizeof(*tree->ets_extents));
+		error = ext4fs_extent_physical_check(
+		    tree->ets_extents, entries, NULL, 0);
+		if (error)
+			goto fail;
+		return (0);
+	}
+	error = ext4fs_extent_index_check(fs, eh);
+	if (error)
+		return (error);
+	idx = din->i_extent_idx;
+	if (tree->ets_depth == 1)
+		tree->ets_leaf_count = entries;
+	else {
+		tree->ets_index_count = entries;
+		tree->ets_indexes = mallocarray(MAX(entries, 1),
+		    sizeof(*tree->ets_indexes), M_UFSMNT, M_WAITOK);
+		for (i = 0; i < entries; i++) {
+			block = letoh32(idx[i].ei_leaf_lo) |
+			    ((u_int64_t)
+			    letoh16(idx[i].ei_leaf_hi) << 32);
+			for (j = 0; j < i; j++) {
+				if (tree->ets_indexes[j].eis_block == block) {
+					error = EIO;
+					goto fail;
+				}
+			}
+			error = ext4fs_extent_tree_read(ip, block, 1,
+			    &bp);
+			if (error)
+				goto fail;
+			node_eh = (struct ext4fs_extent_header *)
+			    bp->b_data;
+			error = ext4fs_extent_index_check(fs, node_eh);
+			node_idx = (struct ext4fs_extent_idx *)
+			    (node_eh + 1);
+			if (error == 0 && letoh32(node_idx[0].ei_block) <
+			    letoh32(idx[i].ei_block))
+				error = EIO;
+			if (error) {
+				brelse(bp);
+				goto fail;
+			}
+			tree->ets_indexes[i].eis_block = block;
+			tree->ets_indexes[i].eis_entries =
+			    letoh16(node_eh->eh_entries);
+			tree->ets_indexes[i].eis_first_leaf =
+			    tree->ets_leaf_count;
+			if (tree->ets_indexes[i].eis_entries >
+			    UINT16_MAX - tree->ets_leaf_count) {
+				brelse(bp);
+				error = EFBIG;
+				goto fail;
+			}
+			tree->ets_leaf_count +=
+			    tree->ets_indexes[i].eis_entries;
+			brelse(bp);
+		}
+	}
+
+	tree->ets_leaves = mallocarray(MAX(tree->ets_leaf_count, 1),
+	    sizeof(*tree->ets_leaves), M_UFSMNT, M_WAITOK);
+	leaf = 0;
+	if (tree->ets_depth == 1) {
+		for (i = 0; i < entries; i++, leaf++) {
+			tree->ets_leaves[leaf].els_block =
+			    letoh32(idx[i].ei_leaf_lo) |
+			    ((u_int64_t)
+			    letoh16(idx[i].ei_leaf_hi) << 32);
+			tree->ets_leaves[leaf].els_logical =
+			    letoh32(idx[i].ei_block);
+		}
+	} else {
+		for (i = 0; i < tree->ets_index_count; i++) {
+			error = ext4fs_extent_tree_read(ip,
+			    tree->ets_indexes[i].eis_block, 1, &bp);
+			if (error)
+				goto fail;
+			node_eh = (struct ext4fs_extent_header *)
+			    bp->b_data;
+			error = ext4fs_extent_index_check(fs, node_eh);
+			if (error || letoh16(node_eh->eh_entries) !=
+			    tree->ets_indexes[i].eis_entries) {
+				brelse(bp);
+				if (error == 0)
+					error = EIO;
+				goto fail;
+			}
+			node_idx = (struct ext4fs_extent_idx *)
+			    (node_eh + 1);
+			for (j = 0; j <
+			    tree->ets_indexes[i].eis_entries;
+			    j++, leaf++) {
+				tree->ets_leaves[leaf].els_block =
+				    letoh32(node_idx[j].ei_leaf_lo) |
+				    ((u_int64_t)letoh16(
+				    node_idx[j].ei_leaf_hi) << 32);
+				tree->ets_leaves[leaf].els_logical =
+				    letoh32(node_idx[j].ei_block);
+				tree->ets_leaves[leaf].els_parent = i;
+			}
+			brelse(bp);
+		}
+	}
+
+	if (tree->ets_index_count >
+	    UINT16_MAX - tree->ets_leaf_count) {
+		error = EFBIG;
+		goto fail;
+	}
+	node_count = tree->ets_index_count + tree->ets_leaf_count;
+	tree->ets_node_count = node_count;
+	tree->ets_nodes = mallocarray(MAX(node_count, 1),
+	    sizeof(*tree->ets_nodes), M_UFSMNT, M_WAITOK);
+	for (i = 0; i < tree->ets_index_count; i++)
+		tree->ets_nodes[i] = tree->ets_indexes[i].eis_block;
+	extent_count = 0;
+	for (i = 0; i < tree->ets_leaf_count; i++) {
+		block = tree->ets_leaves[i].els_block;
+		for (j = 0; j < tree->ets_index_count + i; j++) {
+			if (tree->ets_nodes[j] == block) {
+				error = EIO;
+				goto fail;
+			}
+		}
+		tree->ets_nodes[tree->ets_index_count + i] = block;
+		error = ext4fs_extent_tree_read(ip, block, 0, &bp);
+		if (error)
+			goto fail;
+		node_eh = (struct ext4fs_extent_header *)bp->b_data;
+		error = ext4fs_extent_leaf_check(fs, node_eh);
+		if (error) {
+			brelse(bp);
+			goto fail;
+		}
+		tree->ets_leaves[i].els_entries =
+		    letoh16(node_eh->eh_entries);
+		tree->ets_leaves[i].els_offset = extent_count;
+		if (tree->ets_leaves[i].els_entries == 0 ||
+		    extent_count > UINT16_MAX ||
+		    tree->ets_leaves[i].els_entries >
+		    UINT16_MAX - extent_count) {
+			brelse(bp);
+			error = EFBIG;
+			goto fail;
+		}
+		extent_count += tree->ets_leaves[i].els_entries;
+		brelse(bp);
+	}
+	tree->ets_extent_count = extent_count;
+	tree->ets_extents = mallocarray(MAX(extent_count, 1),
+	    sizeof(*tree->ets_extents), M_UFSMNT, M_WAITOK);
+	previous_end = 0;
+	for (i = 0; i < tree->ets_leaf_count; i++) {
+		error = ext4fs_extent_tree_read(ip,
+		    tree->ets_leaves[i].els_block, 0, &bp);
+		if (error)
+			goto fail;
+		node_eh = (struct ext4fs_extent_header *)bp->b_data;
+		error = ext4fs_extent_leaf_check(fs, node_eh);
+		if (error || letoh16(node_eh->eh_entries) !=
+		    tree->ets_leaves[i].els_entries) {
+			brelse(bp);
+			if (error == 0)
+				error = EIO;
+			goto fail;
+		}
+		ext = (struct ext4fs_extent *)(node_eh + 1);
+		logical = letoh32(ext[0].e_block);
+		if (logical < tree->ets_leaves[i].els_logical ||
+		    (i != 0 && logical < previous_end)) {
+			brelse(bp);
+			error = EIO;
+			goto fail;
+		}
+		j = tree->ets_leaves[i].els_entries - 1;
+		length = letoh16(ext[j].e_len);
+		if (length > 0x8000)
+			length -= 0x8000;
+		end = (u_int64_t)letoh32(ext[j].e_block) + length;
+		previous_end = end;
+		memcpy(&tree->ets_extents[
+		    tree->ets_leaves[i].els_offset], ext,
+		    tree->ets_leaves[i].els_entries * sizeof(*ext));
+		brelse(bp);
+	}
+	error = ext4fs_extent_physical_check(tree->ets_extents,
+	    tree->ets_extent_count, tree->ets_nodes,
+	    tree->ets_node_count);
+	if (error)
+		goto fail;
+	return (0);
+
+fail:
+	ext4fs_extent_tree_release(tree);
+	return (error);
+}
+
+static int
+ext4fs_extent_tree_validate (struct inode *ip)
+{
+	struct ext4fs_extent_tree_state tree;
+	int error;
+
+	error = ext4fs_extent_tree_collect(ip, &tree);
+	if (error)
+		return (error);
+	ext4fs_extent_tree_release(&tree);
+	return (0);
+}
+
 static int
 ext4fs_truncate_zero_journal (struct inode *ip)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
 	struct ext4fs_extent_header *eh = &din->i_extent_header;
-	struct ext4fs_extent_idx *idx;
-	struct ext4fs_extent_header *leaf_eh;
-	struct ext4fs_extent *extents, *leaf_ext;
+	struct ext4fs_extent_tree_state tree;
 	struct ext4fs_dinode_256 saved_inode;
 	struct ext4fs_journal_handle *handle;
 	struct vnode *vp = ITOV(ip);
-	struct buf *bp;
-	size_t capacity, extent_count, maximum;
 	u_int64_t credits, first_group, group_touches, last_group;
-	u_int64_t leaf_blocks[4], logical_end, previous_end, start;
-	u_int64_t released_blocks;
-	u_int32_t index_logical, length, logical;
-	u_int16_t depth, entries, leaf_count, leaf_entries;
-	int changed, end_error, error, i, j, saved_flags;
+	u_int64_t released_blocks, start;
+	u_int32_t length;
+	int changed, end_error, error, i, saved_flags;
 
-	error = ext4fs_extent_header_check(eh,
-	    sizeof(din->i_block), -1);
+	handle = NULL;
+	error = ext4fs_extent_tree_collect(ip, &tree);
 	if (error)
 		return (error);
-	depth = letoh16(eh->eh_depth);
-	entries = letoh16(eh->eh_entries);
-	if (depth > 1)
-		return (EOPNOTSUPP);
-
-	leaf_count = 0;
-	capacity = 1;
-	if (depth == 1) {
-		error = ext4fs_extent_index_check(fs, eh);
-		if (error)
-			return (error);
-		leaf_count = entries;
-		capacity = (fs->m_block_size -
-		    sizeof(struct ext4fs_extent_header)) /
-		    sizeof(struct ext4fs_extent);
-		maximum = (size_t)leaf_count * capacity;
-	} else {
-		error = ext4fs_extent_leaf_check(fs, eh);
-		if (error)
-			return (error);
-		maximum = entries;
-	}
-	if (maximum == 0)
-		maximum = 1;
-	if (maximum > UINT16_MAX)
-		return (EFBIG);
-	extents = mallocarray(maximum, sizeof(*extents), M_UFSMNT,
-	    M_WAITOK);
-	extent_count = 0;
-	previous_end = 0;
-	bp = NULL;
-
-	if (depth == 0) {
-		memcpy(extents, din->i_extent,
-		    (size_t)entries * sizeof(*extents));
-		extent_count = entries;
-	} else {
-		idx = din->i_extent_idx;
-		for (i = 0; i < leaf_count; i++) {
-			leaf_blocks[i] = letoh32(idx[i].ei_leaf_lo) |
-			    ((u_int64_t)
-			    letoh16(idx[i].ei_leaf_hi) << 32);
-			for (j = 0; j < i; j++) {
-				if (leaf_blocks[j] == leaf_blocks[i]) {
-					error = EIO;
-					goto out;
-				}
-			}
-			error = ext4fs_journal_read_metadata(
-			    fs->m_mountp, ip->i_devvp,
-			    leaf_blocks[i], &bp);
-			if (error) {
-				if (bp != NULL)
-					brelse(bp);
-				bp = NULL;
-				goto out;
-			}
-			leaf_eh =
-			    (struct ext4fs_extent_header *)bp->b_data;
-			error = ext4fs_extent_header_check(leaf_eh,
-			    fs->m_block_size, 0);
-			if (error == 0)
-				error =
-				    ext4fs_extent_block_csum_verify(fs,
-				    ip->i_number, din->i_nfs_generation,
-				    bp->b_data);
-			if (error == 0)
-				error = ext4fs_extent_leaf_check(fs,
-				    leaf_eh);
-			if (error)
-				goto out;
-			leaf_entries = letoh16(leaf_eh->eh_entries);
-			if (leaf_entries == 0 ||
-			    leaf_entries > maximum - extent_count) {
-				error = EIO;
-				goto out;
-			}
-			leaf_ext =
-			    (struct ext4fs_extent *)(leaf_eh + 1);
-			index_logical = letoh32(idx[i].ei_block);
-			logical = letoh32(leaf_ext[0].e_block);
-			if (logical < index_logical ||
-			    (i != 0 && (index_logical < previous_end ||
-			    logical < previous_end))) {
-				error = EIO;
-				goto out;
-			}
-			length = letoh16(
-			    leaf_ext[leaf_entries - 1].e_len);
-			if (length > 0x8000)
-				length -= 0x8000;
-			logical_end = (u_int64_t)letoh32(
-			    leaf_ext[leaf_entries - 1].e_block) +
-			    length;
-			previous_end = logical_end;
-			memcpy(&extents[extent_count], leaf_ext,
-			    (size_t)leaf_entries * sizeof(*extents));
-			extent_count += leaf_entries;
-			brelse(bp);
-			bp = NULL;
-		}
-	}
-	error = ext4fs_extent_physical_check(extents, extent_count,
-	    leaf_blocks, leaf_count);
-	if (error)
-		goto out;
 
 	group_touches = 0;
 	released_blocks = 0;
-	for (i = 0; i < (int)extent_count; i++) {
-		start = letoh32(extents[i].e_start_lo) |
-		    ((u_int64_t)letoh16(extents[i].e_start_hi) << 32);
-		length = letoh16(extents[i].e_len);
+	for (i = 0; i < (int)tree.ets_extent_count; i++) {
+		start = letoh32(tree.ets_extents[i].e_start_lo) |
+		    ((u_int64_t)letoh16(
+		    tree.ets_extents[i].e_start_hi) << 32);
+		length = letoh16(tree.ets_extents[i].e_len);
 		if (length > 0x8000)
 			length -= 0x8000;
 		first_group = (start - fs->m_first_data_block) /
 		    fs->m_blocks_per_group;
 		last_group = (start + length - 1 -
 		    fs->m_first_data_block) / fs->m_blocks_per_group;
+		if (group_touches > UINT64_MAX -
+		    (last_group - first_group + 1)) {
+			error = EFBIG;
+			goto out;
+		}
 		group_touches += last_group - first_group + 1;
 		if (released_blocks > UINT64_MAX - length) {
 			error = EFBIG;
@@ -2766,15 +3279,17 @@ ext4fs_truncate_zero_journal (struct inode *ip)
 		}
 		released_blocks += length;
 	}
-	if (released_blocks > UINT64_MAX - leaf_count) {
+	if (released_blocks > UINT64_MAX - tree.ets_node_count) {
 		error = EFBIG;
 		goto out;
 	}
-	if (group_touches > (UINT64_MAX - 3 * leaf_count - 2) / 2) {
+	if (group_touches > (UINT64_MAX -
+	    3 * tree.ets_node_count - 2) / 2) {
 		error = EFBIG;
 		goto out;
 	}
-	credits = 2 * group_touches + 3 * leaf_count + 2;
+	credits = 2 * group_touches +
+	    3 * tree.ets_node_count + 2;
 	if (credits == 0 || credits > UINT_MAX ||
 	    (vp->v_type == VDIR && released_blocks >
 	    UINT_MAX - credits)) {
@@ -2783,27 +3298,27 @@ ext4fs_truncate_zero_journal (struct inode *ip)
 	}
 	if (vp->v_type == VDIR)
 		credits += released_blocks;
-	released_blocks += leaf_count;
+	released_blocks += tree.ets_node_count;
 
 	error = vinvalbuf(vp, 0, NOCRED, curproc, 0, INFSLP);
 	if (error)
 		goto out;
 	memcpy(&saved_inode, ip->i_e4din, sizeof(saved_inode));
 	saved_flags = ip->i_flag;
-	handle = NULL;
 	changed = 0;
 	error = ext4fs_journal_begin(vp->v_mount, (unsigned int)credits,
 	    &handle);
 	if (error)
 		goto out;
-	changed = extent_count != 0 || leaf_count != 0;
-	error = ext4fs_free_extents_handle(ip, handle, extents,
-	    (u_int16_t)extent_count);
+	changed = tree.ets_extent_count != 0 ||
+	    tree.ets_node_count != 0;
+	error = ext4fs_free_extents_handle(ip, handle,
+	    tree.ets_extents, (u_int16_t)tree.ets_extent_count);
 	if (error)
 		goto fail;
-	for (i = 0; i < leaf_count; i++) {
+	for (i = 0; i < tree.ets_node_count; i++) {
 		error = ext4fs_blkfree_handle(ip, handle,
-		    leaf_blocks[i]);
+		    tree.ets_nodes[i]);
 		if (error)
 			goto fail;
 		changed = 1;
@@ -2846,14 +3361,13 @@ restore:
 	ip->i_flag = saved_flags;
 
 out:
-	if (bp != NULL)
-		brelse(bp);
-	free(extents, M_UFSMNT, maximum * sizeof(*extents));
+	ext4fs_extent_tree_release(&tree);
 	return (error);
 }
 
 static int
-ext4fs_truncate_shrink_journal (struct inode *ip, off_t length)
+ext4fs_truncate_shrink_depth01_journal (struct inode *ip,
+    off_t length)
 {
 	struct m_ext4fs *fs = ip->i_e4fs;
 	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
@@ -3259,6 +3773,415 @@ out:
 	free(released, M_UFSMNT, maximum * sizeof(*released));
 	free(original, M_UFSMNT, maximum * sizeof(*original));
 	return (error);
+}
+
+static int
+ext4fs_truncate_shrink_depth2_journal (struct inode *ip,
+    off_t length)
+{
+	struct m_ext4fs *fs = ip->i_e4fs;
+	struct ext4fs_dinode *din = &ip->i_e4din->dinode;
+	struct ext4fs_extent_header *eh = &din->i_extent_header;
+	struct ext4fs_extent_header *node_eh;
+	struct ext4fs_extent_idx *idx, *node_idx;
+	struct ext4fs_extent *ext, *released, *retained;
+	struct ext4fs_extent_tree_state tree;
+	struct ext4fs_dinode_256 saved_inode;
+	struct ext4fs_journal_handle *handle;
+	struct vnode *vp = ITOV(ip);
+	struct buf *bp = NULL;
+	size_t k, maximum, released_count;
+	u_int64_t credits, cutoff, first_group, group_touches;
+	u_int64_t last_group, physical, released_blocks, start;
+	u_int64_t tail_lbn, tail_pblk;
+	u_int32_t dirty_indexes, dirty_leaves, empty_indexes;
+	u_int32_t empty_leaves, empty_nodes, length_blocks;
+	u_int32_t logical, offset;
+	u_int16_t *new_entries, *new_index_entries;
+	u_int16_t i, j, leaf, new_root_entries, raw_length;
+	u_int8_t *index_changed, *leaf_changed;
+	int changed, end_error, error, saved_flags, seen_empty;
+	int tail_unwritten;
+
+	handle = NULL;
+	error = ext4fs_extent_tree_collect(ip, &tree);
+	if (error)
+		return (error);
+	if (tree.ets_depth != 2) {
+		error = EIO;
+		goto out_tree;
+	}
+
+	maximum = MAX(tree.ets_extent_count, 1);
+	released = mallocarray(maximum, sizeof(*released), M_UFSMNT,
+	    M_WAITOK);
+	retained = mallocarray(maximum, sizeof(*retained), M_UFSMNT,
+	    M_WAITOK | M_ZERO);
+	new_entries = mallocarray(MAX(tree.ets_leaf_count, 1),
+	    sizeof(*new_entries), M_UFSMNT, M_WAITOK | M_ZERO);
+	leaf_changed = mallocarray(MAX(tree.ets_leaf_count, 1),
+	    sizeof(*leaf_changed), M_UFSMNT, M_WAITOK | M_ZERO);
+	new_index_entries = mallocarray(MAX(tree.ets_index_count, 1),
+	    sizeof(*new_index_entries), M_UFSMNT,
+	    M_WAITOK | M_ZERO);
+	index_changed = mallocarray(MAX(tree.ets_index_count, 1),
+	    sizeof(*index_changed), M_UFSMNT, M_WAITOK | M_ZERO);
+
+	cutoff = ((u_int64_t)length + fs->m_block_size - 1) /
+	    fs->m_block_size;
+	released_count = 0;
+	released_blocks = 0;
+	seen_empty = 0;
+	for (i = 0; i < tree.ets_leaf_count; i++) {
+		error = ext4fs_extent_plan_shrink(
+		    &tree.ets_extents[tree.ets_leaves[i].els_offset],
+		    tree.ets_leaves[i].els_entries, cutoff,
+		    &retained[tree.ets_leaves[i].els_offset],
+		    &new_entries[i], released, maximum,
+		    &released_count, &released_blocks);
+		if (error)
+			goto out;
+		if (new_entries[i] == 0)
+			seen_empty = 1;
+		else if (seen_empty) {
+			error = EIO;
+			goto out;
+		}
+		leaf_changed[i] = new_entries[i] !=
+		    tree.ets_leaves[i].els_entries ||
+		    memcmp(&tree.ets_extents[
+		    tree.ets_leaves[i].els_offset],
+		    &retained[tree.ets_leaves[i].els_offset],
+		    new_entries[i] * sizeof(*retained)) != 0;
+	}
+
+	seen_empty = 0;
+	new_root_entries = 0;
+	for (i = 0; i < tree.ets_index_count; i++) {
+		for (j = 0; j < tree.ets_indexes[i].eis_entries;
+		    j++) {
+			leaf = tree.ets_indexes[i].eis_first_leaf + j;
+			if (leaf >= tree.ets_leaf_count ||
+			    tree.ets_leaves[leaf].els_parent != i) {
+				error = EIO;
+				goto out;
+			}
+			if (new_entries[leaf] != 0)
+				new_index_entries[i]++;
+		}
+		if (new_index_entries[i] == 0)
+			seen_empty = 1;
+		else if (seen_empty) {
+			error = EIO;
+			goto out;
+		} else
+			new_root_entries++;
+		index_changed[i] = new_index_entries[i] !=
+		    tree.ets_indexes[i].eis_entries;
+	}
+
+	tail_pblk = 0;
+	tail_unwritten = 0;
+	if (length % fs->m_block_size != 0) {
+		tail_lbn = cutoff - 1;
+		for (k = 0; k < tree.ets_extent_count; k++) {
+			logical = letoh32(tree.ets_extents[k].e_block);
+			raw_length = letoh16(
+			    tree.ets_extents[k].e_len);
+			length_blocks = raw_length > 0x8000 ?
+			    raw_length - 0x8000 : raw_length;
+			if (tail_lbn < logical ||
+			    tail_lbn - logical >= length_blocks)
+				continue;
+			physical = letoh32(
+			    tree.ets_extents[k].e_start_lo) |
+			    ((u_int64_t)letoh16(
+			    tree.ets_extents[k].e_start_hi) << 32);
+			tail_pblk = physical + tail_lbn - logical;
+			tail_unwritten = raw_length > 0x8000;
+			break;
+		}
+	}
+
+	group_touches = 0;
+	for (k = 0; k < released_count; k++) {
+		start = letoh32(released[k].e_start_lo) |
+		    ((u_int64_t)letoh16(
+		    released[k].e_start_hi) << 32);
+		length_blocks = letoh16(released[k].e_len);
+		if (length_blocks > 0x8000)
+			length_blocks -= 0x8000;
+		first_group = (start - fs->m_first_data_block) /
+		    fs->m_blocks_per_group;
+		last_group = (start + length_blocks - 1 -
+		    fs->m_first_data_block) / fs->m_blocks_per_group;
+		if (group_touches > UINT64_MAX -
+		    (last_group - first_group + 1)) {
+			error = EFBIG;
+			goto out;
+		}
+		group_touches += last_group - first_group + 1;
+	}
+
+	dirty_leaves = 0;
+	empty_leaves = 0;
+	for (i = 0; i < tree.ets_leaf_count; i++) {
+		if (new_entries[i] == 0)
+			empty_leaves++;
+		else if (leaf_changed[i])
+			dirty_leaves++;
+	}
+	dirty_indexes = 0;
+	empty_indexes = 0;
+	for (i = 0; i < tree.ets_index_count; i++) {
+		if (new_index_entries[i] == 0)
+			empty_indexes++;
+		else if (index_changed[i])
+			dirty_indexes++;
+	}
+	empty_nodes = empty_leaves + empty_indexes;
+	if (group_touches > (UINT64_MAX - 3 * empty_nodes -
+	    dirty_leaves - dirty_indexes - 2) / 2) {
+		error = EFBIG;
+		goto out;
+	}
+	credits = 2 * group_touches + 3 * empty_nodes +
+	    dirty_leaves + dirty_indexes + 2;
+	if (credits == 0 || credits > UINT_MAX ||
+	    (vp->v_type == VDIR && released_blocks >
+	    UINT_MAX - credits) ||
+	    released_blocks > UINT64_MAX - empty_nodes) {
+		error = EFBIG;
+		goto out;
+	}
+	if (vp->v_type == VDIR)
+		credits += released_blocks;
+	released_blocks += empty_nodes;
+
+	error = vinvalbuf(vp, 0, NOCRED, curproc, 0, INFSLP);
+	if (error)
+		goto out;
+	if (tail_pblk != 0 && ! tail_unwritten) {
+		error = bread(ip->i_devvp,
+		    (daddr_t)EXT4FS_FSBTODB(fs, tail_pblk),
+		    fs->m_block_size, &bp);
+		if (error) {
+			if (bp != NULL)
+				brelse(bp);
+			bp = NULL;
+			goto out;
+		}
+		offset = (u_int32_t)((u_int64_t)length %
+		    fs->m_block_size);
+		memset((char *)bp->b_data + offset, 0,
+		    fs->m_block_size - offset);
+		error = bwrite(bp);
+		bp = NULL;
+		if (error)
+			goto out;
+	}
+
+	memcpy(&saved_inode, ip->i_e4din, sizeof(saved_inode));
+	saved_flags = ip->i_flag;
+	changed = 0;
+	error = ext4fs_journal_begin(vp->v_mount,
+	    (unsigned int)credits, &handle);
+	if (error)
+		goto out;
+	changed = released_count != 0 || empty_nodes != 0 ||
+	    dirty_leaves != 0 || dirty_indexes != 0;
+	error = ext4fs_free_extents_handle(ip, handle, released,
+	    (u_int16_t)released_count);
+	if (error)
+		goto fail;
+
+	for (i = 0; i < tree.ets_leaf_count; i++) {
+		if (new_entries[i] == 0) {
+			error = ext4fs_blkfree_handle(ip, handle,
+			    tree.ets_leaves[i].els_block);
+			if (error)
+				goto fail;
+			continue;
+		}
+		if (! leaf_changed[i])
+			continue;
+		error = ext4fs_journal_get_metadata(handle,
+		    ip->i_devvp, tree.ets_leaves[i].els_block, &bp);
+		if (error)
+			goto fail;
+		node_eh = (struct ext4fs_extent_header *)bp->b_data;
+		error = ext4fs_extent_header_check(node_eh,
+		    fs->m_block_size, 0);
+		if (error == 0)
+			error = ext4fs_extent_block_csum_verify(fs,
+			    ip->i_number, din->i_nfs_generation,
+			    bp->b_data);
+		if (error == 0)
+			error = ext4fs_extent_leaf_check(fs, node_eh);
+		ext = (struct ext4fs_extent *)(node_eh + 1);
+		if (error == 0 &&
+		    (letoh16(node_eh->eh_entries) !=
+		    tree.ets_leaves[i].els_entries ||
+		    memcmp(ext, &tree.ets_extents[
+		    tree.ets_leaves[i].els_offset],
+		    tree.ets_leaves[i].els_entries *
+		    sizeof(*ext)) != 0))
+			error = EIO;
+		if (error) {
+			bp = NULL;
+			goto fail;
+		}
+		memset(ext, 0, tree.ets_leaves[i].els_entries *
+		    sizeof(*ext));
+		memcpy(ext, &retained[
+		    tree.ets_leaves[i].els_offset],
+		    new_entries[i] * sizeof(*ext));
+		node_eh->eh_entries = htole16(new_entries[i]);
+		ext4fs_extent_block_csum_set(fs, ip->i_number,
+		    din->i_nfs_generation, bp->b_data);
+		error = ext4fs_journal_dirty_metadata(handle, bp);
+		bp = NULL;
+		if (error)
+			goto fail;
+	}
+
+	for (i = 0; i < tree.ets_index_count; i++) {
+		if (new_index_entries[i] == 0) {
+			error = ext4fs_blkfree_handle(ip, handle,
+			    tree.ets_indexes[i].eis_block);
+			if (error)
+				goto fail;
+			continue;
+		}
+		if (! index_changed[i])
+			continue;
+		error = ext4fs_journal_get_metadata(handle,
+		    ip->i_devvp, tree.ets_indexes[i].eis_block,
+		    &bp);
+		if (error)
+			goto fail;
+		node_eh = (struct ext4fs_extent_header *)bp->b_data;
+		error = ext4fs_extent_header_check(node_eh,
+		    fs->m_block_size, 1);
+		if (error == 0)
+			error = ext4fs_extent_block_csum_verify(fs,
+			    ip->i_number, din->i_nfs_generation,
+			    bp->b_data);
+		if (error == 0)
+			error = ext4fs_extent_index_check(fs, node_eh);
+		node_idx = (struct ext4fs_extent_idx *)(node_eh + 1);
+		if (error == 0 && letoh16(node_eh->eh_entries) !=
+		    tree.ets_indexes[i].eis_entries)
+			error = EIO;
+		for (j = 0; error == 0 &&
+		    j < tree.ets_indexes[i].eis_entries; j++) {
+			leaf = tree.ets_indexes[i].eis_first_leaf + j;
+			physical = letoh32(node_idx[j].ei_leaf_lo) |
+			    ((u_int64_t)letoh16(
+			    node_idx[j].ei_leaf_hi) << 32);
+			if (physical != tree.ets_leaves[leaf].els_block ||
+			    letoh32(node_idx[j].ei_block) !=
+			    tree.ets_leaves[leaf].els_logical)
+				error = EIO;
+		}
+		if (error) {
+			bp = NULL;
+			goto fail;
+		}
+		memset(&node_idx[new_index_entries[i]], 0,
+		    (tree.ets_indexes[i].eis_entries -
+		    new_index_entries[i]) * sizeof(*node_idx));
+		node_eh->eh_entries =
+		    htole16(new_index_entries[i]);
+		ext4fs_extent_block_csum_set(fs, ip->i_number,
+		    din->i_nfs_generation, bp->b_data);
+		error = ext4fs_journal_dirty_metadata(handle, bp);
+		bp = NULL;
+		if (error)
+			goto fail;
+	}
+
+	idx = din->i_extent_idx;
+	if (new_root_entries == 0) {
+		memset(din->i_extent, 0,
+		    4 * sizeof(struct ext4fs_extent));
+		eh->eh_entries = htole16(0);
+		eh->eh_depth = htole16(0);
+	} else {
+		memset(&idx[new_root_entries], 0,
+		    (tree.ets_index_count - new_root_entries) *
+		    sizeof(*idx));
+		eh->eh_entries = htole16(new_root_entries);
+	}
+	error = ext4fs_inode_blocks_subtract(ip, released_blocks);
+	if (error)
+		goto fail;
+	ext4fs_setsize(ip, length);
+	ip->i_flag |= IN_CHANGE | IN_UPDATE;
+	error = ext4fs_update_handle(ip, handle);
+	if (error)
+		goto fail;
+	changed = 1;
+	end_error = ext4fs_journal_end_commit(handle,
+	    EXT4FS_JOURNAL_COMMIT_ORDINARY);
+	handle = NULL;
+	if (end_error) {
+		error = end_error;
+		ext4fs_journal_abort(vp->v_mount, error);
+		goto restore;
+	}
+	ip->i_flag &= ~IN_MODIFIED;
+	uvm_vnp_setsize(vp, length);
+	error = 0;
+	goto out;
+
+fail:
+	if (changed)
+		ext4fs_journal_abort(vp->v_mount, error);
+	end_error = ext4fs_journal_end(handle);
+	handle = NULL;
+	if (error == 0)
+		error = end_error;
+restore:
+	memcpy(ip->i_e4din, &saved_inode, sizeof(saved_inode));
+	ip->i_flag = saved_flags;
+
+out:
+	if (bp != NULL)
+		brelse(bp);
+	free(index_changed, M_UFSMNT,
+	    MAX(tree.ets_index_count, 1) *
+	    sizeof(*index_changed));
+	free(new_index_entries, M_UFSMNT,
+	    MAX(tree.ets_index_count, 1) *
+	    sizeof(*new_index_entries));
+	free(leaf_changed, M_UFSMNT,
+	    MAX(tree.ets_leaf_count, 1) *
+	    sizeof(*leaf_changed));
+	free(new_entries, M_UFSMNT,
+	    MAX(tree.ets_leaf_count, 1) * sizeof(*new_entries));
+	free(retained, M_UFSMNT, maximum * sizeof(*retained));
+	free(released, M_UFSMNT, maximum * sizeof(*released));
+out_tree:
+	ext4fs_extent_tree_release(&tree);
+	return (error);
+}
+
+static int
+ext4fs_truncate_shrink_journal (struct inode *ip, off_t length)
+{
+	struct ext4fs_extent_header *eh;
+	u_int16_t depth;
+
+	eh = &ip->i_e4din->dinode.i_extent_header;
+	depth = letoh16(eh->eh_depth);
+	if (depth <= 1)
+		return (ext4fs_truncate_shrink_depth01_journal(ip,
+		    length));
+	if (depth == 2)
+		return (ext4fs_truncate_shrink_depth2_journal(ip,
+		    length));
+	return (EOPNOTSUPP);
 }
 
 /*
@@ -4712,7 +5635,8 @@ ext4fs_write_allocated_run (struct inode *ip, struct uio *uio,
 	saved_filesize = (off_t)letoh32(din->i_size_lo) |
 	    ((off_t)letoh32(din->i_size_hi) << 32);
 	*filesizep = saved_filesize;
-	error = ext4fs_journal_begin(vp->v_mount, 9, &handle);
+	/* Root promotion may add one index and one leaf block. */
+	error = ext4fs_journal_begin(vp->v_mount, 12, &handle);
 	if (error)
 		goto out;
 	error = ext4fs_extent_pblk(ip, handle, lbn, &pblk,
@@ -5202,7 +6126,7 @@ ext4fs_remove (void *v)
 			    letoh16(din->i_extent_header.eh_magic) !=
 			    EXT4FS_EXTENT_HEADER_MAGIC)
 				journal_final_error = EIO;
-			else if (depth <= 1)
+			else if (depth <= 2)
 				journal_final = 1;
 			break;
 		case VLNK:
@@ -5211,7 +6135,7 @@ ext4fs_remove (void *v)
 				    din->i_extent_header.eh_magic) !=
 				    EXT4FS_EXTENT_HEADER_MAGIC)
 					journal_final_error = EIO;
-				else if (depth <= 1)
+				else if (depth <= 2)
 					journal_final = 1;
 			} else {
 				if (blocks == blockless_units &&
@@ -5243,6 +6167,12 @@ ext4fs_remove (void *v)
 	if (fs->m_journal != NULL && nlink == 1 && ! journal_final) {
 		error = journal_final_error;
 		goto out;
+	}
+	if (fs->m_journal != NULL && journal_final &&
+	    (inode_flags & EXTFS_INODE_FLAG_EXTENTS) && depth == 2) {
+		error = ext4fs_extent_tree_validate(ip);
+		if (error)
+			goto out;
 	}
 	if (fs->m_journal != NULL && journal_final && xattr != 0) {
 		error = ext4fs_orphan_xattr_validate(ip);
@@ -5539,7 +6469,7 @@ ext4fs_rename_target_validate (struct inode *ip, int *orphanp)
 		if (error)
 			return (error);
 		depth = letoh16(eh->eh_depth);
-		if (depth > 1)
+		if (depth > 2)
 			return (EOPNOTSUPP);
 		if (depth == 0)
 			error = ext4fs_extent_leaf_check(fs,
@@ -5549,6 +6479,11 @@ ext4fs_rename_target_validate (struct inode *ip, int *orphanp)
 			    eh);
 		if (error)
 			return (error);
+		if (depth == 2) {
+			error = ext4fs_extent_tree_validate(ip);
+			if (error)
+				return (error);
+		}
 		break;
 	case VLNK:
 		if (flags & EXTFS_INODE_FLAG_EXTENTS) {
@@ -5557,7 +6492,7 @@ ext4fs_rename_target_validate (struct inode *ip, int *orphanp)
 			if (error)
 				return (error);
 			depth = letoh16(eh->eh_depth);
-			if (depth > 1)
+			if (depth > 2)
 				return (EOPNOTSUPP);
 			if (depth == 0)
 				error = ext4fs_extent_leaf_check(fs,
@@ -5567,6 +6502,11 @@ ext4fs_rename_target_validate (struct inode *ip, int *orphanp)
 				    eh);
 			if (error)
 				return (error);
+			if (depth == 2) {
+				error = ext4fs_extent_tree_validate(ip);
+				if (error)
+					return (error);
+			}
 		} else if (blocks != blockless_units ||
 		    size > EXT4FS_SYMLINK_LEN_MAX)
 			return (EIO);
@@ -6896,7 +7836,7 @@ ext4fs_rmdir (void *v)
 		    sizeof(din->i_block), -1);
 		if (error)
 			goto out;
-		if (letoh16(eh->eh_depth) > 1) {
+		if (letoh16(eh->eh_depth) > 2) {
 			error = EOPNOTSUPP;
 			goto out;
 		}
@@ -6906,6 +7846,11 @@ ext4fs_rmdir (void *v)
 			error = ext4fs_extent_index_check(fs, eh);
 		if (error)
 			goto out;
+		if (letoh16(eh->eh_depth) == 2) {
+			error = ext4fs_extent_tree_validate(ip);
+			if (error)
+				goto out;
+		}
 		error = ext4fs_orphan_xattr_validate(ip);
 		if (error)
 			goto out;

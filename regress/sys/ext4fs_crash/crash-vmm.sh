@@ -113,8 +113,8 @@ for stage in $EXT4FS_CRASH_STAGES; do
 	esac
 done
 case "$EXT4FS_CRASH_MODE" in
-timed|flush|orphan|directory|extent|truncate|reuse|journal|errors|\
-allocation-error|queue|create-rollback) ;;
+timed|flush|orphan|directory|extent|extent-deep|truncate|reuse|journal|\
+errors|allocation-error|queue|create-rollback) ;;
 *)	fail "unsupported crash mode: $EXT4FS_CRASH_MODE" ;;
 esac
 if [ "$EXT4FS_CRASH_MODE" != timed ]; then
@@ -848,12 +848,17 @@ extent_leaf_count()
 	awk '
 	    {
 		line = $0
-		while (match(line, /\(ETB0\):/)) {
-			count++
+		while (match(line, /\(ETB[0-9]+\):/)) {
+			node = substr(line, RSTART, RLENGTH)
+			gsub(/[^0-9]/, "", node)
+			depth = node + 0
+			count[depth]++
+			if (depth > deepest)
+				deepest = depth
 			line = substr(line, RSTART + RLENGTH)
 		}
 	    }
-	    END { print count + 0 }
+	    END { print count[deepest + 0] + 0 }
 	' "$output"
 }
 
@@ -871,6 +876,107 @@ check_extent_leaf_count()
 	esac
 	[ "$actual" -eq "$expected" ] ||
 	    fail "expected $expected extent leaves, got $actual"
+}
+
+check_deep_extent_fixture()
+{
+	deep_capacity=$(((block_size - 12) / 12))
+	deep_dump=$work/deep-fixture-$block_size.log
+	"$DEBUGFS" -c -R 'dump_extents /crash/extent-probe' \
+	    "$image" >"$deep_dump" 2>&1 ||
+	    fail "could not inspect deep-growth fixture"
+	# Check the actual tree, not just the number of source extents.
+	# Require four root children and a full final leaf.
+	awk -v capacity="$deep_capacity" '
+	    { gsub(/\//, " ") }
+	    $1 == "0" {
+		if ($2 != 1 || $4 != 4)
+			bad = 1
+		roots++
+	    }
+	    $1 == "1" {
+		if ($2 != 1)
+			bad = 1
+		last = $4
+	    }
+	    END { exit (bad || roots != 4 || last != capacity) }
+	' "$deep_dump" || {
+		cat "$deep_dump" >&2
+		fail "fixture does not reach the depth-2 boundary"
+	}
+}
+
+run_deep_extent_case()
+{
+	deep_base=$1
+	block_size=$2
+	test_name="deep extent lifecycle, $block_size-byte blocks"
+	printf '%-64s' "vmm: $test_name"
+	case_dir=$work/extent-deep-lifecycle-$block_size
+	mkdir "$case_dir"
+	deep_grown=$case_dir/grown.img
+	cp "$deep_base" "$deep_grown"
+	validate_guest "$deep_grown" '' 'extent-deep grow' \
+	    "$case_dir/grow.log"
+	grep -qx 'state=extent-deep-grown' "$case_dir/grow.log" ||
+	    fail "guest did not grow the deep extent tree"
+	"$E2FSCK" -fn "$deep_grown" >"$case_dir/grow-fsck.log" \
+	    2>&1 || fail "e2fsck rejected deep extent growth"
+	check_extent_leaf_count "$deep_grown" /crash/extent-probe 5 \
+	    "$case_dir/grow-stat.log"
+	grep -q '(ETB1):' "$case_dir/grow-stat.log" ||
+	    fail "growth did not create an external index"
+	deep_hash=$($SHA256 -q "$deep_grown")
+	validate_guest "$deep_grown" ro 'extent-deep verify-grown' \
+	    "$case_dir/grow-verify.log"
+	[ "$deep_hash" = "$($SHA256 -q "$deep_grown")" ] ||
+	    fail "read-only deep extent verification changed image"
+	"$DUMPE2FS" -h "$deep_base" >"$case_dir/base-super.log" \
+	    2>&1 || fail "could not inspect deep extent baseline"
+	deep_base_free=$(filesystem_free_blocks \
+	    "$case_dir/base-super.log")
+	deep_entries=$((4 * ((block_size - 12) / 12) - 3))
+	deep_expected_free=$((deep_base_free + deep_entries + 4))
+
+	# Each operation starts from the persisted depth-2 tree.
+	for deep_action in shrink zero unlink replace; do
+		image=$case_dir/$deep_action.img
+		cp "$deep_grown" "$image"
+		case "$deep_action" in
+		shrink) deep_state=shrunk; deep_leaves=1 ;;
+		zero|replace) deep_state=empty; deep_leaves=0 ;;
+		unlink) deep_state=absent ;;
+		esac
+		validate_guest "$image" '' "extent-deep $deep_action" \
+		    "$case_dir/$deep_action.log"
+		grep -qx "state=extent-deep-$deep_state" \
+		    "$case_dir/$deep_action.log" ||
+		    fail "$deep_action did not report completion"
+		"$E2FSCK" -fn "$image" \
+		    >"$case_dir/$deep_action-fsck.log" 2>&1 ||
+		    fail "e2fsck rejected deep extent $deep_action"
+		if [ "$deep_action" != unlink ]; then
+			check_extent_leaf_count "$image" \
+			    /crash/extent-probe "$deep_leaves" \
+			    "$case_dir/$deep_action-stat.log"
+		fi
+		if [ "$deep_action" != shrink ]; then
+			"$DUMPE2FS" -h "$image" \
+			    >"$case_dir/$deep_action-super.log" 2>&1 ||
+			    fail "could not inspect freed tree"
+			deep_free=$(filesystem_free_blocks \
+			    "$case_dir/$deep_action-super.log")
+			[ "$deep_free" -eq "$deep_expected_free" ] ||
+			    fail "$deep_action leaked tree blocks"
+		fi
+		deep_hash=$($SHA256 -q "$image")
+		validate_guest "$image" ro \
+		    "extent-deep verify-$deep_state" \
+		    "$case_dir/$deep_action-verify.log"
+		[ "$deep_hash" = "$($SHA256 -q "$image")" ] ||
+		    fail "read-only $deep_action changed image"
+	done
+	echo ' ok'
 }
 
 journal_revoke_records()
@@ -1454,18 +1560,10 @@ prepare_sparse_extent_base()
 	fixture_file=$6
 	source_root=$work/source-$fixture_name-$block_size
 	source_file=$source_root/crash/$fixture_file
-	fixture_size=$(((2 * fixture_entries - 1) * block_size))
 
 	mkdir -p "$source_root/crash"
-	dd if=/dev/zero of="$source_file" bs=1 count=0 \
-	    seek="$fixture_size" status=none
-	fixture_entry=0
-	while [ "$fixture_entry" -lt "$fixture_entries" ]; do
-		fixture_offset=$((2 * fixture_entry * block_size))
-		printf x | dd of="$source_file" bs=1 \
-		    seek="$fixture_offset" conv=notrunc status=none
-		fixture_entry=$((fixture_entry + 1))
-	done
+	"$EXT4FS_CRASH" extent-source "$source_file" "$block_size" \
+	    "$fixture_entries" || fail "could not create sparse source"
 	dd if=/dev/zero of="$image" bs=1m count=0 \
 	    seek="$EXT4FS_CRASH_IMAGE_MB" status=none
 	if ! "$MKE2FS" -q -F -t ext4 -I 256 -b "$block_size" \
@@ -1523,6 +1621,25 @@ if [ "$EXT4FS_CRASH_MODE" = journal ]; then
 fi
 
 for block_size in $EXT4FS_CRASH_BLOCK_SIZES; do
+	if [ "$EXT4FS_CRASH_MODE" = extent-deep ]; then
+		extent_capacity=$(((block_size - 12) / 12))
+		deep_source=$work/base-extent-deep-$block_size.img
+		prepare_sparse_extent_base "$deep_source" \
+		    "$block_size" "$((4 * extent_capacity - 3))" 4 \
+		    deep extent-probe
+		check_deep_extent_fixture
+		run_deep_extent_case "$deep_source" "$block_size"
+		run_flush_matrix "$deep_source" "$block_size" \
+		    extent-deep 'depth-2 extent growth' \
+		    verify-extent-deep 'state=extent-four-leaves' \
+		    'state=extent-deep' 4 5
+		run_flush_matrix "$deep_grown" "$block_size" \
+		    extent-deep-unlink 'depth-2 open unlink' \
+		    verify-extent-deep-unlink \
+		    'state=extent-deep-linked' \
+		    'state=extent-deep-absent'
+		continue
+	fi
 	if [ "$EXT4FS_CRASH_MODE" = create-rollback ]; then
 		run_create_rollback_case "$block_size"
 		continue

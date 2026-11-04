@@ -22,6 +22,41 @@ Recovery hardening and its production-kernel regression gate are
 complete. The Phase 3 writer is activated and production-tested by the
 converted Phase 4 metadata paths.
 
+### Deeper extent growth follow-up (2026-11-03)
+
+A real rsync append reached the depth-1 writer limit: all four root
+slots were occupied and the final leaf held 340 extents with 4 KiB
+blocks.  The preflight rejected growth at logical block 28715 with
+`EOPNOTSUPP`.  Earlier leaves still had space, so this is a tree-shape
+limit rather than a fixed maximum file size.
+
+- [x] Confirm the rejected layout using read-only extent inspection.
+- [x] Add `run-regress-ext4fs-crash-extent-deep-vmm` as a positive
+      growth and retirement gate, separate from the existing rejection
+      test.  Check the fixture's root and final-leaf occupancy first.
+- [x] Build the helper and pass its source-data self-tests.  Validate
+      the boundary and depth-2 fixtures offline at all three block
+      sizes.  Reject already-deep and not-full boundary fixtures.
+- [x] Run the VMM baseline on the unchanged production kernel.  The
+      first growth operation must fail, not be counted as success.
+- [ ] Implement index promotion/splitting with bounded handle credits,
+      handle-aware traversal, checksums, and inode block accounting.
+- [ ] Extend live shrink, zero truncate, unlink, and rename retirement
+      before enabling growth.  Audit transaction-size limits and
+      restartable orphan recovery for larger trees.
+- [ ] Pass VMM growth, partial-tail zeroing, leaf pruning, zero
+      truncate, open unlink, and replacement after a remount.
+- [ ] Pass growth and open-unlink crash boundaries with replay,
+      read-only remount verification, and offline consistency checks.
+- [ ] Replace the old depth-2 rejection expectation once the complete
+      runtime path is enabled; retain non-mutating unsupported-limit
+      coverage where a limit remains.
+
+The new VMM gate is registered with the global runner.  Its unchanged
+kernel baseline failed at the first depth-2 growth write with
+`EOPNOTSUPP`, as required.  Kernel growth and retirement are now under
+implementation and remain gated by the positive and crash tests.
+
 ### Phase 1 implementation status (2026-09-23)
 
 The kernel and `fsck_ext4fs` recovery implementations now compile from

@@ -12,6 +12,7 @@ REGRESS_VMM_TARGETS= \
 		run-regress-ext4fs-crash-orphan-vmm \
 		run-regress-ext4fs-crash-directory-vmm \
 		run-regress-ext4fs-crash-extent-vmm \
+		run-regress-ext4fs-crash-extent-deep-vmm \
 		run-regress-ext4fs-crash-truncate-vmm \
 		run-regress-ext4fs-crash-reuse-vmm \
 		run-regress-ext4fs-crash-journal-vmm \
@@ -225,6 +226,21 @@ run-regress-ext4fs-crash-create-rollback-vmm: ${PROG}
 	    EXT4FS_CRASH_BLOCK_SIZES='${EXT4FS_CRASH_BLOCK_SIZES}' \
 	    EXT4FS_CRASH_SSH_KEY='${EXT4FS_CRASH_SSH_KEY}' \
 	    EXT4FS_CRASH_MODE='create-rollback' \
+	    sh ${.CURDIR}/crash-vmm.sh
+
+# Explicit only: deep growth and retirement may panic or hang a guest.
+run-regress-ext4fs-crash-extent-deep-vmm: ${PROG}
+	env EXT4FS_CRASH='${.OBJDIR}/${PROG}' \
+	    EXT4FS_CRASH_VMM_BASE='${EXT4FS_CRASH_VMM_BASE}' \
+	    EXT4FS_CRASH_VMM_KERNEL='${EXT4FS_CRASH_VMM_KERNEL}' \
+	    EXT4FS_CRASH_VMM_DIR='${EXT4FS_CRASH_VMM_DIR}' \
+	    EXT4FS_CRASH_BOOT_TIMEOUT='${EXT4FS_CRASH_BOOT_TIMEOUT}' \
+	    EXT4FS_CRASH_STEP_TIMEOUT='${EXT4FS_CRASH_STEP_TIMEOUT}' \
+	    EXT4FS_CRASH_IMAGE_MB='${EXT4FS_CRASH_IMAGE_MB}' \
+	    EXT4FS_CRASH_BLOCK_SIZES='${EXT4FS_CRASH_BLOCK_SIZES}' \
+	    EXT4FS_CRASH_FLUSH_COUNTS='${EXT4FS_CRASH_FLUSH_COUNTS}' \
+	    EXT4FS_CRASH_SSH_KEY='${EXT4FS_CRASH_SSH_KEY}' \
+	    EXT4FS_CRASH_MODE='extent-deep' \
 	    sh ${.CURDIR}/crash-vmm.sh
 
 .include <bsd.regress.mk>
