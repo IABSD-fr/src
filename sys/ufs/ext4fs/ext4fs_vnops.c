@@ -2767,6 +2767,58 @@ ext4fs_free_extents_handle (struct inode *ip,
 }
 
 /*
+ * Count distinct block groups touched by a list of extents.  A journal
+ * transaction needs one bitmap and one group-descriptor credit per
+ * group, regardless of how many extents in that group are released.
+ */
+static int
+ext4fs_extent_group_touches (struct m_ext4fs *fs,
+    const struct ext4fs_extent *ext, size_t entries,
+    u_int64_t *touchesp)
+{
+	u_int8_t *touched;
+	u_int64_t first, group, last, length, start;
+	size_t bytes, i;
+
+	*touchesp = 0;
+	if (fs->m_blocks_per_group == 0 ||
+	    fs->m_block_group_count == 0 ||
+	    fs->m_block_group_count > UINT32_MAX)
+		return (EFBIG);
+	bytes = howmany((size_t)fs->m_block_group_count, NBBY);
+	touched = malloc(bytes, M_UFSMNT, M_WAITOK | M_ZERO);
+	for (i = 0; i < entries; i++) {
+		start = letoh32(ext[i].e_start_lo) |
+		    ((u_int64_t)letoh16(ext[i].e_start_hi) << 32);
+		length = letoh16(ext[i].e_len);
+		if (length > 0x8000)
+			length -= 0x8000;
+		if (length == 0 || start < fs->m_first_data_block ||
+		    start >= fs->m_blocks_count ||
+		    length > fs->m_blocks_count - start) {
+			free(touched, M_UFSMNT, bytes);
+			return (EIO);
+		}
+		first = (start - fs->m_first_data_block) /
+		    fs->m_blocks_per_group;
+		last = (start + length - 1 -
+		    fs->m_first_data_block) / fs->m_blocks_per_group;
+		if (last >= fs->m_block_group_count) {
+			free(touched, M_UFSMNT, bytes);
+			return (EIO);
+		}
+		for (group = first; group <= last; group++) {
+			if (isset(touched, (u_int32_t)group))
+				continue;
+			setbit(touched, (u_int32_t)group);
+			(*touchesp)++;
+		}
+	}
+	free(touched, M_UFSMNT, bytes);
+	return (0);
+}
+
+/*
  * Reject physical aliases within a regular file's extent tree.  In
  * particular, data extents must not cover an external extent node which
  * a truncate is about to update or free.
@@ -3244,8 +3296,7 @@ ext4fs_truncate_zero_journal (struct inode *ip)
 	struct ext4fs_dinode_256 saved_inode;
 	struct ext4fs_journal_handle *handle;
 	struct vnode *vp = ITOV(ip);
-	u_int64_t credits, first_group, group_touches, last_group;
-	u_int64_t released_blocks, start;
+	u_int64_t credits, group_touches, released_blocks;
 	u_int32_t length;
 	int changed, end_error, error, i, saved_flags;
 
@@ -3254,25 +3305,15 @@ ext4fs_truncate_zero_journal (struct inode *ip)
 	if (error)
 		return (error);
 
-	group_touches = 0;
+	error = ext4fs_extent_group_touches(fs, tree.ets_extents,
+	    tree.ets_extent_count, &group_touches);
+	if (error)
+		goto out;
 	released_blocks = 0;
 	for (i = 0; i < (int)tree.ets_extent_count; i++) {
-		start = letoh32(tree.ets_extents[i].e_start_lo) |
-		    ((u_int64_t)letoh16(
-		    tree.ets_extents[i].e_start_hi) << 32);
 		length = letoh16(tree.ets_extents[i].e_len);
 		if (length > 0x8000)
 			length -= 0x8000;
-		first_group = (start - fs->m_first_data_block) /
-		    fs->m_blocks_per_group;
-		last_group = (start + length - 1 -
-		    fs->m_first_data_block) / fs->m_blocks_per_group;
-		if (group_touches > UINT64_MAX -
-		    (last_group - first_group + 1)) {
-			error = EFBIG;
-			goto out;
-		}
-		group_touches += last_group - first_group + 1;
 		if (released_blocks > UINT64_MAX - length) {
 			error = EFBIG;
 			goto out;
@@ -3381,10 +3422,9 @@ ext4fs_truncate_shrink_depth01_journal (struct inode *ip,
 	struct buf *bp;
 	size_t capacity, maximum, original_count, released_count;
 	size_t original_offset[4], retained_count, retained_offset[4];
-	u_int64_t credits, cutoff, first_group, group_touches;
-	u_int64_t last_group;
+	u_int64_t credits, cutoff, group_touches;
 	u_int64_t leaf_blocks[4], logical_end, previous_end;
-	u_int64_t physical, released_blocks, start, tail_lbn, tail_pblk;
+	u_int64_t physical, released_blocks, tail_lbn, tail_pblk;
 	u_int32_t dirty_leaves, empty_leaves, index_logical;
 	u_int32_t length_blocks;
 	u_int32_t logical, offset;
@@ -3578,24 +3618,10 @@ ext4fs_truncate_shrink_depth01_journal (struct inode *ip,
 		}
 	}
 
-	group_touches = 0;
-	for (i = 0; i < (int)released_count; i++) {
-		start = letoh32(released[i].e_start_lo) |
-		    ((u_int64_t)letoh16(released[i].e_start_hi) << 32);
-		length_blocks = letoh16(released[i].e_len);
-		if (length_blocks > 0x8000)
-			length_blocks -= 0x8000;
-		first_group = (start - fs->m_first_data_block) /
-		    fs->m_blocks_per_group;
-		last_group = (start + length_blocks - 1 -
-		    fs->m_first_data_block) / fs->m_blocks_per_group;
-		if (group_touches > UINT64_MAX -
-		    (last_group - first_group + 1)) {
-			error = EFBIG;
-			goto out;
-		}
-		group_touches += last_group - first_group + 1;
-	}
+	error = ext4fs_extent_group_touches(fs, released,
+	    released_count, &group_touches);
+	if (error)
+		goto out;
 	dirty_leaves = 0;
 	empty_leaves = 0;
 	for (i = 0; i < leaf_count; i++) {
@@ -3791,8 +3817,8 @@ ext4fs_truncate_shrink_depth2_journal (struct inode *ip,
 	struct vnode *vp = ITOV(ip);
 	struct buf *bp = NULL;
 	size_t k, maximum, released_count;
-	u_int64_t credits, cutoff, first_group, group_touches;
-	u_int64_t last_group, physical, released_blocks, start;
+	u_int64_t credits, cutoff, group_touches;
+	u_int64_t physical, released_blocks;
 	u_int64_t tail_lbn, tail_pblk;
 	u_int32_t dirty_indexes, dirty_leaves, empty_indexes;
 	u_int32_t empty_leaves, empty_nodes, length_blocks;
@@ -3903,25 +3929,10 @@ ext4fs_truncate_shrink_depth2_journal (struct inode *ip,
 		}
 	}
 
-	group_touches = 0;
-	for (k = 0; k < released_count; k++) {
-		start = letoh32(released[k].e_start_lo) |
-		    ((u_int64_t)letoh16(
-		    released[k].e_start_hi) << 32);
-		length_blocks = letoh16(released[k].e_len);
-		if (length_blocks > 0x8000)
-			length_blocks -= 0x8000;
-		first_group = (start - fs->m_first_data_block) /
-		    fs->m_blocks_per_group;
-		last_group = (start + length_blocks - 1 -
-		    fs->m_first_data_block) / fs->m_blocks_per_group;
-		if (group_touches > UINT64_MAX -
-		    (last_group - first_group + 1)) {
-			error = EFBIG;
-			goto out;
-		}
-		group_touches += last_group - first_group + 1;
-	}
+	error = ext4fs_extent_group_touches(fs, released,
+	    released_count, &group_touches);
+	if (error)
+		goto out;
 
 	dirty_leaves = 0;
 	empty_leaves = 0;
