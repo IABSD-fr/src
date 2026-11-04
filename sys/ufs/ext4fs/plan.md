@@ -39,14 +39,14 @@ limit rather than a fixed maximum file size.
       sizes.  Reject already-deep and not-full boundary fixtures.
 - [x] Run the VMM baseline on the unchanged production kernel.  The
       first growth operation must fail, not be counted as success.
-- [ ] Implement index promotion/splitting with bounded handle credits,
+- [x] Implement index promotion/splitting with bounded handle credits,
       handle-aware traversal, checksums, and inode block accounting.
-- [ ] Extend live shrink, zero truncate, unlink, and rename retirement
+- [x] Extend live shrink, zero truncate, unlink, and rename retirement
       before enabling growth.  Audit transaction-size limits and
       restartable orphan recovery for larger trees.
-- [ ] Pass VMM growth, partial-tail zeroing, leaf pruning, zero
+- [x] Pass VMM growth, partial-tail zeroing, leaf pruning, zero
       truncate, open unlink, and replacement after a remount.
-- [ ] Pass growth and open-unlink crash boundaries with replay,
+- [x] Pass growth and open-unlink crash boundaries with replay,
       read-only remount verification, and offline consistency checks.
 - [ ] Replace the old depth-2 rejection expectation once the complete
       runtime path is enabled; retain non-mutating unsupported-limit
@@ -54,8 +54,19 @@ limit rather than a fixed maximum file size.
 
 The new VMM gate is registered with the global runner.  Its unchanged
 kernel baseline failed at the first depth-2 growth write with
-`EOPNOTSUPP`, as required.  Kernel growth and retirement are now under
-implementation and remain gated by the positive and crash tests.
+`EOPNOTSUPP`, as required.  The depth-2 writer now promotes and splits
+external index blocks through the active handle and maintains node
+checksums and inode block accounting.  Shrink, zero truncate, open
+unlink, and rename replacement validate and retire the complete tree.
+
+On 2026-11-04, the production-kernel VMM matrix passed growth, partial
+tail zeroing, leaf pruning, zero truncate, open unlink, replacement,
+read-only remount verification, replay idempotence, and offline
+`e2fsck -fn` at 1 KiB, 2 KiB, and 4 KiB.  The first 4 KiB pruning run
+exposed journal-credit accounting per released extent rather than per
+distinct block group.  Deduplicating bitmap and group-descriptor
+credits fixed that false `ENOSPC`; per-block revokes remain charged
+individually.  Replacing the old rejection test is the remaining item.
 
 ### Phase 1 implementation status (2026-09-23)
 

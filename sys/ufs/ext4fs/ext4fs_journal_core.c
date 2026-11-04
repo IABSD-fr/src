@@ -74,7 +74,7 @@ struct ext4fs_journal_metadata {
 	struct buf	*jm_buf;
 	/* Frozen image shared by logging and checkpointing. */
 	void		*jm_snapshot;
-	/* Handle until dirtied. */
+	/* Handle while the live buffer may be changed. */
 	struct ext4fs_journal_handle *jm_owner;
 	u_int64_t	 jm_fsblock;
 	u_int32_t	 jm_snapshot_size;
@@ -233,6 +233,7 @@ struct ext4fs_journal {
 	u_int32_t	 j_committed_count;
 	u_int32_t	 j_committed_blocks;
 	u_int32_t	 j_max_transaction_credits;
+	u_int32_t	 j_cache_readers;
 	u_int32_t	 j_expired_sequence;
 	u_int32_t	 j_stall_sequence;
 	u_int32_t	 j_features_compat;
@@ -311,6 +312,7 @@ static void	ext4fs_journal_io_submit (
 static void	ext4fs_journal_io_submit_raw (
 		    struct ext4fs_journal_io_batch *, struct vnode *,
 		    struct buf *);
+static int	ext4fs_journal_io_read_raw (struct vnode *, struct buf *);
 static int	ext4fs_journal_io_wait (
 		    struct ext4fs_journal_io_batch *);
 static void	ext4fs_journal_scratch_acquire (
@@ -631,7 +633,9 @@ ext4fs_journal_materialize_record (struct ext4fs_journal *journal,
 	if (! metadata->jm_update_pending)
 		return (0);
 	if (metadata->jm_buf == NULL || ! metadata->jm_dirty ||
-	    metadata->jm_owner != NULL ||
+	    (metadata->jm_owner != NULL &&
+	    (metadata->jm_owner->jh_journal != journal ||
+	    metadata->jm_owner->jh_transaction != tx)) ||
 	    ! ISSET(metadata->jm_buf->b_flags, B_BUSY) ||
 	    ! ISSET(metadata->jm_buf->b_flags, B_DONE))
 		return (EINVAL);
@@ -926,6 +930,26 @@ ext4fs_journal_io_submit_raw (
 	VOP_STRATEGY(devvp, bp);
 	if (bp->b_bq != NULL)
 		bufq_wait(bp->b_bq);
+}
+
+static int
+ext4fs_journal_io_read_raw (struct vnode *devvp, struct buf *bp)
+{
+	KASSERT(devvp != NULL);
+	KASSERT(devvp->v_type == VBLK);
+	KASSERT(bp != NULL);
+	KASSERT(bp->b_vp == NULL);
+	KASSERT(ISSET(bp->b_flags, B_BUSY));
+	KASSERT(bp->b_iodone == NULL);
+
+	CLR(bp->b_flags, B_DONE | B_ERROR | B_EINTR | B_INVAL |
+	    B_WRITE | B_DELWRI | B_ASYNC | B_CALL);
+	SET(bp->b_flags, B_READ | B_RAW | B_NOCACHE);
+	bp->b_dev = devvp->v_rdev;
+	bp->b_error = 0;
+	bp->b_resid = 0;
+	VOP_STRATEGY(devvp, bp);
+	return (biowait(bp));
 }
 
 static int
@@ -2342,7 +2366,8 @@ ext4fs_journal_destroy (struct mount *mp)
 	    &journal->j_commit_task);
 
 	mtx_enter(&journal->j_lock);
-	while (journal->j_active != NULL)
+	while (journal->j_active != NULL ||
+	    journal->j_cache_readers != 0)
 		msleep_nsec(&journal->j_active, &journal->j_lock,
 		    PRIBIO, "e4jdrain", INFSLP);
 	while (journal->j_commit_busy)
@@ -2624,6 +2649,7 @@ ext4fs_journal_begin (struct mount *mp, unsigned int credits,
 			}
 			error = ext4fs_journal_state_admission(
 			    journal->j_active != NULL ||
+			    journal->j_cache_readers != 0 ||
 			    journal->j_handoff != NULL,
 			    journal->j_aborted, journal->j_error,
 			    journal->j_shutting_down);
@@ -2775,7 +2801,7 @@ ext4fs_journal_read_metadata (struct mount *mp, struct vnode *devvp,
 	struct ext4fs_journal_metadata *metadata;
 	struct ext4fs_journal *journal;
 	struct ext4fs_journal_revoke *revoke;
-	struct ext4fs_journal_transaction *committing;
+	struct ext4fs_journal_transaction *committing, *tx;
 	struct m_ext4fs *fs;
 	struct ufsmount *ump;
 	struct buf *bp, *copy;
@@ -2809,26 +2835,10 @@ ext4fs_journal_read_metadata (struct mount *mp, struct vnode *devvp,
 		    journal->j_shutting_down);
 		if (error)
 			goto out;
-		/*
-		 * A handle owns the live buffers while it is active and may
-		 * change them without holding j_lock.  Wait for the handle
-		 * boundary before treating a running buffer as stable.
-		 */
-		if (journal->j_active != NULL) {
-			/* A self-read must use the active handle. */
-			if (journal->j_active->jh_owner_tid ==
-			    curproc->p_tid) {
-				error = EDEADLK;
-				goto out;
-			}
-			ext4fs_journal_wait_active(journal,
-			    "e4jread");
-			mtx_leave(&journal->j_lock);
-			continue;
-		}
 		data = NULL;
 		metadata = NULL;
 		revoke = NULL;
+		tx = NULL;
 		if (journal->j_running != NULL) {
 			metadata = ext4fs_journal_metadata_block_find(
 			    journal->j_running, fsblock);
@@ -2836,6 +2846,30 @@ ext4fs_journal_read_metadata (struct mount *mp, struct vnode *devvp,
 			    journal->j_running, fsblock);
 		}
 		if (metadata != NULL) {
+			if (revoke != NULL) {
+				error = EINVAL;
+				goto out;
+			}
+			/*
+			 * Only an owner of this block can change its live
+			 * buffer.  Unrelated active handles must not delay a
+			 * reader which may already hold another vnode lock.
+			 */
+			if (metadata->jm_owner != NULL) {
+				if (metadata->jm_owner != journal->j_active) {
+					error = EINVAL;
+					goto out;
+				}
+				if (metadata->jm_owner->jh_owner_tid ==
+				    curproc->p_tid) {
+					error = EDEADLK;
+					goto out;
+				}
+				ext4fs_journal_wait_active(journal,
+				    "e4jread");
+				mtx_leave(&journal->j_lock);
+				continue;
+			}
 			if (metadata->jm_update_pending) {
 				error = ext4fs_journal_materialize_record(
 				    journal, journal->j_running, metadata);
@@ -2844,7 +2878,6 @@ ext4fs_journal_read_metadata (struct mount *mp, struct vnode *devvp,
 			}
 			if (metadata->jm_buf == NULL ||
 			    metadata->jm_buf->b_vp != devvp ||
-			    metadata->jm_owner != NULL ||
 			    ! metadata->jm_dirty ||
 			    ! ISSET(metadata->jm_buf->b_flags, B_BUSY) ||
 			    ! ISSET(metadata->jm_buf->b_flags, B_DONE) ||
@@ -2857,15 +2890,24 @@ ext4fs_journal_read_metadata (struct mount *mp, struct vnode *devvp,
 		}
 		committing = journal->j_committing;
 		if (data == NULL && revoke == NULL &&
-		    committing != NULL &&
-		    (committing->jt_state ==
-		    EXT4FS_JOURNAL_TRANSACTION_COMMITTING ||
-		    committing->jt_state ==
-		    EXT4FS_JOURNAL_TRANSACTION_FROZEN ||
-		    committing->jt_state ==
-		    EXT4FS_JOURNAL_TRANSACTION_COMMITTED)) {
+		    committing != NULL && committing->jt_state ==
+		    EXT4FS_JOURNAL_TRANSACTION_CHECKPOINTING) {
+			/* Checkpoint removes records outside j_lock. */
+			ext4fs_journal_wait_committing(journal,
+			    "e4jread");
+			mtx_leave(&journal->j_lock);
+			continue;
+		}
+		if (data == NULL && revoke == NULL &&
+		    committing != NULL) {
 			metadata = ext4fs_journal_metadata_block_find(
 			    committing, fsblock);
+			revoke = ext4fs_journal_revoke_block_find(
+			    committing, fsblock);
+			if (metadata != NULL && revoke != NULL) {
+				error = EINVAL;
+				goto out;
+			}
 			if (metadata != NULL && committing->jt_state ==
 			    EXT4FS_JOURNAL_TRANSACTION_COMMITTING) {
 				ext4fs_journal_wait_committing(journal,
@@ -2890,6 +2932,39 @@ ext4fs_journal_read_metadata (struct mount *mp, struct vnode *devvp,
 				data = metadata->jm_snapshot;
 			}
 		}
+		if (data == NULL && revoke == NULL) {
+			TAILQ_FOREACH_REVERSE(tx, &journal->j_committed,
+			    ext4fs_journal_transaction_head, jt_entry) {
+				if (tx == committing)
+					continue;
+				metadata =
+				    ext4fs_journal_metadata_block_find(tx,
+				    fsblock);
+				revoke = ext4fs_journal_revoke_block_find(tx,
+				    fsblock);
+				if (metadata != NULL || revoke != NULL)
+					break;
+			}
+			if (metadata != NULL && revoke != NULL) {
+				error = EINVAL;
+				goto out;
+			}
+			if (metadata != NULL) {
+				if (tx == NULL || tx->jt_state !=
+				    EXT4FS_JOURNAL_TRANSACTION_COMMITTED ||
+				    metadata->jm_snapshot == NULL ||
+				    metadata->jm_snapshot_size !=
+				    journal->j_blocksize ||
+				    metadata->jm_buf != NULL ||
+				    metadata->jm_owner != NULL ||
+				    ! metadata->jm_dirty ||
+				    metadata->jm_update_pending) {
+					error = EINVAL;
+					goto out;
+				}
+				data = metadata->jm_snapshot;
+			}
+		}
 		if (copy == NULL) {
 			/* Allocation may sleep; recheck the transaction. */
 			mtx_leave(&journal->j_lock);
@@ -2898,25 +2973,48 @@ ext4fs_journal_read_metadata (struct mount *mp, struct vnode *devvp,
 		}
 		if (data == NULL) {
 			/*
-			 * A reader may read another metadata block while it
-			 * holds this one.  Return an anonymous copy so a writer
-			 * cannot wait on its busy home buffer while the reader
-			 * waits for the writer's active handle.
+			 * A cache reader excludes new handles until it has copied
+			 * the block.  With an unrelated handle already active,
+			 * use raw I/O so neither side can wait for a cache block
+			 * owned by the other.
 			 */
-			mtx_leave(&journal->j_lock);
-			bp = NULL;
-			error = bread(devvp,
-			    (daddr_t)EXT4FS_FSBTODB(fs, fsblock),
-			    fs->m_block_size, &bp);
-			if (error) {
+			copy->b_blkno = (daddr_t)EXT4FS_FSBTODB(fs,
+			    fsblock);
+			copy->b_lblkno = copy->b_blkno;
+			if (journal->j_active == NULL) {
+				if (journal->j_cache_readers == UINT32_MAX) {
+					error = EOVERFLOW;
+					goto out;
+				}
+				journal->j_cache_readers++;
+				mtx_leave(&journal->j_lock);
+				bp = NULL;
+				error = bread(devvp, copy->b_blkno,
+				    fs->m_block_size, &bp);
+				if (error == 0)
+					memcpy(copy->b_data, bp->b_data,
+					    fs->m_block_size);
 				if (bp != NULL)
 					brelse(bp);
-				brelse(copy);
-				return (error);
+				mtx_enter(&journal->j_lock);
+				KASSERT(journal->j_cache_readers != 0);
+				journal->j_cache_readers--;
+				if (journal->j_cache_readers == 0)
+					wakeup(&journal->j_active);
+				mtx_leave(&journal->j_lock);
+				if (error) {
+					brelse(copy);
+					return (error);
+				}
+			} else {
+				mtx_leave(&journal->j_lock);
+				error = ext4fs_journal_io_read_raw(devvp,
+				    copy);
+				if (error) {
+					brelse(copy);
+					return (error);
+				}
 			}
-			memcpy(copy->b_data, bp->b_data,
-			    fs->m_block_size);
-			brelse(bp);
 		} else {
 			/* j_lock keeps the transaction image stable. */
 			memcpy(copy->b_data, data,
@@ -2929,7 +3027,7 @@ ext4fs_journal_read_metadata (struct mount *mp, struct vnode *devvp,
 		copy->b_error = 0;
 		copy->b_resid = 0;
 		CLR(copy->b_flags, B_ERROR | B_EINTR | B_INVAL |
-		    B_READ);
+		    B_READ | B_RAW);
 		SET(copy->b_flags, B_DONE | B_NOCACHE);
 		*bpp = copy;
 		return (0);
@@ -2990,6 +3088,13 @@ retry:
 			error = EBUSY;
 			goto out;
 		}
+		if (metadata->jm_update_pending) {
+			error = ext4fs_journal_materialize_record(journal,
+			    handle->jh_transaction, metadata);
+			if (error)
+				goto out;
+		}
+		metadata->jm_owner = handle;
 		*bpp = metadata->jm_buf;
 		error = 0;
 		goto out;
@@ -3081,12 +3186,12 @@ retry:
 			goto out;
 		}
 		/*
-		 * The successor owns and logs the inherited image even if
-		 * its caller stops before changing it.  An abort can then
-		 * invalidate the buffer through the successor record.
+		 * The successor logs the inherited image even if its caller
+		 * stops before changing it.  The handle retains ownership
+		 * until end(), so readers cannot copy a live buffer which the
+		 * caller may still change.
 		 */
 		candidate->jm_dirty = 1;
-		candidate->jm_owner = NULL;
 		removed = RB_REMOVE(
 		    ext4fs_journal_metadata_buffer_tree,
 		    &committing->jt_metadata_buffers, source);
@@ -3290,10 +3395,7 @@ ext4fs_journal_get_write_access (struct ext4fs_journal_handle *handle,
 	}
 	TAILQ_INSERT_TAIL(&handle->jh_transaction->jt_metadata,
 	    candidate, jm_entry);
-	/*
-	 * The handle now owns the busy buffer until dirty_metadata() or
-	 * end().
-	 */
+	/* The handle owns the busy buffer until end(). */
 	candidate = NULL;
 	error = 0;
 
@@ -3311,18 +3413,16 @@ ext4fs_journal_dirty_record_locked (
 {
 	int error;
 
-	if (metadata->jm_dirty)
-		return (0);
 	if (metadata->jm_owner != handle)
 		return (EBUSY);
+	if (metadata->jm_dirty)
+		return (0);
 	error = ext4fs_journal_state_consume(&handle->jh_credits,
 	    &handle->jh_transaction->jt_credits_reserved,
 	    &handle->jh_transaction->jt_credits_used);
 	if (error)
 		return (error);
 	metadata->jm_dirty = 1;
-	/* Transfer the busy buffer to the transaction. */
-	metadata->jm_owner = NULL;
 	return (0);
 }
 
@@ -3563,7 +3663,9 @@ ext4fs_journal_revoke (struct ext4fs_journal_handle *handle,
 		 * obsolete image and reuse its consumed credit for the
 		 * revoke record.
 		 */
-		if (! metadata->jm_dirty || metadata->jm_owner != NULL ||
+		if (! metadata->jm_dirty ||
+		    (metadata->jm_owner != NULL &&
+		    metadata->jm_owner != handle) ||
 		    metadata->jm_buf == NULL ||
 		    metadata->jm_snapshot != NULL ||
 		    metadata->jm_update_pending ||
@@ -3690,8 +3792,12 @@ ext4fs_journal_end_internal (struct ext4fs_journal_handle *handle,
 		*transactionp = 0;
 	TAILQ_FOREACH_SAFE(metadata,
 	    &handle->jh_transaction->jt_metadata, jm_entry, next) {
-		if (metadata->jm_owner != handle || metadata->jm_dirty)
+		if (metadata->jm_owner != handle)
 			continue;
+		if (metadata->jm_dirty) {
+			metadata->jm_owner = NULL;
+			continue;
+		}
 		ext4fs_journal_metadata_remove(
 		    handle->jh_transaction, metadata);
 		TAILQ_INSERT_TAIL(&unused, metadata, jm_entry);
