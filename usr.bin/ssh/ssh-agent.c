@@ -1605,7 +1605,7 @@ add_p11_identity(struct sshkey *key, char *comment, const char *provider,
 	if (lookup_identity(key) != NULL) {
 		sshkey_free(key);
 		free(comment);
-		return;
+		return 0;
 	}
 	if (check_dest_constraint_space(dest_constraints, ndest_constraints,
 	    NULL) != 0) {
